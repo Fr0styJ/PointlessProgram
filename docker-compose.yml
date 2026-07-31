@@ -912,18 +912,77 @@ services:
       - phase11
 
   # ---------------------------------------------------------------------------
-  # PHASES 12+: Custom services — each added when their phase executes.
+  # PHASE 12: Sim Clock — custom Python service
+  # Spec §19.1: advances sim_time at configurable speed_multiplier
+  # Net: net_clients (other services call it), net_data (Postgres)
+  # API: GET /clock, POST /set_speed, GET /sim_time, GET /health
+  # ---------------------------------------------------------------------------
+  sim-clock:
+    build:
+      context: ./sim-clock
+      dockerfile: Dockerfile
+    container_name: fakeco-sim-clock
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      TICK_INTERVAL_SECONDS: "1.0"
+      SPEED_MULTIPLIER: "${SPEED_MULTIPLIER:-1.0}"
+    networks:
+      - net_clients
+      - net_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "sim-clock"
+      fakeco.phase: "12"
+      fakeco.managed: "true"
+    profiles:
+      - phase12
+
+  # ---------------------------------------------------------------------------
+  # PHASE 13: narrative-db-migrate — init container, runs migrations then exits
+  # Applies all SQL migrations in narrative-db/migrations/ in order.
+  # Must complete successfully before any service that reads/writes narrative tables.
+  # ---------------------------------------------------------------------------
+  narrative-db-migrate:
+    build:
+      context: ./narrative-db
+      dockerfile: Dockerfile
+    container_name: fakeco-narrative-db-migrate
+    restart: "no"   # init container — run once, don't restart
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+    networks:
+      - net_data
+    labels:
+      fakeco.service: "narrative-db-migrate"
+      fakeco.phase: "13"
+      fakeco.managed: "true"
+    profiles:
+      - phase13
+
+  # ---------------------------------------------------------------------------
+  # PHASES 13+: Custom services — each added when their phase executes.
   # Placeholders listed here as comments to document the final topology:
   #
-  # sim-clock        (Phase 12) — net_clients, net_data
-  # orchestrator     (Phase 18) — net_clients, net_data, net_office, net_mail
-  # meeting-simulator (Phase 16) — net_clients, net_data, net_office
-  # human-bridge     (Phase 17) — net_clients, net_data, net_mail, net_office
-  # accounting-engine (Phase 15) — net_clients, net_data, net_office
-  # external-world   (Phase 21+22) — net_clients, net_data, net_mail, net_office
-  # kpi-engine       (Phase 23+) — net_clients, net_data, net_office
-  # branding-manager (Phase 30) — net_clients, net_data, net_office
-  # purge-manager    (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
-  # snapshot-manager (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
-  # dashboard        (Phase 33+) — net_mgmt, net_clients (calls other services)
+  # orchestrator       (Phase 18) — net_clients, net_data, net_office, net_mail
+  # meeting-simulator  (Phase 16) — net_clients, net_data, net_office
+  # human-bridge       (Phase 17) — net_clients, net_data, net_mail, net_office
+  # accounting-engine  (Phase 15) — net_clients, net_data, net_office
+  # external-world     (Phase 21+22) — net_clients, net_data, net_mail, net_office
+  # kpi-engine         (Phase 23+) — net_clients, net_data, net_office
+  # branding-manager   (Phase 30) — net_clients, net_data, net_office
+  # purge-manager      (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
+  # snapshot-manager   (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
+  # dashboard          (Phase 33+) — net_mgmt, net_clients (calls other services)
   # ---------------------------------------------------------------------------
