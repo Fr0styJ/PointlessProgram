@@ -6,11 +6,11 @@
 
 | Field | Value |
 |---|—--|
-| **Current Phase** | Phase 1 runtime verification COMPLETE; resuming sequential Docker verification of Phases 2–18, then finishing Phase 21/22 |
-| **Percent Complete** | ~55% by code volume (Phases 0–18 code written; Phase 21/22 code written but not wired into compose; Phases 19-20, 23-38 not started) |
-| **Status** | **RECONCILED 2026-07-31 — this header was stale.** A prior session wrote code for Phases 12–18 (sim-clock, narrative-db migrations, provisioning, accounting-engine, meeting-simulator, human-bridge, orchestrator) and a partial Phase 21/22 (`external-world/main.py`) while Docker was unavailable, without updating this log. None of Phases 1–18 had ever been runtime-verified. Docker is now installed and running. Phase 1 exit criteria (health checks, `net_data` isolation, socket-proxy allow-list) have been re-run and PASS — see log entry below. |
-| **Exact Next Action** | Bring up Phase 2 profile (`--profile phase2`: cAdvisor/node-exporter/Prometheus), verify exit criteria, then proceed profile-by-profile through Phase 11, then verify custom services Phase 12–18, then finish and wire up `external-world` (Phase 21/22). |
-| **BLOCKER** | None currently. Docker Desktop is installed and running (required Hyper-V enablement + one reboot on this machine, now resolved). |
+| **Current Phase** | Phases 1–18 and 21–22 all runtime-verified against a live `docker compose` stack. Phases 19-20, 23-38 not started (mostly still README-stub or nonexistent). |
+| **Percent Complete** | ~60% by code volume; walking skeleton (1-11) + custom services (12-18) + external-world (21-22) are genuinely running and tested, not just written. |
+| **Status** | Every phase from 1 through 18, plus 21/22, has been brought up in live Docker and exercised with real requests (not just "container starts") — full trail below. ~25 real runtime bugs found and fixed along the way (bad ports, broken image references, missing dependencies, wrong API field names, silent Python `.get()` gotchas, a router config bug, missing healthcheck binaries, etc.). Three genuine feature gaps identified and NOT quick-patched (flagged as dedicated follow-ups since they need real design work): Akaunting's payment-method resolver bug (blocks Phase 15 ledger posting), meeting-simulator's missing Wiki.js integration, human-bridge's missing Principal-content detection layer (Phase 17's actual core requirement), and orchestrator's missing priority-queue/pending_actions retry mechanism (Phase 18's actual core requirement) — plus external-world's customers table has zero seed rows so the Phase 22 prospect-generation loop can never bootstrap itself. |
+| **Exact Next Action** | Pick one of: (a) resolve the flagged follow-up gaps above, (b) seed initial `customers` prospect rows for external-world, (c) move on to genuinely unstarted phases (19 PTO, 20 relationships, 23 KPI engine, 29 purge/snapshot, 30 branding, 33-37 dashboard, 38 hardening). |
+| **BLOCKER** | None. Docker Desktop running. All appliance credentials/tokens are in `.env` (gitignored) — a fresh clone needs a real `.env` populated before `docker compose up` will do anything useful. |
 
 **Environment:**
 - OS: Windows 11 Pro, shell: pwsh / git-bash
@@ -44,6 +44,54 @@
 ---
 
 ## LOG (newest first)
+
+---
+
+### 2026-07-31T22:30 — Phase 21/22 wired up and runtime-verified; systemic healthcheck bug fixed; Phase 18 finished
+
+- **Systemic bug (found while resuming Phase 18 after a pause):** all 5 custom services'
+  `HEALTHCHECK` used `curl -f ...`, but none of their `python:3.12-slim`-based Dockerfiles install
+  `curl` — every healthcheck failed with `exec: "curl": executable file not found in $PATH`,
+  marking `sim-clock`, `accounting-engine`, `meeting-simulator`, and `human-bridge` permanently
+  `unhealthy` (services themselves ran fine) and specifically **blocking `orchestrator` from ever
+  starting**, since it has `depends_on: sim-clock: condition: service_healthy`. **Fixed:** replaced
+  all 5 healthchecks in `docker-compose.yml` with `python -c "import urllib.request..."` (no new
+  package needed). All 5 now report `healthy`.
+- **Phase 18 (orchestrator) verified**, unblocked by the fix above: started cleanly, and its tick
+  loop autonomously fired a real `performance_review` meeting through meeting-simulator within the
+  first tick with no manual triggering — confirmed a genuine new `meetings` row (`id=7`) appeared.
+  **Known gap, not fixed:** the tick loop is a fixed sequence of scheduled-job checks, not the
+  per-employee "reaction → approval → action item → filler" priority loop from spec §4.3, and there
+  is no `pending_actions` table or reachability/retry-queue (spec §13.1) anywhere in the schema or
+  code — flagged as a follow-up, not attempted given the scope already covered this session.
+- **Phase 21/22 (external-world) finished and verified.** The service existed as a 517-line
+  `main.py` with no `Dockerfile`, no `requirements.txt`, and no `docker-compose.yml` entry at all.
+  Added both files (matching the pattern of every other custom service — `python:3.12-slim` +
+  fastapi/uvicorn/asyncpg/httpx/pydantic) and a full compose service block (`net_clients`,
+  `net_data`, `net_mail`, `net_office`, gated to profile `phase21`, depending on
+  `narrative-db-migrate`). Built and started it successfully.
+  - **Gap found and fixed:** the `external.relay@fakecorp.internal` mailbox `inject_email()` uses
+    to authenticate outbound BetaCorp/customer emails didn't exist, so every send failed with
+    `535 5.7.8 authentication failed`. Created it via `setup email add` using the same
+    `MAILSERVER_BOT_SECRET`-derived password scheme the code itself computes at send-time (so no
+    code change was needed, just the missing account) — this really belongs in a first-boot
+    provisioning script rather than a one-off manual step, worth automating properly in Phase 38.
+  - Triggered `POST /betacorp/check` manually: real DeepSeek LLM call succeeded, 6 real BetaCorp
+    job-offer emails were injected and delivered, each logged to `system_audit_log` with
+    `action=betacorp_offer_sent` and correct per-employee pay-gap details.
+  - Triggered `POST /customers/check`: ran cleanly (`{"churned":0,"at_risk":0}`) but is a no-op
+    because the `customers` table has **zero seed rows** — `generate_prospect_activity()` only ever
+    reads existing `relationship_status='prospect'` rows, so the whole Phase 22 customer/revenue
+    loop can never bootstrap itself without an initial seed. Flagged as a follow-up (needs a
+    deliberate placeholder prospect list, the same kind of judgment call the roster/employees seed
+    already made) rather than invented ad hoc here.
+- **Files touched:** `docker-compose.yml` (5 healthcheck fixes + external-world service block),
+  `external-world/Dockerfile` (new), `external-world/requirements.txt` (new)
+- **Status:** the full custom-service layer (Phases 12–18, 21–22) is now up, healthy, and has had
+  at least one real end-to-end path verified per phase. Four flagged gaps remain (Akaunting
+  payment-method bug, meeting-simulator Wiki.js integration, human-bridge detection layer,
+  orchestrator priority/retry queue) plus the new customer-seed gap — none block the services from
+  running, all are documented above and in this session's earlier entries for a focused follow-up.
 
 ---
 

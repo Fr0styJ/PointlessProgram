@@ -24,6 +24,7 @@ import smtplib
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from typing import Optional
 
 import asyncpg
@@ -127,6 +128,8 @@ async def send_as_employee(
     msg["Subject"] = subject
     msg["From"] = f"{employee_name} <{employee_email}>"
     msg["To"] = to_email
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
     msg["X-Sim-Origin"] = "human-bridge"  # internal marker for log analysis
 
     def _send():
@@ -463,36 +466,40 @@ async def _poll_zammad_once(pool: asyncpg.Pool) -> None:
         if not principal_id:
             return
         headers = {"Authorization": f"Token token={ZAMMAD_ADMIN_TOKEN}"}
-        r = await http.get(f"{ZAMMAD_URL}/api/v1/ticket_articles", headers=headers)
-        if r.status_code != 200:
-            log.warning("human-bridge: zammad article list failed (%s)", r.status_code)
+        # /api/v1/ticket_articles (bare list) 403s under a plain token-auth
+        # Agent account — but /api/v1/tickets + per-ticket
+        # /api/v1/ticket_articles/by_ticket/{id} both work, so we walk tickets
+        # and pull articles per-ticket instead.
+        tr_list = await http.get(f"{ZAMMAD_URL}/api/v1/tickets", headers=headers)
+        if tr_list.status_code != 200:
+            log.warning("human-bridge: zammad ticket list failed (%s)", tr_list.status_code)
             return
-        articles = r.json()
+        tickets = tr_list.json()
 
         async with pool.acquire() as conn:
             cursor_key = "zammad:article"
             since_id = int(await _get_cursor(conn, cursor_key) or 0)
             max_id = since_id
-            for art in articles:
-                art_id = art.get("id", 0)
-                max_id = max(max_id, art_id)
-                if art_id <= since_id:
+            for ticket in tickets:
+                ticket_id = ticket.get("id")
+                ar = await http.get(f"{ZAMMAD_URL}/api/v1/ticket_articles/by_ticket/{ticket_id}", headers=headers)
+                if ar.status_code != 200:
                     continue
-                if art.get("created_by_id") != principal_id and art.get("origin_by_id") != principal_id:
-                    continue
-                ticket_id = art.get("ticket_id")
-                tr = await http.get(f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}", headers=headers)
-                if tr.status_code != 200:
-                    continue
-                ticket = tr.json()
-                agent_id = ticket.get("owner_id")
-                emp = await _resolve_employee_by_zammad_agent(conn, agent_id)
-                if emp:
-                    body = (art.get("body") or "")[:200]
-                    await _record_human_event(
-                        conn, emp, "ticket", f"zammad:{art_id}",
-                        f"Principal commented on Zammad ticket #{ticket_id} assigned to {emp['name']}: {body}",
-                    )
+                for art in ar.json():
+                    art_id = art.get("id", 0)
+                    max_id = max(max_id, art_id)
+                    if art_id <= since_id:
+                        continue
+                    if art.get("created_by_id") != principal_id:
+                        continue
+                    agent_id = ticket.get("owner_id")
+                    emp = await _resolve_employee_by_zammad_agent(conn, agent_id)
+                    if emp:
+                        body = (art.get("body") or "")[:200]
+                        await _record_human_event(
+                            conn, emp, "ticket", f"zammad:{art_id}",
+                            f"Principal commented on Zammad ticket #{ticket_id} assigned to {emp['name']}: {body}",
+                        )
             if max_id > since_id:
                 await _set_cursor(conn, cursor_key, max_id)
 
@@ -507,12 +514,11 @@ async def _poll_wikijs_once(pool: asyncpg.Pool) -> None:
         r = await http.post(
             f"{WIKIJS_URL}/graphql",
             headers={"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}"},
+            # Wiki.js's `pages.list` PageListItem type doesn't expose authorId/tags
+            # (confirmed live — only pages.single does), so list gives us candidate
+            # ids+updatedAt cheaply, then we fetch full detail per-page below.
             json={"query": """
-                query {
-                  pages { list(orderBy: UPDATED, orderByDirection: DESC, limit: 50) {
-                      id path title updatedAt authorId tags
-                  } }
-                }
+                query { pages { list(limit: 50) { id path title updatedAt } } }
             """},
         )
         if r.status_code != 200:
@@ -530,20 +536,18 @@ async def _poll_wikijs_once(pool: asyncpg.Pool) -> None:
                     continue
                 if updated_at > latest:
                     latest = updated_at
-                if page.get("authorId") != principal_id:
+                sr = await http.post(
+                    f"{WIKIJS_URL}/graphql",
+                    headers={"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}"},
+                    json={"query": "query($id: Int!) { pages { single(id: $id) { authorId tags { tag } } } }",
+                          "variables": {"id": page["id"]}},
+                )
+                if sr.status_code != 200:
                     continue
-                # tags aren't returned with detail by the list query in all Wiki.js
-                # versions; fetch the single page for full tag info if missing.
-                tags = page.get("tags") or []
-                if not tags:
-                    sr = await http.post(
-                        f"{WIKIJS_URL}/graphql",
-                        headers={"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}"},
-                        json={"query": "query($id: Int!) { pages { single(id: $id) { tags } } }",
-                              "variables": {"id": page["id"]}},
-                    )
-                    if sr.status_code == 200:
-                        tags = sr.json().get("data", {}).get("pages", {}).get("single", {}).get("tags", []) or []
+                detail = sr.json().get("data", {}).get("pages", {}).get("single", {}) or {}
+                if detail.get("authorId") != principal_id:
+                    continue
+                tags = [t["tag"] for t in (detail.get("tags") or [])]
                 emp = await _resolve_employee_by_wiki_tag(conn, tags)
                 if emp:
                     await _record_human_event(
@@ -555,38 +559,35 @@ async def _poll_wikijs_once(pool: asyncpg.Pool) -> None:
 
 
 # --- Mail (IMAP) polling ------------------------------------------------------
-# The Principal's mailbox is provisioned via the same MailserverClient path
-# (and password derivation) as employee bot mailboxes — `provision-principal`
-# calls `mail.create_account(PRINCIPAL_EMAIL)` which uses the identical
-# `_derive_password()` scheme. So we can IMAP-login as the Principal directly
-# and poll their Sent folder for replies they authored, rather than needing to
-# poll every employee's INBOX for `From: principal`. Confirmed against the
-# live mailserver (see BUILD_LOG.md Phase 17 entry) that docker-mailserver's
-# default Sent folder is named "Sent".
+# Original plan was to IMAP-login as the Principal (their mailbox uses the
+# same derive_mail_password() scheme — confirmed: provision-principal's
+# mail.create_account(PRINCIPAL_EMAIL) hits the identical MailserverClient
+# path as employee accounts) and poll their Sent folder for replies. Verified
+# live against the real mailserver that this does NOT work: docker-mailserver
+# doesn't do sender-side archiving on SMTP submission — mail sent via raw SMTP
+# (or by a real MUA that doesn't itself IMAP-APPEND a copy) never lands in the
+# sender's Sent folder; that folder stays empty. So instead we poll every
+# active employee's own INBOX (using that employee's already-working derived
+# password — this is exactly how send_as_employee's login already works) and
+# filter for messages From: the Principal's address — a reply from the
+# Principal to an employee always lands in the employee's INBOX regardless of
+# how it was sent. Tracked per-employee via human_bridge_cursors.
 
 import email as email_lib
 import imaplib
 
 
-def _imap_fetch_sent_since_uid(last_uid: int) -> list[tuple[int, bytes]]:
+def _imap_fetch_inbox_from_principal(mailbox: str, last_uid: int) -> list[tuple[int, bytes]]:
     """Blocking IMAP call — always run via asyncio.to_thread."""
-    password = derive_mail_password(PRINCIPAL_EMAIL)
+    password = derive_mail_password(mailbox)
     results: list[tuple[int, bytes]] = []
     conn = imaplib.IMAP4(MAILSERVER_HOST, MAILSERVER_IMAP_PORT)
     try:
-        try:
-            conn.starttls()
-        except Exception:
-            pass
-        conn.login(PRINCIPAL_EMAIL, password)
-        folder = "Sent"
-        status, _ = conn.select(folder, readonly=True)
+        conn.login(mailbox, password)
+        status, _ = conn.select("INBOX", readonly=True)
         if status != "OK":
-            status, _ = conn.select("INBOX.Sent", readonly=True)
-            folder = "INBOX.Sent"
-            if status != "OK":
-                return results
-        typ, data = conn.uid("search", None, f"UID {last_uid + 1}:*")
+            return results
+        typ, data = conn.uid("search", None, f"UID {last_uid + 1}:*", "FROM", f'"{PRINCIPAL_EMAIL}"')
         if typ != "OK":
             return results
         uids = [int(u) for u in data[0].split()] if data and data[0] else []
@@ -606,34 +607,35 @@ def _imap_fetch_sent_since_uid(last_uid: int) -> list[tuple[int, bytes]]:
 
 async def _poll_mail_once(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
-        cursor_key = "mail:principal_sent_uid"
-        last_uid = int(await _get_cursor(conn, cursor_key) or 0)
+        employees = await conn.fetch(
+            "SELECT * FROM employees WHERE status = 'active' AND mailbox_address IS NOT NULL"
+        )
 
-    try:
-        messages = await asyncio.to_thread(_imap_fetch_sent_since_uid, last_uid)
-    except Exception as exc:
-        log.warning("human-bridge: IMAP poll failed: %s", exc)
-        return
+    for emp in employees:
+        mailbox = emp["mailbox_address"]
+        cursor_key = f"mail:{mailbox}"
+        async with pool.acquire() as conn:
+            last_uid = int(await _get_cursor(conn, cursor_key) or 0)
 
-    if not messages:
-        return
+        try:
+            messages = await asyncio.to_thread(_imap_fetch_inbox_from_principal, mailbox, last_uid)
+        except Exception as exc:
+            log.warning("human-bridge: IMAP poll failed for %s: %s", mailbox, exc)
+            continue
+        if not messages:
+            continue
 
-    async with pool.acquire() as conn:
-        max_uid = last_uid
-        for uid, raw in messages:
-            max_uid = max(max_uid, uid)
-            msg = email_lib.message_from_bytes(raw)
-            to_addr = email_lib.utils.parseaddr(msg.get("To", ""))[1]
-            subject = msg.get("Subject", "")
-            if not to_addr:
-                continue
-            emp = await _resolve_employee_by_email(conn, to_addr)
-            if emp:
+        async with pool.acquire() as conn:
+            max_uid = last_uid
+            for uid, raw in messages:
+                max_uid = max(max_uid, uid)
+                msg = email_lib.message_from_bytes(raw)
+                subject = msg.get("Subject", "")
                 await _record_human_event(
-                    conn, emp, "email", f"mail:{uid}",
-                    f"Principal emailed {emp['name']} ({to_addr}): {subject}",
+                    conn, emp, "email", f"mail:{mailbox}:{uid}",
+                    f"Principal emailed {emp['name']}: {subject}",
                 )
-        await _set_cursor(conn, cursor_key, max_uid)
+            await _set_cursor(conn, cursor_key, max_uid)
 
 
 # --- Polling supervisor -------------------------------------------------------
