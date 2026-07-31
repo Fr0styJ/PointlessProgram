@@ -1406,6 +1406,17 @@ services:
       PAYROLL_INTERVAL_DAYS: "14"
       STALE_THREAD_DAYS: "2"
       APPROVAL_REMINDER_DAYS: "1"
+      # Phase 19: PTO
+      PTO_DAILY_PROBABILITY: "${PTO_DAILY_PROBABILITY:-0.01}"
+      PTO_MIN_GAP_DAYS: "${PTO_MIN_GAP_DAYS:-45}"
+      PTO_DURATION_MIN_DAYS: "${PTO_DURATION_MIN_DAYS:-3}"
+      PTO_DURATION_MAX_DAYS: "${PTO_DURATION_MAX_DAYS:-7}"
+      MAILSERVER_CONTAINER: "fakeco-mailserver"
+      MAILSERVER_DOMAIN: "${MAILSERVER_DOMAIN:-fakecorp.internal}"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # Phase 19: for `docker exec fakeco-mailserver doveadm sieve ...`
     networks:
       - net_clients
       - net_data

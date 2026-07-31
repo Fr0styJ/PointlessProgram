@@ -59,6 +59,7 @@ AKAUNTING_PASSWORD = os.environ.get("AKAUNTING_ADMIN_PASSWORD", "")
 AKAUNTING_COMPANY_ID = int(os.environ.get("AKAUNTING_COMPANY_ID", "1"))
 ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad-nginx:8080")
 ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
+SIM_CLOCK_URL = os.environ.get("SIM_CLOCK_URL", "http://sim-clock:8000")
 
 # Approval policy thresholds (spec §10.2 defaults — all tunable via env)
 IC_AUTO_APPROVE_LIMIT = Decimal(os.environ.get("IC_AUTO_APPROVE_LIMIT", "25.00"))
@@ -208,16 +209,66 @@ async def get_pool() -> asyncpg.Pool:
 # Approval policy engine (§10.2)
 # SPEC_CLARIFICATIONS #3: is_lead bool derived from role_tier; longest-tenured = lead.
 # ---------------------------------------------------------------------------
+async def get_sim_time() -> datetime:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            r = await http.get(f"{SIM_CLOCK_URL}/sim_time")
+            r.raise_for_status()
+            return datetime.fromisoformat(r.json()["sim_time"])
+    except Exception:
+        log.warning("accounting-engine: could not reach sim-clock; using wall time")
+        return datetime.now(timezone.utc)
+
+
+async def _is_on_pto(conn: asyncpg.Connection, employee_id: int, sim_time: datetime) -> bool:
+    return bool(await conn.fetchval("""
+        SELECT 1 FROM pto_calendar WHERE employee_id = $1
+          AND start_sim_time <= $2 AND end_sim_time > $2 LIMIT 1
+    """, employee_id, sim_time))
+
+
+async def _redirect_pto_approver(
+    conn: asyncpg.Connection,
+    approver_id: int,
+    sim_time: datetime,
+) -> tuple[Optional[int], bool]:
+    """
+    Phase 19: if the resolved approver is currently on PTO, don't stall the approval —
+    route to their configured backup_approver_id if set and active and not themselves on
+    PTO, otherwise escalate one tier (to Principal), matching PLAN_REMAINING_PHASES.md
+    Phase 19 item 5 and the existing §10.2 escalation-tier convention.
+    """
+    if not await _is_on_pto(conn, approver_id, sim_time):
+        return (approver_id, False)
+
+    backup_id = await conn.fetchval("SELECT backup_approver_id FROM employees WHERE id = $1", approver_id)
+    if backup_id and not await _is_on_pto(conn, backup_id, sim_time):
+        backup_active = await conn.fetchval(
+            "SELECT 1 FROM employees WHERE id = $1 AND status = 'active'", backup_id
+        )
+        if backup_active:
+            log.info("PTO delegation: approver %d on PTO, routing to backup %d", approver_id, backup_id)
+            return (backup_id, False)
+
+    log.info("PTO delegation: approver %d on PTO with no usable backup, escalating to Principal", approver_id)
+    return (None, True)
+
+
 async def resolve_approver(
     conn: asyncpg.Connection,
     requester_id: int,
     amount: Decimal,
+    sim_time: Optional[datetime] = None,
 ) -> tuple[Optional[int], bool]:
     """
     Determine who should approve an expense request.
     Returns (approver_employee_id, approver_is_principal).
-    Spec §10.2 approval policy table.
+    Spec §10.2 approval policy table. Phase 19: PTO'd approvers are redirected to a backup
+    or escalated a tier rather than stalling the approval.
     """
+    if sim_time is None:
+        sim_time = await get_sim_time()
+
     requester = await conn.fetchrow(
         "SELECT id, department, role_tier, hired_at FROM employees WHERE id = $1 AND status = 'active'",
         requester_id
@@ -242,14 +293,14 @@ async def resolve_approver(
             # No lead in department → escalate straight to Principal (SPEC_CLARIFICATIONS #3)
             return (None, True)
         if amount <= LEAD_AUTO_APPROVE_LIMIT:
-            return (lead["id"], False)
+            return await _redirect_pto_approver(conn, lead["id"], sim_time)
         else:
             return (None, True)  # escalate to Principal
 
     # Lead: auto-approve ≤ LEAD_AUTO_APPROVE_LIMIT, else escalate to Principal
     elif role_tier == "lead":
         if amount <= LEAD_AUTO_APPROVE_LIMIT:
-            return (requester_id, False)  # auto-approved by lead's own limit
+            return await _redirect_pto_approver(conn, requester_id, sim_time)
         return (None, True)  # escalate to Principal
 
     # Principal (if an employee row exists for them): unlimited

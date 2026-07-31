@@ -201,11 +201,17 @@ async def post_mattermost_as_employee(
         r2.raise_for_status()
         post_id = r2.json()["id"]
 
-        # Revoke the ephemeral token
+        # Revoke the ephemeral token.
+        # BUG FOUND during Phase 19 verification: Mattermost has no `DELETE
+        # /users/{user_id}/tokens/{token_id}` route (404s silently since this call's result was
+        # never checked) — the real revoke endpoint is `POST /users/tokens/revoke` with a
+        # `{"token_id": ...}` body. This means every ephemeral impersonation token created here
+        # since Phase 17 has been leaking (never actually revoked). Fixed.
         token_id = r.json()["id"]
-        await http.delete(
-            f"{MATTERMOST_URL}/api/v4/users/{mattermost_id}/tokens/{token_id}",
+        await http.post(
+            f"{MATTERMOST_URL}/api/v4/users/tokens/revoke",
             headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
+            json={"token_id": token_id},
         )
 
     await audit_log(conn, "principal", "mattermost_posted_as_employee", {

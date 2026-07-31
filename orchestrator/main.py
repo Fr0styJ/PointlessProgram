@@ -23,9 +23,11 @@ Spec §18 design: orchestrator makes NO LLM calls. It only schedules other servi
 All state checks are SQL reads. All decisions are rule-based Python.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import random
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -66,6 +68,16 @@ PERF_REVIEW_INTERVAL_SIM_DAYS = int(os.environ.get("PERF_REVIEW_INTERVAL_DAYS", 
 PAYROLL_INTERVAL_SIM_DAYS = int(os.environ.get("PAYROLL_INTERVAL_DAYS", "14"))  # biweekly
 STALE_THREAD_THRESHOLD_SIM_DAYS = int(os.environ.get("STALE_THREAD_DAYS", "2"))
 APPROVAL_REMINDER_SIM_DAYS = float(os.environ.get("APPROVAL_REMINDER_DAYS", "1.0"))
+
+# Phase 19: PTO scheduler config
+PTO_CHECK_PROBABILITY = float(os.environ.get("PTO_DAILY_PROBABILITY", "0.01"))  # per active employee, per sim-day
+PTO_MIN_GAP_DAYS = int(os.environ.get("PTO_MIN_GAP_DAYS", "45"))  # min days between an employee's PTO windows
+PTO_DURATION_MIN_DAYS = int(os.environ.get("PTO_DURATION_MIN_DAYS", "3"))
+PTO_DURATION_MAX_DAYS = int(os.environ.get("PTO_DURATION_MAX_DAYS", "7"))
+MAILSERVER_CONTAINER = os.environ.get("MAILSERVER_CONTAINER", "fakeco-mailserver")
+MAILSERVER_DOMAIN = os.environ.get("MAILSERVER_DOMAIN", "fakecorp.internal")
+MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://mattermost:8065")
+MATTERMOST_ADMIN_TOKEN = os.environ.get("MATTERMOST_ADMIN_TOKEN", "")
 
 DEPARTMENTS = [
     "Engineering", "Sales", "Support", "Operations", "HR", "Finance", "Marketing"
@@ -119,6 +131,305 @@ async def record_run(conn: asyncpg.Connection, job_name: str, sim_time: datetime
         "orchestrator_job_ran",
         json.dumps({"job_name": job_name, "sim_time": sim_time.isoformat(), **(detail or {})}),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 19: PTO / out-of-office
+#
+# Sieve research finding (see BUILD_LOG.md Phase 19 entry): docker-mailserver's
+# `setup` CLI has NO subcommand for Sieve script management (`setup help` only
+# exposes email/alias/dkim/relay/debug/etc. — confirmed by inspecting a live
+# container). docker-mailserver *does* ship Dovecot Pigeonhole and its
+# `doveadm sieve` CLI plugin inside the same container, though, so rather than
+# hand-rolling the raw ManageSieve wire protocol (RFC 5804) against port 4190,
+# we drive `doveadm sieve put/activate/deactivate/delete -u <user>` via the
+# same `docker exec fakeco-mailserver ...` pattern provisioning already uses
+# for `setup email` — genuinely native Sieve/Pigeonhole, just invoked through
+# doveadm instead of `setup`. This is equivalent to (and simpler + more
+# reliable than) a raw ManageSieve client: doveadm's sieve plugin talks to the
+# exact same per-user script storage a ManageSieve client would.
+# ---------------------------------------------------------------------------
+VACATION_SIEVE_SCRIPT_NAME = "pto-vacation"
+
+
+def _vacation_sieve_script(employee_name: str, reason: str, end_sim_time: datetime) -> str:
+    """A real Sieve vacation-responder script (RFC 5230)."""
+    safe_reason = (reason or "PTO").replace('"', "'")
+    until = end_sim_time.date().isoformat()
+    return (
+        'require ["vacation"];\n'
+        "vacation\n"
+        '    :days 1\n'
+        f'    :subject "Out of office — {employee_name}"\n'
+        f'    "Hi,\\n\\nI am currently out of office ({safe_reason}) until {until}. '
+        'I will respond when I am back.\\n\\nThanks,\\n' + employee_name + '";\n'
+    )
+
+
+async def _docker_exec(*args: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", "-i", MAILSERVER_CONTAINER, *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+async def _docker_exec_stdin(stdin_data: bytes, *args: str) -> tuple[int, str, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", "-i", MAILSERVER_CONTAINER, *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate(input=stdin_data)
+    return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
+
+
+async def activate_vacation_sieve(mailbox_address: str, employee_name: str, reason: str, end_sim_time: datetime) -> None:
+    """Install + activate a real Sieve vacation responder on PTO start."""
+    script = _vacation_sieve_script(employee_name, reason, end_sim_time)
+    rc, out, err = await _docker_exec_stdin(
+        script.encode(), "doveadm", "sieve", "put", "-u", mailbox_address, VACATION_SIEVE_SCRIPT_NAME
+    )
+    if rc != 0:
+        raise RuntimeError(f"doveadm sieve put failed for {mailbox_address}: {err or out}")
+    rc, out, err = await _docker_exec("doveadm", "sieve", "activate", "-u", mailbox_address, VACATION_SIEVE_SCRIPT_NAME)
+    if rc != 0:
+        raise RuntimeError(f"doveadm sieve activate failed for {mailbox_address}: {err or out}")
+    log.info("PTO: activated Sieve vacation responder for %s", mailbox_address)
+
+
+async def deactivate_vacation_sieve(mailbox_address: str) -> None:
+    """
+    Remove the Sieve vacation responder on PTO end. Tolerant of already-gone state.
+
+    BUG FOUND during Phase 19 verification: `doveadm sieve deactivate -u <user> <name>` (passing
+    a script name, mirroring `activate`'s syntax) is NOT the same command as plain
+    `doveadm sieve deactivate -u <user>` — `deactivate` takes no script-name argument at all; it
+    always deactivates whatever is currently active. Passing an extra arg made it silently do
+    nothing (still exit non-zero further down the line), and the subsequent `sieve delete` then
+    failed with "Cannot delete the active Sieve script" — so PTO-end reversion looked like it
+    logged success but the vacation responder was, in fact, still ACTIVE afterward (confirmed via
+    `doveadm sieve list` still showing it ACTIVE post-revert). Fixed: no script-name arg to
+    `deactivate`.
+    """
+    await _docker_exec("doveadm", "sieve", "deactivate", "-u", mailbox_address)
+    rc, out, err = await _docker_exec("doveadm", "sieve", "delete", "-u", mailbox_address, VACATION_SIEVE_SCRIPT_NAME)
+    if rc != 0 and "unknown script" not in (err + out).lower() and "doesn't exist" not in (err + out).lower():
+        log.warning("PTO: sieve delete for %s returned rc=%d: %s", mailbox_address, rc, err or out)
+    log.info("PTO: deactivated Sieve vacation responder for %s", mailbox_address)
+
+
+async def set_mattermost_oof_status(mattermost_id: str, end_sim_time: datetime) -> None:
+    """
+    Real Mattermost custom status via PUT /api/v4/users/{id}/status/custom, using an
+    ephemeral admin-issued personal access token to act as the employee — same
+    impersonation pattern as human-bridge's post_mattermost_as_employee.
+    """
+    if not MATTERMOST_ADMIN_TOKEN or not mattermost_id:
+        return
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        r = await http.post(
+            f"{MATTERMOST_URL}/api/v4/users/{mattermost_id}/tokens",
+            headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
+            json={"description": "orchestrator PTO status token"},
+        )
+        r.raise_for_status()
+        token = r.json()["token"]
+        token_id = r.json()["id"]
+        try:
+            r2 = await http.put(
+                f"{MATTERMOST_URL}/api/v4/users/{mattermost_id}/status/custom",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "emoji": "palm_tree",
+                    "text": "Out of Office",
+                    "duration": "date_and_time",
+                    "expires_at": end_sim_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                },
+            )
+            r2.raise_for_status()
+        finally:
+            # Real bug found here during Phase 19 verification (and present in human-bridge's
+            # post_mattermost_as_employee, copied from the same pattern): Mattermost has no
+            # `DELETE /users/{user_id}/tokens/{token_id}` route — that 404s silently (this code
+            # doesn't check the status, so the ephemeral token was never actually being revoked).
+            # The real revoke endpoint is `POST /users/tokens/revoke` with a `{"token_id": ...}`
+            # body. Verified directly: DELETE returned 404 and the token was still listed under
+            # GET /users/{id}/tokens afterward; switching to POST /tokens/revoke actually removes it.
+            await http.post(
+                f"{MATTERMOST_URL}/api/v4/users/tokens/revoke",
+                headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
+                json={"token_id": token_id},
+            )
+    log.info("PTO: set Mattermost OOO custom status for user %s", mattermost_id)
+
+
+async def clear_mattermost_oof_status(mattermost_id: str) -> None:
+    """Revert the custom status on PTO end (unset via PUT /status/custom/unset)."""
+    if not MATTERMOST_ADMIN_TOKEN or not mattermost_id:
+        return
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        r = await http.post(
+            f"{MATTERMOST_URL}/api/v4/users/{mattermost_id}/tokens",
+            headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
+            json={"description": "orchestrator PTO status token"},
+        )
+        r.raise_for_status()
+        token = r.json()["token"]
+        token_id = r.json()["id"]
+        try:
+            r2 = await http.delete(
+                f"{MATTERMOST_URL}/api/v4/users/{mattermost_id}/status/custom",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            r2.raise_for_status()
+        finally:
+            # Real bug found here during Phase 19 verification (and present in human-bridge's
+            # post_mattermost_as_employee, copied from the same pattern): Mattermost has no
+            # `DELETE /users/{user_id}/tokens/{token_id}` route — that 404s silently (this code
+            # doesn't check the status, so the ephemeral token was never actually being revoked).
+            # The real revoke endpoint is `POST /users/tokens/revoke` with a `{"token_id": ...}`
+            # body. Verified directly: DELETE returned 404 and the token was still listed under
+            # GET /users/{id}/tokens afterward; switching to POST /tokens/revoke actually removes it.
+            await http.post(
+                f"{MATTERMOST_URL}/api/v4/users/tokens/revoke",
+                headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
+                json={"token_id": token_id},
+            )
+    log.info("PTO: cleared Mattermost OOO custom status for user %s", mattermost_id)
+
+
+async def maybe_schedule_pto(conn: asyncpg.Connection, sim_time: datetime) -> None:
+    """
+    Deterministic-per-run (seeded on employee id + sim date, so a given tick's decision is
+    reproducible) daily probability check per active employee: if not currently on PTO and
+    not within PTO_MIN_GAP_DAYS of their last window, roll PTO_CHECK_PROBABILITY to start a
+    new PTO_DURATION_MIN..MAX-day window starting today.
+    """
+    job_name = f"pto_schedule_check:{sim_time.date()}"
+    if await get_last_run(conn, job_name) is not None:
+        return  # already rolled today
+
+    employees = await conn.fetch("SELECT id, name FROM employees WHERE status = 'active'")
+    for emp in employees:
+        last_window = await conn.fetchrow("""
+            SELECT end_sim_time FROM pto_calendar
+            WHERE employee_id = $1 ORDER BY end_sim_time DESC LIMIT 1
+        """, emp["id"])
+        if last_window and (sim_time - last_window["end_sim_time"]).days < PTO_MIN_GAP_DAYS:
+            continue
+        on_pto_now = await conn.fetchval("""
+            SELECT 1 FROM pto_calendar WHERE employee_id = $1
+              AND start_sim_time <= $2 AND end_sim_time > $2 LIMIT 1
+        """, emp["id"], sim_time)
+        if on_pto_now:
+            continue
+
+        # Deterministic RNG seeded per (employee, sim-date) so re-running the same tick
+        # never double-rolls, and results are reproducible for testing.
+        seed = int(hashlib.sha256(f"pto:{emp['id']}:{sim_time.date()}".encode()).hexdigest()[:8], 16)
+        rng = random.Random(seed)
+        if rng.random() >= PTO_CHECK_PROBABILITY:
+            continue
+
+        duration_days = rng.randint(PTO_DURATION_MIN_DAYS, PTO_DURATION_MAX_DAYS)
+        start = sim_time
+        end = sim_time + timedelta(days=duration_days)
+        await conn.execute("""
+            INSERT INTO pto_calendar (employee_id, start_sim_time, end_sim_time, reason)
+            VALUES ($1, $2, $3, $4)
+        """, emp["id"], start, end, "Scheduled time off")
+        log.info("PTO: scheduled %s out from %s to %s", emp["name"], start.date(), end.date())
+
+    await record_run(conn, job_name, sim_time)
+
+
+async def maybe_apply_pto_effects(conn: asyncpg.Connection, sim_time: datetime) -> None:
+    """
+    Per tick: apply the real Sieve + Mattermost effects for any PTO window that has started
+    but whose start-effects haven't been applied yet, and revert (+ fire a catching-up burst)
+    for any window whose end-effects haven't been applied yet.
+    """
+    starting = await conn.fetch("""
+        SELECT p.id, p.employee_id, p.end_sim_time, p.reason,
+               e.name, e.mailbox_address, e.mattermost_id
+        FROM pto_calendar p JOIN employees e ON e.id = p.employee_id
+        WHERE p.start_sim_time <= $1 AND p.end_sim_time > $1
+    """, sim_time)
+    for row in starting:
+        job_name = f"pto_start_effects:{row['id']}"
+        if await get_last_run(conn, job_name) is not None:
+            continue
+        try:
+            if row["mailbox_address"]:
+                await activate_vacation_sieve(row["mailbox_address"], row["name"], row["reason"], row["end_sim_time"])
+            if row["mattermost_id"]:
+                await set_mattermost_oof_status(row["mattermost_id"], row["end_sim_time"])
+            await record_run(conn, job_name, sim_time, {"employee_id": row["employee_id"], "pto_id": row["id"]})
+        except Exception as exc:
+            log.error("PTO start-effects failed for employee %d: %s", row["employee_id"], exc)
+
+    ending = await conn.fetch("""
+        SELECT p.id, p.employee_id, e.name, e.mailbox_address, e.mattermost_id
+        FROM pto_calendar p JOIN employees e ON e.id = p.employee_id
+        WHERE p.end_sim_time <= $1
+    """, sim_time)
+    for row in ending:
+        job_name = f"pto_end_effects:{row['id']}"
+        if await get_last_run(conn, job_name) is not None:
+            continue
+        try:
+            if row["mailbox_address"]:
+                await deactivate_vacation_sieve(row["mailbox_address"])
+            if row["mattermost_id"]:
+                await clear_mattermost_oof_status(row["mattermost_id"])
+            await record_run(conn, job_name, sim_time, {"employee_id": row["employee_id"], "pto_id": row["id"]})
+            await fire_catching_up_burst(conn, sim_time, row["employee_id"], row["name"])
+        except Exception as exc:
+            log.error("PTO end-effects failed for employee %d: %s", row["employee_id"], exc)
+
+
+async def is_employee_on_pto(conn: asyncpg.Connection, employee_id: int, sim_time: datetime) -> bool:
+    return bool(await conn.fetchval("""
+        SELECT 1 FROM pto_calendar WHERE employee_id = $1
+          AND start_sim_time <= $2 AND end_sim_time > $2 LIMIT 1
+    """, employee_id, sim_time))
+
+
+async def fire_catching_up_burst(conn: asyncpg.Connection, sim_time: datetime, employee_id: int, employee_name: str) -> None:
+    """
+    On the tick an employee's PTO window just ended: one extra burst of routine activity for
+    them specifically, via a pending_reactions row targeting them in their department's most
+    recently active open thread (reusing the same mechanism human-bridge/meeting-simulator's
+    continuity loop already consumes — no new consumption path needed).
+    """
+    emp = await conn.fetchrow("SELECT department FROM employees WHERE id = $1", employee_id)
+    if emp is None:
+        return
+    thread_id = await conn.fetchval("""
+        SELECT id FROM narrative_threads WHERE department = $1 AND status = 'open'
+        ORDER BY updated_at DESC LIMIT 1
+    """, emp["department"])
+    if thread_id is None:
+        thread_id = await conn.fetchval("""
+            INSERT INTO narrative_threads (topic, department, status, summary)
+            VALUES ($1, $2, 'open', '') RETURNING id
+        """, f"{employee_name} catching up after PTO", emp["department"])
+    event_id = await conn.fetchval("""
+        INSERT INTO narrative_events (thread_id, employee_id, origin, source_type, source_ref, short_summary)
+        VALUES ($1, $2, 'external', 'external', $3, $4)
+        RETURNING id
+    """, thread_id, employee_id, f"pto_return:{employee_id}:{sim_time.isoformat()}",
+        f"{employee_name} is back from PTO and catching up.")
+    await conn.execute("""
+        INSERT INTO pending_reactions (thread_id, target_employee_id, triggering_event_id, status)
+        VALUES ($1, $2, $3, 'pending')
+    """, thread_id, employee_id, event_id)
+    log.info("PTO: fired catching-up burst for %s", employee_name)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +498,9 @@ async def maybe_run_performance_reviews(conn: asyncpg.Connection, sim_time: date
         last_run = await get_last_run(conn, job_name)
         if last_run is not None:
             continue  # Already ran this month for this employee
+        if await is_employee_on_pto(conn, emp["id"], sim_time):
+            log.info("Orchestrator: skipping performance_review for %s — on PTO", emp["name"])
+            continue
 
         log.info("Orchestrator: firing performance_review for employee %d (%s)", emp["id"], emp["name"])
         try:
@@ -306,6 +620,8 @@ async def tick_loop(pool: asyncpg.Pool) -> None:
 
             async with pool.acquire() as conn:
                 # Order matches spec §4.3 priority: crisis first, then scheduled, then maintenance
+                await maybe_schedule_pto(conn, sim_time)
+                await maybe_apply_pto_effects(conn, sim_time)
                 await maybe_handle_stale_threads(conn, sim_time)
                 await maybe_run_performance_reviews(conn, sim_time)
                 await maybe_run_standups(conn, sim_time)
@@ -387,6 +703,10 @@ async def manual_trigger(job_name: str, pool: PoolDep):
             await maybe_handle_stale_threads(conn, sim_time)
         elif job_name == "performance-reviews":
             await maybe_run_performance_reviews(conn, sim_time)
+        elif job_name == "pto-schedule":
+            await maybe_schedule_pto(conn, sim_time)
+        elif job_name == "pto-effects":
+            await maybe_apply_pto_effects(conn, sim_time)
         else:
             return {"status": "unknown_job", "job": job_name}
     return {"status": "triggered", "job": job_name, "sim_time": sim_time.isoformat()}

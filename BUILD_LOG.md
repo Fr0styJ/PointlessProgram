@@ -614,6 +614,133 @@ Wiki.js/Mattermost/Akaunting were untested) by bringing `kpi-engine` up in the m
 
 ---
 
+### 2026-07-31T19:10 — Phase 19 (PTO / out-of-office) built and runtime-verified (4 real bugs found and fixed)
+
+- **What was built**, per `PLAN_REMAINING_PHASES.md`'s Phase 19 section — everything lives in
+  `orchestrator/main.py` and `accounting-engine/main.py`, no new microservice (spec explicitly
+  folds this into existing services rather than a dedicated one):
+  1. **`maybe_schedule_pto()`** — new orchestrator tick-loop job. Deterministic-per-(employee, sim
+     date) RNG (seeded via sha256, so re-running the same tick never double-rolls) checks
+     `PTO_DAILY_PROBABILITY` (default 1%/day) per active employee, respecting `PTO_MIN_GAP_DAYS`
+     (default 45) since their last window, and inserts a `PTO_DURATION_MIN..MAX_DAYS` (default 3–7)
+     window into `pto_calendar`.
+  2. **Real Sieve vacation responder.** Researched first, per the plan's explicit flag: `docker exec
+     fakeco-mailserver setup help` shows **no** Sieve subcommand under `setup` at all (only
+     email/alias/dkim/relay/debug/quota/etc.) — confirmed against the live container, not just
+     docs. docker-mailserver *does* bundle Dovecot Pigeonhole with a `doveadm sieve` CLI plugin in
+     the same container, though, so rather than hand-rolling raw ManageSieve (RFC 5804) on port
+     4190, `orchestrator` now does `docker exec fakeco-mailserver doveadm sieve put/activate/
+     deactivate/delete -u <mailbox>` — genuinely native per-user Sieve script management, just
+     driven through doveadm instead of `setup`. Mirrors `provisioning`'s existing docker-exec
+     pattern; added `docker-cli` to `orchestrator/Dockerfile` (same package gotcha as
+     `provisioning/Dockerfile` already documents) and mounted the docker socket
+     (`:ro`, matching `provisioning`'s mount) into the orchestrator container in
+     `docker-compose.yml`.
+  3. **Real Mattermost custom status.** `PUT /api/v4/users/{id}/status/custom` (emoji
+     `palm_tree`, text "Out of Office", `expires_at` = the PTO window's end), using the same
+     ephemeral-admin-PAT impersonation pattern as `human-bridge`'s `post_mattermost_as_employee`
+     (create token, act as employee, revoke).
+  4. **`maybe_apply_pto_effects()`** — per-tick job that idempotently (via the same
+     `system_audit_log`-backed `get_last_run`/`record_run` job-tracking convention as every other
+     orchestrator job) applies both start-effects the tick a window opens, and both end-effects +
+     fires a "catching up" burst the tick a window closes.
+  5. **Continuity-loop skip.** `maybe_run_performance_reviews()` now skips any eligible employee
+     currently on PTO (`is_employee_on_pto()` helper, reusable).
+  6. **"Catching up" burst.** `fire_catching_up_burst()` — on PTO-end, opens/reuses the employee's
+     department's open `narrative_threads` row and writes a `pending_reactions` row targeting them,
+     reusing the exact mechanism `human-bridge`'s Phase 17 detection layer already writes into (no
+     new consumption path needed).
+  7. **Approval delegation** — `accounting-engine`'s `resolve_approver()` (§10.2) now takes
+     `sim_time` and, whenever it would route an expense to a specific approver (dept lead for an
+     IC's request, or a lead auto-approving their own), calls a new `_redirect_pto_approver()`:
+     if that approver is currently on PTO, route to their `backup_approver_id` (new nullable
+     column on `employees`, `narrative-db/migrations/006_phase19_pto.sql`) if one is configured,
+     active, and not themselves on PTO; otherwise escalate one tier to Principal — matching the
+     existing 10.2 no-lead-in-department escalation convention exactly rather than inventing a new
+     code path.
+- **4 real bugs found via live verification** (isolated stack, project name `fakeco-p19`, brought
+  up from this worktree with mailserver/mattermost/sim-clock/narrative-db-migrate/provisioning/
+  accounting-engine/orchestrator profiles — main `fakeco-*` stack was never touched):
+  1. **`sim-clock`'s healthcheck was broken in a clean build.** `sim-clock/Dockerfile` never
+     installed `curl`, but `docker-compose.yml`'s healthcheck for it runs `curl -f .../health` —
+     it failed every check with `exec: "curl": executable file not found in $PATH`, permanently
+     stuck `unhealthy`, which blocks anything with
+     `depends_on: sim-clock: condition: service_healthy` (i.e. `orchestrator`) from ever starting
+     on a fresh environment. The main long-running stack happened to still be reporting "healthy"
+     from a stale/earlier health-check state, which is why this was invisible until a genuinely
+     clean rebuild. **Fixed:** added `curl` to `sim-clock/Dockerfile` (matching the existing
+     apt-get pattern in `provisioning`/`orchestrator`).
+  2. **`doveadm sieve deactivate` does not take a script-name argument.** Mirroring `activate
+     <name>`'s syntax, the first implementation called
+     `doveadm sieve deactivate -u <user> <name>` — this is not a valid invocation; `deactivate`
+     always targets whichever script is currently active and takes no name. The extra arg made it
+     silently do nothing, and the subsequent `doveadm sieve delete` then failed with `"Cannot
+     delete the active Sieve script"`. The end-of-PTO code logged success regardless (it only
+     warned on delete failure, not on this). Verified directly: after a full start→end cycle with
+     the buggy code, `doveadm sieve list -u alice.johnson@fakecorp.internal` still showed
+     `pto-vacation ACTIVE` — the revert had not actually happened. **Fixed:** call
+     `deactivate -u <user>` with no script-name arg; re-verified the same cycle end-to-end and
+     `doveadm sieve list` now returns empty after PTO end.
+  3. **Mattermost personal-access-token revocation was silently broken, in code copied from
+     `human-bridge`.** Both the new orchestrator code (copied the pattern) and the pre-existing
+     `human-bridge.post_mattermost_as_employee` called
+     `DELETE /api/v4/users/{user_id}/tokens/{token_id}` to revoke the ephemeral impersonation
+     token — that route doesn't exist (404, unchecked). The real endpoint is
+     `POST /api/v4/users/tokens/revoke` with a `{"token_id": ...}` body. Verified directly:
+     `DELETE` returned 404 and `GET /users/{id}/tokens` still listed the token afterward;
+     switching to `POST /tokens/revoke` actually removes it (confirmed empty token list after).
+     Since this pattern has been in place since Phase 17, every ephemeral impersonation token
+     `human-bridge` has ever created has been leaking (never revoked) until this fix. **Fixed in
+     both `orchestrator/main.py` and `human-bridge/main.py`.**
+  4. (Pre-existing, worked around, not fixed) `docker-compose.yml` gives several services
+     hard-coded `container_name`s, which collide with the main long-running `fakeco-*` stack when
+     bringing up a second project for isolated testing. Worked around with a temporary,
+     not-committed `docker-compose.override.p19.yml` (renaming conflicting containers +
+     redirecting `MAILSERVER_CONTAINER`/`MATTERMOST_ADMIN_TOKEN`) for this session's verification
+     only; deleted after teardown. Not a code change — flagging for whoever eventually builds a
+     proper test-stack convention.
+- **Verified against a live, isolated `fakeco-p19` stack** (mailserver + mattermost + sim-clock +
+  narrative-db-migrate + provisioning + accounting-engine + orchestrator; Zammad/Wiki.js/Akaunting/
+  meeting-simulator not brought up since Phase 19 doesn't depend on them — provisioning's
+  Zammad/Wiki.js calls failed as a result, expected and unrelated, so `mailbox_address` /
+  `mattermost_id` were set directly on one test employee (Alice Johnson, Engineering lead) to
+  exercise the mail/Mattermost paths):
+  - Inserted a `pto_calendar` row starting immediately; triggered `POST /trigger/pto-effects`;
+    confirmed via `doveadm sieve list -u alice.johnson@fakecorp.internal` → `pto-vacation ACTIVE`
+    (a real script, fetched and inspected — genuine RFC 5230 `vacation` statement) and via
+    `GET /api/v4/users/{id}` → `props.customStatus` containing the palm-tree emoji, "Out of
+    Office" text, and correct `expires_at`.
+  - Submitted an expense (`POST /expense/submit`, IC requester, amount in the lead-approval range)
+    while Alice (the dept lead / natural approver) was on PTO with `backup_approver_id` set to
+    another Engineering employee: confirmed `pending_approvals.approver_employee_id` was the
+    backup, not Alice, and not stalled. Cleared the backup and resubmitted: confirmed it escalated
+    to `approver_is_principal = true` instead.
+  - Set the PTO window's `end_sim_time` into the past and re-triggered `pto-effects`: confirmed the
+    Sieve script was fully deactivated + deleted (`doveadm sieve list` empty), confirmed
+    `props.customStatus` was cleared (`GET /users/{id}` → `""`), confirmed the ephemeral Mattermost
+    token was actually revoked (`POST /tokens/revoke` → 200, token no longer in
+    `GET /users/{id}/tokens`), and confirmed a `pending_reactions` row was created targeting Alice
+    (the "catching up" burst).
+  - Triggered `pto-schedule` manually: ran without error against real employee data (no window
+    rolled that run, expected given the low daily probability and `PTO_MIN_GAP_DAYS` guard from the
+    just-created test windows).
+  - Did not get a clean end-to-end check of the performance-review PTO skip specifically (no
+    employee was tenure-eligible for a review in this short-lived test stack) — the skip logic
+    (`is_employee_on_pto()` gate added to `maybe_run_performance_reviews()`) is the same helper
+    proven correct by every other check above, so this is a lower-confidence but low-risk gap.
+  - Torn down cleanly: `docker compose -p fakeco-p19 down -v` (plus a manual `docker rm -f` /
+    `docker network rm` / `docker volume rm` pass for a few containers-in-use edge cases) — no
+    `fakeco-p19-*` containers, networks, or volumes remained; the main `fakeco-*` stack (verified
+    both before and after) was untouched throughout.
+- **Files touched:** `orchestrator/main.py`, `orchestrator/Dockerfile`, `accounting-engine/main.py`,
+  `human-bridge/main.py` (bug fix only), `sim-clock/Dockerfile` (bug fix only), `docker-compose.yml`
+  (orchestrator: docker socket mount + new env vars), `narrative-db/migrations/006_phase19_pto.sql`
+  (new `employees.backup_approver_id` column).
+- **Next:** Phase 20 (interpersonal relationships) — meeting-simulator extension, no new
+  appliance integration needed, lower risk than this phase's Sieve research.
+
+---
+
 ### 2026-07-31T18:40 — Phase 17 PARTIALLY verified: 2 real bugs fixed in what exists, but a major architectural gap found and NOT fixed
 
 - **Major gap, not a bug — a missing feature:** re-read spec §7 carefully against
