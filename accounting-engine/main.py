@@ -89,7 +89,13 @@ class AkauntingClient:
         self.base = base_url.rstrip("/") + "/api"
         self.company_id = company_id
         self.auth = (email, password)
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # Laravel's TrustHosts middleware rejects the bare service DNS name ("akaunting") —
+        # every request needs a Host header matching Akaunting's configured APP_URL
+        # (accounting.fakecorp.internal), even though we connect directly to the container,
+        # bypassing Traefik. Found live: every real call from this client was silently 500ing
+        # with "Untrusted Host" outside of manual tests that happened to pass an explicit
+        # Host header via curl -H — this was never actually exercised as this client sends it.
+        self._client = httpx.AsyncClient(timeout=30.0, headers={"Host": "accounting.fakecorp.internal"})
 
     async def close(self):
         await self._client.aclose()

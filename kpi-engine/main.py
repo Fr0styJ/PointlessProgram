@@ -152,6 +152,12 @@ class WikiJSClient:
         return body
 
     async def list_pages(self) -> list[dict]:
+        # `pages.list`'s item type (PageListItem) does NOT expose authorId/creatorId — those
+        # only exist on the single-page type (`pages.single(id)`). Confirmed via GraphQL
+        # introspection against a live instance: requesting them on `list` 400s with
+        # "Cannot query field \"authorId\" on type \"PageListItem\"". Fetch the list first,
+        # then a per-page `single` query to get attribution (N+1, acceptable for a once-daily
+        # rollup over a realistically small wiki page count).
         result = await self.graphql("""
             query {
                 pages {
@@ -159,8 +165,6 @@ class WikiJSClient:
                         id
                         path
                         title
-                        authorId
-                        creatorId
                         createdAt
                         updatedAt
                     }
@@ -168,6 +172,20 @@ class WikiJSClient:
             }
         """)
         pages = ((result.get("data") or {}).get("pages") or {}).get("list") or []
+        for p in pages:
+            detail = await self.graphql("""
+                query($id: Int!) {
+                    pages {
+                        single(id: $id) {
+                            authorId
+                            creatorId
+                        }
+                    }
+                }
+            """, {"id": p["id"]})
+            single = ((detail.get("data") or {}).get("pages") or {}).get("single") or {}
+            p["authorId"] = single.get("authorId")
+            p["creatorId"] = single.get("creatorId")
         return pages
 
 
@@ -229,7 +247,19 @@ class AkauntingClient:
         self.base = base_url.rstrip("/") + "/api"
         self.company_id = company_id
         self.auth = (email, password)
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # Akaunting resolves company context from the `X-Company` header specifically — NOT a
+        # `company`/`company_id` query param or a header named `company`. Without it, module-
+        # dependent parts of the API return 500 (confirmed live: this exact endpoint 500'd until
+        # the header was added). See BUILD_LOG.md's Phase 9/15 entry ("X-Company") for the full
+        # root-cause writeup from when this was first found.
+        # ALSO needs a `Host` header matching Akaunting's APP_URL (Laravel's TrustHosts
+        # middleware rejects the bare "akaunting" service DNS name with a 500 "Untrusted Host" —
+        # found live while verifying this exact rollup call; also affected accounting-engine's
+        # AkauntingClient, fixed there too in the same pass).
+        self._client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={"X-Company": str(company_id), "Host": "accounting.fakecorp.internal"},
+        )
 
     async def close(self):
         await self._client.aclose()

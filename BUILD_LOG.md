@@ -47,6 +47,60 @@
 
 ---
 
+### 2026-07-31T23:45 — Phase 23 follow-up closed: kpi-engine's live-appliance rollup verified against the main stack, 3 real bugs found and fixed (2 also affected the already-"verified" accounting-engine)
+
+Closed the gap flagged in the Phase 23 entry below (its live rollup calls against real Zammad/
+Wiki.js/Mattermost/Akaunting were untested) by bringing `kpi-engine` up in the main running stack
+(`docker compose --profile phase13 --profile phase23 up -d --build kpi-engine`) and calling
+`POST /rollup/run` for real.
+
+1. **Wiki.js: `pages.list`'s item type doesn't expose `authorId`/`creatorId`.** The rollup 400'd
+   immediately (`Cannot query field "authorId" on type "PageListItem"`) — confirmed via GraphQL
+   introspection (`__type(name: "PageListItem")`) that the list type only has
+   id/path/locale/title/description/contentType/isPublished/isPrivate/privateNS/createdAt/
+   updatedAt/tags; author/creator attribution only exists on the single-page type
+   (`pages.single(id)`, confirmed via the same introspection technique against `Page`). **Fixed:**
+   `list_pages()` now fetches the list first, then does a per-page `pages.single(id)` follow-up
+   query for `authorId`/`creatorId` (N+1, acceptable for a once-daily rollup over a realistically
+   small wiki).
+2. **Akaunting: `AkauntingClient` had no `X-Company` header at all**, despite kpi-engine's own code
+   comment claiming it followed "the same X-Company-aware pattern as accounting-engine" — it
+   didn't; it only sent `company_id` as a query param, which was never sufficient (see this
+   session's Phase 9/15 entry for the original root-cause). **Fixed:** added the header.
+3. **Real regression found in already-"verified" `accounting-engine`, not just kpi-engine:**
+   even with the `X-Company` header, `GET /transactions` still 500'd —
+   `{"message":"Untrusted Host \"akaunting\".","status_code":500}`. Root cause: Laravel's
+   `TrustHosts` middleware rejects the bare service DNS name; it only accepts a `Host` header
+   matching Akaunting's configured `APP_URL` (`accounting.fakecorp.internal`). Tested directly
+   against `fakeco-accounting-engine`'s own running container (`docker exec ... python3 -c
+   "httpx.get('http://akaunting/...)"`) — **confirmed this exact "Untrusted Host" 500 has been
+   happening on every real call accounting-engine has ever made to Akaunting**, and was masked
+   this whole session because every manual verification curl in Phase 9/15's entries explicitly
+   passed `-H "Host: accounting.fakecorp.internal"`, which the Python client code itself never
+   did. This means Phase 15's accounting-engine (payroll, raises, revenue posting, Books Auditor)
+   has likely never successfully posted a single transaction outside of this session's manual
+   curl tests — a real, previously undiscovered bug in already-committed code. **Fixed in both
+   `accounting-engine/main.py` and `kpi-engine/main.py`'s `AkauntingClient`**: added
+   `headers={"Host": "accounting.fakecorp.internal"}` to the shared httpx client.
+- **Verified after all three fixes:** `POST /rollup/run` against the live main stack now returns
+  `{"status":"complete","snapshot_date":"2026-07-30","rows_written":7}` — real Zammad ticket
+  counts, Wiki.js chat/page metrics, Mattermost chat-message counts, and an Akaunting revenue
+  query all succeeded and wrote real rows to `kpi_snapshots` (spot-checked via direct SQL).
+  `GET /reviews/due` also confirmed working against the full live roster — correct quartile
+  ranking, `top_quartile`/`second_quartile`/`rest` tiers, and `underperforming` flags per
+  department.
+- **Follow-up this surfaces:** since accounting-engine's Akaunting calls were silently broken
+  this entire session outside of manual curl verification, Phase 15's own exit criteria (expense
+  approval posting a real ledger transaction, payroll run totals matching Akaunting, raise
+  application, Books Auditor correction) should be re-verified now that the Host-header fix is in
+  — they were never actually exercised through the real code path before this fix landed.
+- **Files touched:** `kpi-engine/main.py` (Wiki.js list_pages fix, X-Company + Host headers),
+  `accounting-engine/main.py` (Host header fix)
+- **Next:** re-verify Phase 15 (accounting-engine) end-to-end now that its Akaunting client
+  actually works; then Phase 19 (PTO, in progress).
+
+---
+
 ### 2026-07-31T18:20 — Seeded `customers` table (Phase 22 prospect-loop gap, flagged 22:30 entry below); fixed 2 real Zammad ticket-creation bugs found while verifying it
 
 - **Added** `narrative-db/migrations/005_customers_seed.sql`: 6 placeholder prospect companies
