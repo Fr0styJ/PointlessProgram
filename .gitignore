@@ -1,0 +1,62 @@
+# .gitignore — FakeCo "Real Appliances"
+
+# Real env file (contains secrets — NEVER commit)
+.env
+*.env.local
+*.env.production
+
+# Docker volumes and persistent data
+volumes/
+data/
+
+# Secrets and certificates
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Snapshot storage
+snapshots/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+.next/
+dist/
+.cache/
+
+# Logs (local dev runs)
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
