@@ -6,10 +6,10 @@
 
 | Field | Value |
 |---|---|
-| **Current Phase** | Phase 0 — Repo & build-log scaffolding |
-| **Percent Complete** | ~3% (1/39 phases, weighted) |
-| **Status** | IN PROGRESS |
-| **Exact Next Action** | Create directory stubs for all custom deliverables listed in spec §27, each with a placeholder README.md stating which phase populates it |
+| **Current Phase** | Phase 1 — Compose topology, networks, shared Postgres, socket-proxy |
+| **Percent Complete** | ~5% (Phase 0 of 39 complete) |
+| **Status** | Phase 0 COMPLETE — Phase 1 READY TO START |
+| **Exact Next Action** | Create `docker-compose.yml` defining all 7 networks from spec §22 with correct `internal: true` flags, add Postgres service on `net_data`, add `tecnativa/docker-socket-proxy` on `net_mgmt`, verify both come up healthy |
 
 **Environment:**
 - OS: Windows, shell: pwsh
@@ -42,6 +42,22 @@
 ---
 
 ## LOG (newest first)
+
+---
+
+### 2026-07-31T11:36 — Phase 0 COMPLETE
+
+- **Completed:** All Phase 0 exit criteria verified:
+  - Git repo initialized, first commit made: `a188a77`
+  - `BUILD_LOG.md` created with two-part structure (status header + reverse-chronological log)
+  - All 15 custom deliverable directories created, each with a placeholder `README.md`:
+    `orchestrator/`, `meeting-simulator/`, `human-bridge/`, `sim-clock/`, `accounting-engine/`,
+    `purge-manager/`, `snapshot-manager/`, `external-world/`, `kpi-engine/`, `branding-manager/`,
+    `narrative-db/`, `dashboard/`, `provisioning/`, `litellm/`, `monitoring/`
+  - `.env.example` created with all credential stubs (no values) for every category in §26
+  - `.gitignore` created excluding `.env`, volumes, secrets
+- **Files touched:** `BUILD_LOG.md`, `.env.example`, `.gitignore`, all 15 `README.md` stubs
+- **Next:** Phase 1 — `docker-compose.yml` with 7 networks, Postgres, docker-socket-proxy
 
 ---
 
