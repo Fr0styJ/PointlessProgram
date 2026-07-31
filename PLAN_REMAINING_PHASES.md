@@ -169,6 +169,17 @@ instances before committing to an approach.
 
 ## Phase 29 — Data purge & snapshots
 
+**STATUS: DONE (2026-07-31).** Built and runtime-verified against a disposable throwaway
+`docker compose -p fakeco-p29` environment (never the live primary stack). See `BUILD_LOG.md`'s
+2026-07-31T20:05 entry and `PHASE29_PLAN.md` for full detail: `snapshot-manager` (save/restore,
+direct-DB-network sidecar, no `docker exec`) and `purge-manager` (10 scoped endpoints +
+`/purge/full`, mandatory pre-purge snapshot + typed confirmation gate) both built, wired into
+`docker-compose.yml` under `profiles: [phase13, phase29]`, migration `008_phase29_purge_snapshots.sql`
+added. Round-trip save/mutate/restore verified non-lossy for the narrative DB; confirmation gate
+and mandatory-snapshot-blocks-purge rule both verified live. Known flagged simplifications: email
+purge doesn't wipe the raw Maildir, roster purge doesn't live-deprovision appliance accounts,
+Zammad ES isn't auto-reindexed after restore — all documented in each endpoint's response body.
+
 **Depends on:** effectively everything through Phase 28 (not in this batch, but PHASES.md notes
 24/28 recommended-not-required — proceeding without them just means pay-negotiation/crisis data
 won't have dedicated purge handling yet, acceptable gap for a first pass).

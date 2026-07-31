@@ -72,7 +72,10 @@ networks:
     internal: true
 
   net_data:
-    # Shared PostgreSQL (incl. Akaunting's own DB, snapshot storage)
+    # Shared PostgreSQL (narrative/mattermost/zammad/wikijs/nextcloud DBs).
+    # NOTE: Akaunting's own DB is deliberately on net_dmz, NOT here (see net_dmz
+    # below) — this comment previously said otherwise; corrected in Phase 29.
+    # snapshot_storage (Phase 29) is its own dedicated volume, not on this network.
     driver: bridge
     internal: true
 
@@ -93,6 +96,11 @@ networks:
 # =============================================================================
 volumes:
   postgres_data:
+    driver: local
+
+  # PHASE 29: snapshot storage — one directory per snapshot, mounted only into
+  # snapshot-manager (see docker-compose.yml PHASE 29 services below).
+  snapshot_storage:
     driver: local
 
   # Placeholder volumes for later phases — declared now so `docker compose up` doesn't
@@ -1524,11 +1532,114 @@ services:
       - phase21
 
   # ---------------------------------------------------------------------------
-  # PHASES 29+: Custom services — added as their phases execute.
+  # PHASE 29: snapshot-manager — direct-DB-network sidecar for snapshot save/restore.
+  # PHASE29_PLAN.md (signed off 2026-07-31): multi-homed onto net_data + net_dmz +
+  # net_mail (every stateful appliance's DB/Maildir) + net_mgmt (docker-socket-proxy
+  # start/stop calls during restore). NEVER uses `docker exec` — EXEC=0 on
+  # docker-socket-proxy (Phase 1) is a hard constraint, not worked around here.
+  # ---------------------------------------------------------------------------
+  snapshot-manager:
+    build:
+      context: ./snapshot-manager
+      dockerfile: Dockerfile
+    container_name: fakeco-snapshot-manager
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      POSTGRES_USER: "${POSTGRES_USER:-fakeco}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-fakeco}"
+      MATTERMOST_DB_PASSWORD: "${MATTERMOST_DB_PASSWORD}"
+      ZAMMAD_DB_PASSWORD: "${ZAMMAD_DB_PASSWORD}"
+      WIKIJS_DB_PASSWORD: "${WIKIJS_DB_PASSWORD}"
+      NEXTCLOUD_DB_PASSWORD: "${NEXTCLOUD_DB_PASSWORD}"
+      WORDPRESS_DB_PASSWORD: "${WORDPRESS_DB_PASSWORD}"
+      AKAUNTING_DB_PASSWORD: "${AKAUNTING_DB_PASSWORD}"
+      SIM_CLOCK_URL: "http://sim-clock:8000"
+      SOCKET_PROXY_URL: "http://docker-socket-proxy:2375"
+      SNAPSHOT_ROOT: "/snapshots"
+      MAILDIR_PATH: "/maildir"
+      NEXTCLOUD_DATA_PATH: "/nextcloud_data"
+    volumes:
+      - snapshot_storage:/snapshots
+      - mailserver_data:/maildir   # read-write at compose level; write access is enforced
+                                   # in application code to only happen while mailserver is
+                                   # stopped (restore path) — see snapshot-manager/main.py
+      - nextcloud_data:/nextcloud_data
+    networks:
+      - net_data
+      - net_dmz
+      - net_mail
+      - net_mgmt
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "snapshot-manager"
+      fakeco.phase: "29"
+      fakeco.managed: "true"
+    profiles:
+      - phase13
+      - phase29
+
+  # ---------------------------------------------------------------------------
+  # PHASE 29: purge-manager — scoped + full data purge, gated by mandatory
+  # pre-purge snapshot (calls snapshot-manager's own API) + typed confirmation.
+  # ---------------------------------------------------------------------------
+  purge-manager:
+    build:
+      context: ./purge-manager
+      dockerfile: Dockerfile
+    container_name: fakeco-purge-manager
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+      snapshot-manager:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      SNAPSHOT_MANAGER_URL: "http://snapshot-manager:8000"
+      SIM_CLOCK_URL: "http://sim-clock:8000"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      WIKIJS_URL: "http://wikijs:3000"
+      WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      AKAUNTING_DB_PASSWORD: "${AKAUNTING_DB_PASSWORD}"
+    networks:
+      - net_clients
+      - net_data
+      - net_office
+      - net_dmz
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "purge-manager"
+      fakeco.phase: "29"
+      fakeco.managed: "true"
+    profiles:
+      - phase13
+      - phase29
+
+  # ---------------------------------------------------------------------------
+  # PHASES 33+: Custom services — added as their phases execute.
   # Placeholders listed here for topology documentation:
   #
-  # branding-manager   (Phase 30) — net_clients, net_data, net_office
-  # purge-manager      (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
-  # snapshot-manager   (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
   # dashboard          (Phase 33+) — net_mgmt, net_clients (calls other services)
   # ---------------------------------------------------------------------------

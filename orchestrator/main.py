@@ -615,6 +615,20 @@ async def tick_loop(pool: asyncpg.Pool) -> None:
     log.info("Orchestrator: tick loop started (interval=%.0fs)", TICK_INTERVAL_SECONDS)
     while True:
         try:
+            # Phase 29: maintenance-mode gate. snapshot-manager/purge-manager set this flag
+            # before any destructive/consistency-sensitive operation and clear it after —
+            # a mid-purge/restore tick must no-op entirely, not partially run jobs against
+            # a database that is mid-truncate or mid-restore.
+            async with pool.acquire() as maint_conn:
+                maintenance_on = await maint_conn.fetchval(
+                    "SELECT enabled FROM system_maintenance_mode WHERE id = 1"
+                )
+            if maintenance_on:
+                log.info("Orchestrator tick skipped: system_maintenance_mode enabled "
+                         "(Phase 29 snapshot/purge in progress)")
+                await asyncio.sleep(TICK_INTERVAL_SECONDS)
+                continue
+
             sim_time = await get_sim_time()
             log.info("Orchestrator tick at sim_time=%s", sim_time.isoformat())
 

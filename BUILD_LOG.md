@@ -47,6 +47,116 @@
 
 ---
 
+### 2026-07-31T20:05 — Phase 29 built and runtime-verified: snapshot-manager + purge-manager, real client/server version bug found and fixed via live disposable-environment round-trip test
+
+Built the previously-stub `snapshot-manager/` and `purge-manager/` services per `PHASE29_PLAN.md`
+(signed off 2026-07-31, Option A + Option B hybrid: direct-DB-network sidecar for snapshot/restore,
+appliance bulk-API-with-DB-truncate-fallback for purge — never `docker exec`, `EXEC=0` on
+docker-socket-proxy stays untouched).
+
+- **New files:** `snapshot-manager/{main.py,Dockerfile,requirements.txt}`,
+  `purge-manager/{main.py,Dockerfile,requirements.txt}`,
+  `narrative-db/migrations/008_phase29_purge_snapshots.sql` (`system_maintenance_mode` single-row
+  flag table + `snapshot_purge_log` audit table — both excluded from purge/restore scope, same as
+  `system_audit_log`).
+- **docker-compose.yml:** added both services under `profiles: [phase13, phase29]` (matches
+  narrative-db-migrate's own gating), a new `snapshot_storage` named volume, snapshot-manager
+  multi-homed onto `net_data` + `net_dmz` + `net_mail` + `net_mgmt` (DB access to every appliance
+  plus the mailserver Maildir read-write mount plus docker-socket-proxy calls), purge-manager onto
+  `net_clients` + `net_data` + `net_office` + `net_dmz`. Corrected a pre-existing inaccurate
+  `net_data` comment claiming Akaunting's DB lived there (it's actually on `net_dmz`, flagged in
+  `PHASE29_PLAN.md` §3 as worth fixing whenever this volume was actually added).
+- **orchestrator/main.py:** `tick_loop` now reads `system_maintenance_mode.enabled` at the top of
+  every tick and no-ops entirely (not partially) if it's set, before touching sim-clock or any
+  scheduled job.
+- **snapshot-manager** dumps: narrative `fakeco` DB (schema-scoped, NOT the whole Postgres
+  instance — LiteLLM's own spend-history DB shares the instance under a different DB name and is
+  correctly excluded), mattermost/zammad/wikijs/nextcloud (each own Postgres instance) via
+  `pg_dump -Fc`, wordpress/akaunting via `mysqldump --single-transaction`, mailserver Maildir via
+  `tar` over a shared volume mount, Nextcloud's file volume via `tar`. Writes one
+  `manifest.json` per snapshot directory with a sha256 per artifact. Restore stops the app-tier
+  container(s) for each appliance via the already-allowed docker-socket-proxy
+  CONTAINERS+POST(start/stop) capability, `pg_restore --clean --if-exists` / `mysql < dump`,
+  untars Maildir only during the mailserver-stopped window, restarts everything. Both save and
+  restore set/clear `system_maintenance_mode` and best-effort pause/resume sim-clock around the
+  operation.
+- **purge-manager**: one endpoint per scope (`emails`, `chat`, `tickets`, `wiki`,
+  `meetings_narrative`, `accounting`, `external_world`, `kpi_history`, `roster`,
+  `company_direction`) plus `/purge/full`, each requiring its own typed confirmation phrase AND
+  calling snapshot-manager's own `/snapshot/save` first — if that call fails or returns non-200,
+  the purge raises immediately (502) and touches nothing. Verified live (see below).
+- **Known, explicitly-flagged simplifications** (not silently dropped): (1) `emails` scope only
+  clears `employees.mailbox_address` linkage, does not wipe the raw Maildir (a full wipe is
+  snapshot/restore-shaped, left as a follow-up rather than duplicating restore logic); (2)
+  `roster` scope truncates `employees` but does NOT live-deprovision appliance accounts first
+  (`provisioning` is CLI-only today, no FastAPI surface to call) — appliance accounts go orphaned,
+  operator must re-run `provisioning` CLI to reseed; (3) Zammad's Elasticsearch index is not
+  automatically rebuilt after a restore (no exec-free reindex trigger exists yet) — both gaps are
+  returned in the API response body (`notes`/`note` fields), not hidden.
+
+**Real bugs found via live verification (disposable throwaway environment, `docker compose -p
+fakeco-p29`, distinct project name/volumes, container_name stripped from a generated compose file
+specifically to make collision with the live 39-container primary stack impossible even by
+accident):**
+1. **`purge_company_direction` used made-up column names** (`directive_text`/`set_at`) — the real
+   `company_directives` schema (migration 002) uses `content`/`created_at`/`created_by`/`version`/
+   `is_current`. Caught immediately on first live mutation attempt, fixed before any real restore
+   test ran.
+2. **pg_dump/pg_restore client v17 vs. server v16 mismatch** — Debian bookworm's default
+   `postgresql-client` apt package installs v17 client tools; every appliance Postgres instance in
+   this repo runs `postgres:16-alpine`. pg_restore's v17 client always emits
+   `SET transaction_timeout = 0` (a GUC that only exists on PG17+), which a v16 server rejects
+   with "unrecognized configuration parameter" — this silently downgraded every Postgres restore's
+   report to a reported failure (though pg_restore actually proceeded past the harmless error in
+   practice; the version mismatch was still a real, worth-fixing bug, not just a false alarm, since
+   `--if-exists` cleanup order isn't guaranteed reliable across major-version client skew in
+   general). Fixed by installing the PGDG apt repo in `snapshot-manager/Dockerfile` and pinning
+   `postgresql-client-16` explicitly so client and server major versions always match.
+
+**Verification performed (against the disposable environment only, never the live primary
+stack):**
+- Brought up `postgres, docker-socket-proxy, sim-clock, narrative-db-migrate, mattermost(-db),
+  zammad(-db/-init/-railsserver/-scheduler/-websocket/-nginx/-redis/-memcached/-elasticsearch),
+  wikijs(-db), nextcloud(-db), wordpress(-db), akaunting(-db), mailserver, roundcube,
+  snapshot-manager, purge-manager` under project name `fakeco-p29` with container_name stripped
+  (generated via `docker compose config` + a small script removing `container_name:`/`profiles:`
+  keys) specifically so nothing could possibly collide with the live stack's identically-named
+  containers even by mistake.
+- **Round-trip test**: saved a baseline snapshot (all 9 artifacts: narrative/mattermost/zammad/
+  wikijs/nextcloud/wordpress/akaunting SQL dumps + mailserver Maildir tar + Nextcloud files tar —
+  all `"ok": true`, manifest with sha256 per file). Mutated the narrative DB significantly
+  (inserted an employee row, 20→21; inserted a `company_directives` row with a `MUTATED-TEST-
+  MARKER` content string). Called `/snapshot/restore` with the correct confirmation phrase —
+  restore reported all 9 artifacts `"ok": true`. Post-restore: `employees` count back to 20, the
+  mutated employee row gone, the `MUTATED-TEST-MARKER` content row gone, original company
+  directive content back — **restore was not lossy or corrupting for the core narrative DB**.
+- **Container stop/start mechanism** (used during restore): verified the docker-socket-proxy
+  `POST /containers/{name}/stop` and `/start` calls snapshot-manager makes work end-to-end
+  (container observed `Exited (0)` after stop, `Up` immediately after start) — confirmed against
+  the disposable stack's own container names since `container_name` was intentionally stripped
+  there for collision safety (production keeps the literal `fakeco-mattermost` etc. names this
+  code path already targets).
+- **Typed-confirmation gate**: `POST /purge/kpi_history` with `{"confirm":"nope"}` correctly
+  returned 400 without touching any data.
+- **Mandatory-snapshot-before-purge rule**: `POST /purge/kpi_history` with the correct phrase,
+  against a minimal environment (postgres/sim-clock/snapshot-manager/purge-manager only, no
+  appliance DBs reachable) correctly had its pre-purge snapshot fail (`pg_dump: could not
+  translate host name`) and purge-manager returned 502 and aborted — a pre-inserted
+  `kpi_snapshots` test row was confirmed still present afterward, proving purge never ran when the
+  mandatory snapshot failed.
+- **Teardown**: `docker compose -p fakeco-p29 ... down -v` removed all disposable containers,
+  volumes, and networks; disposable-only images (`fakeco-p29-*`) explicitly `docker rmi`'d.
+  Confirmed the live primary stack's container count was 39 before and 39 after, with zero
+  `fakeco-p29-*` containers, volumes, or images left behind.
+
+**Known gap, not fixed in this pass:** `purge-manager`'s pg_restore-error-detection heuristic
+(treats any `"ERROR"` substring in stderr as failure) is slightly too blunt — real pg_restore runs
+sometimes emit one ignorable `--if-exists`-related NOTICE-as-ERROR on a fresh target and still
+succeed overall. Not a correctness bug given the client-version fix above eliminates the one case
+that triggered it in practice, but worth tightening if it resurfaces.
+
+---
+
 ### 2026-08-01T01:15 — Phase 30 built and runtime-verified: branding-manager service, 3 real appliance-API bugs/gaps found and fixed
 
 Built the previously-stub `branding-manager/` service (spec §17): asset library, employee avatar
