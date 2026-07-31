@@ -430,12 +430,18 @@ async def generate_prospect_activity(pool: asyncpg.Pool, llm: LLMClient, sim_tim
                         headers={"Authorization": f"Token token={ZAMMAD_ADMIN_TOKEN}"},
                         json={
                             "title": f"[PROSPECT] {prospect['company_name']}: inquiry",
-                            "group": "Sales",
+                            "group": "Users",
+                            # `customer_id` is a hard-required field on ticket creation — Zammad
+                            # accepts a "guess:<email>" shorthand that resolves to (or auto-creates) that customer.
+                            "customer_id": f"guess:{prospect['contact_email']}",
                             "article": {
                                 "subject": f"Inquiry from {prospect['contact_name']} at {prospect['company_name']}",
                                 "body": inquiry,
-                                "type": "email",
-                                "from": f"{prospect['contact_name']} <{prospect['contact_email']}>",
+                                # "email" article type requires the group to have an outgoing
+                                # email channel configured, which this sim environment doesn't
+                                # provision — "phone" simulates the inbound contact without that
+                                # dependency (matches human-bridge's ticket-creation pattern).
+                                "type": "phone",
                                 "internal": False,
                             },
                         }

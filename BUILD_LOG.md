@@ -8,8 +8,8 @@
 |---|—--|
 | **Current Phase** | Phases 1–18 and 21–22 all runtime-verified against a live `docker compose` stack. Phases 19-20, 23-38 not started (mostly still README-stub or nonexistent). |
 | **Percent Complete** | ~60% by code volume; walking skeleton (1-11) + custom services (12-18) + external-world (21-22) are genuinely running and tested, not just written. |
-| **Status** | Every phase from 1 through 18, plus 21/22, has been brought up in live Docker and exercised with real requests (not just "container starts") — full trail below. ~25 real runtime bugs found and fixed along the way (bad ports, broken image references, missing dependencies, wrong API field names, silent Python `.get()` gotchas, a router config bug, missing healthcheck binaries, etc.). Three genuine feature gaps identified and NOT quick-patched (flagged as dedicated follow-ups since they need real design work): Akaunting's payment-method resolver bug (blocks Phase 15 ledger posting), meeting-simulator's missing Wiki.js integration, human-bridge's missing Principal-content detection layer (Phase 17's actual core requirement), and orchestrator's missing priority-queue/pending_actions retry mechanism (Phase 18's actual core requirement) — plus external-world's customers table has zero seed rows so the Phase 22 prospect-generation loop can never bootstrap itself. |
-| **Exact Next Action** | Pick one of: (a) resolve the flagged follow-up gaps above, (b) seed initial `customers` prospect rows for external-world, (c) move on to genuinely unstarted phases (19 PTO, 20 relationships, 23 KPI engine, 29 purge/snapshot, 30 branding, 33-37 dashboard, 38 hardening). |
+| **Status** | Every phase from 1 through 18, plus 21/22, has been brought up in live Docker and exercised with real requests (not just "container starts") — full trail below. ~27 real runtime bugs found and fixed along the way (bad ports, broken image references, missing dependencies, wrong API field names, silent Python `.get()` gotchas, a router config bug, missing healthcheck binaries, 2 Zammad ticket-creation field bugs, etc.). external-world's `customers` table is now seeded (`005_customers_seed.sql`) and the Phase 22 prospect-generation loop is runtime-verified end-to-end (real Zammad tickets created). Three genuine feature gaps remain, identified and NOT quick-patched (flagged as dedicated follow-ups since they need real design work): Akaunting's payment-method resolver bug (blocks Phase 15 ledger posting), meeting-simulator's missing Wiki.js integration, human-bridge's missing Principal-content detection layer (Phase 17's actual core requirement), and orchestrator's missing priority-queue/pending_actions retry mechanism (Phase 18's actual core requirement). |
+| **Exact Next Action** | Pick one of: (a) resolve the 4 remaining flagged follow-up gaps above, (b) move on to genuinely unstarted phases (19 PTO, 20 relationships, 23 KPI engine, 29 purge/snapshot, 30 branding, 33-37 dashboard, 38 hardening). |
 | **BLOCKER** | None. Docker Desktop running. All appliance credentials/tokens are in `.env` (gitignored) — a fresh clone needs a real `.env` populated before `docker compose up` will do anything useful. |
 
 **Environment:**
@@ -34,7 +34,7 @@
 - [~] `external-world/` (Phase 21/22 `main.py` written, 517 lines, but no `Dockerfile`/`requirements.txt`, not wired into `docker-compose.yml` — INCOMPLETE)
 - [ ] `kpi-engine/` (README stub only, Phase 23 not started)
 - [ ] `branding-manager/` (README stub only, Phase 30 not started)
-- [x] `narrative-db/` (migrations 001–004 written, Phase 13 — not yet runtime-verified)
+- [x] `narrative-db/` (migrations 001–005 written and runtime-verified — 005 adds `customers` seed data, Phase 13/22)
 - [ ] `dashboard/` (README stub only, Phases 33–37 not started)
 - [x] `provisioning/` (code written, Phase 14 — not yet runtime-verified)
 - [x] `litellm/config.yaml` (written, Phase 10 — not yet runtime-verified)
@@ -44,6 +44,42 @@
 ---
 
 ## LOG (newest first)
+
+---
+
+### 2026-07-31T18:20 — Seeded `customers` table (Phase 22 prospect-loop gap, flagged 22:30 entry below); fixed 2 real Zammad ticket-creation bugs found while verifying it
+
+- **Added** `narrative-db/migrations/005_customers_seed.sql`: 6 placeholder prospect companies
+  (`relationship_status='prospect'`), same invented-placeholder pattern as the employee roster
+  (`SPEC_CLARIFICATIONS #10`). Sales/support reps assigned by looking up real employee IDs via
+  email from `003_employees.sql` (not hardcoded IDs), so it stays valid if that roster changes.
+- Ran `docker compose --profile phase13 up --build narrative-db-migrate`: applied cleanly
+  (`005_customers_seed.sql` — 001-004 skipped as already-applied), 6 rows confirmed in `customers`
+  with correctly-resolved `assigned_sales_rep_id`/`assigned_support_rep_id`.
+- **2 real bugs found and fixed in `external-world/main.py`'s `generate_prospect_activity()`**
+  while verifying it against the newly-seeded rows (never caught before because the table was
+  empty, so the code path never actually ran against real data):
+  1. Hardcoded `"group": "Sales"` — no such Zammad group exists (only the default `Users` group
+     is provisioned anywhere in this stack; nothing creates a `Sales` group). Every ticket POST
+     422'd with `No lookup value found for 'group': "Sales"`. Fixed: use `"Users"`.
+  2. Missing `customer_id` — Zammad hard-requires it on ticket creation. Fixed using the same
+     `"guess:<email>"` shorthand already working in `human-bridge/main.py`'s ticket-creation code
+     (resolves-or-creates the Zammad customer from the email). Also had to switch the article
+     `type` from `"email"` to `"phone"`: an `email`-type article requires the target group to have
+     an outgoing email channel configured, which isn't provisioned in this sim — `phone` simulates
+     the inbound contact without that dependency, matching how `human-bridge` avoids the same
+     issue by using `type: "note"`.
+- **Verified end-to-end after the fixes:** rebuilt/restarted `external-world`. `POST
+  /customers/check` returned `{"churned":0,"at_risk":0}` (correct — none of the seed rows are
+  `active`/`at_risk` yet). Called `generate_prospect_activity()` directly with a business-hours
+  sim_time (real sim-clock time was past the 6pm cutoff at test time) — got two real `201 Created`
+  Zammad tickets (`[PROSPECT] Summit Peak Analytics: inquiry`, `[PROSPECT] Cedarline Retail:
+  inquiry`), confirmed visible via `GET /api/v1/tickets`, and confirmed matching
+  `prospect_inquiry_generated` rows in `system_audit_log` with correct `customer_id`/`company_name`.
+- **Files touched:** `narrative-db/migrations/005_customers_seed.sql` (new),
+  `external-world/main.py` (group/customer_id/article-type fixes)
+- **Status:** Phase 22's prospect-generation loop can now actually bootstrap and fire real Zammad
+  tickets. The customer-seed gap flagged in the 22:30 entry below is resolved.
 
 ---
 
