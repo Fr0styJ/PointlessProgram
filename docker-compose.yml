@@ -972,13 +972,104 @@ services:
       - phase13
 
   # ---------------------------------------------------------------------------
-  # PHASES 13+: Custom services — each added when their phase executes.
-  # Placeholders listed here as comments to document the final topology:
+  # PHASE 14: provisioning — per-employee account creation across all appliances
+  # Spec §9, §7; SPEC_CLARIFICATIONS #10
+  # Run once (or selectively for new hires/fires) — CLI-driven, restart: "no"
+  # ---------------------------------------------------------------------------
+  provisioning:
+    build:
+      context: ./provisioning
+      dockerfile: Dockerfile
+    container_name: fakeco-provisioning
+    restart: "no"   # CLI tool — run manually; supervisor can set to unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      MAILSERVER_CONTAINER: "fakeco-mailserver"
+      MAILSERVER_DOMAIN: "${MAILSERVER_DOMAIN:-fakecorp.internal}"
+      MAILSERVER_BOT_SECRET: "${MAILSERVER_BOT_SECRET:?MAILSERVER_BOT_SECRET required}"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      MATTERMOST_TEAM_ID: "${MATTERMOST_TEAM_ID:-}"
+      ZAMMAD_URL: "http://zammad:3000"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      WIKIJS_URL: "http://wikijs:3000"
+      WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"
+      PRINCIPAL_EMAIL: "${PRINCIPAL_EMAIL:-principal@fakecorp.internal}"
+      PRINCIPAL_NAME: "${PRINCIPAL_NAME:-Admin}"
+      PRINCIPAL_MATTERMOST_PASSWORD: "${PRINCIPAL_MATTERMOST_PASSWORD:-}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # for mailserver exec
+    networks:
+      - net_clients
+      - net_data
+      - net_office
+      - net_mail
+    labels:
+      fakeco.service: "provisioning"
+      fakeco.phase: "14"
+      fakeco.managed: "true"
+    profiles:
+      - phase14
+
+  # ---------------------------------------------------------------------------
+  # PHASE 15: accounting-engine — deterministic financial logic
+  # Spec §10.1–10.4; SPEC_CLARIFICATIONS #1, #2, #4
+  # All financial math is code — never LLM.
+  # ---------------------------------------------------------------------------
+  accounting-engine:
+    build:
+      context: ./accounting-engine
+      dockerfile: Dockerfile
+    container_name: fakeco-accounting-engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      AKAUNTING_URL: "http://akaunting"
+      AKAUNTING_ADMIN_EMAIL: "${AKAUNTING_ADMIN_EMAIL:?AKAUNTING_ADMIN_EMAIL required}"
+      AKAUNTING_ADMIN_PASSWORD: "${AKAUNTING_ADMIN_PASSWORD:?AKAUNTING_ADMIN_PASSWORD required}"
+      AKAUNTING_COMPANY_ID: "${AKAUNTING_COMPANY_ID:-1}"
+      AKAUNTING_PAYROLL_ACCOUNT_ID: "${AKAUNTING_PAYROLL_ACCOUNT_ID:-0}"
+      AKAUNTING_EXPENSE_ACCOUNT_ID: "${AKAUNTING_EXPENSE_ACCOUNT_ID:-0}"
+      AKAUNTING_REVENUE_ACCOUNT_ID: "${AKAUNTING_REVENUE_ACCOUNT_ID:-0}"
+      AKAUNTING_LLM_EXPENSE_ACCOUNT_ID: "${AKAUNTING_LLM_EXPENSE_ACCOUNT_ID:-0}"
+      ZAMMAD_URL: "http://zammad:3000"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      IC_AUTO_APPROVE_LIMIT: "${IC_AUTO_APPROVE_LIMIT:-25.00}"
+      LEAD_AUTO_APPROVE_LIMIT: "${LEAD_AUTO_APPROVE_LIMIT:-500.00}"
+    networks:
+      - net_clients
+      - net_data
+      - net_office
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "accounting-engine"
+      fakeco.phase: "15"
+      fakeco.managed: "true"
+    profiles:
+      - phase15
+
+  # ---------------------------------------------------------------------------
+  # PHASES 16+: Custom services — added as their phases execute.
+  # Placeholders listed here for topology documentation:
   #
-  # orchestrator       (Phase 18) — net_clients, net_data, net_office, net_mail
   # meeting-simulator  (Phase 16) — net_clients, net_data, net_office
   # human-bridge       (Phase 17) — net_clients, net_data, net_mail, net_office
-  # accounting-engine  (Phase 15) — net_clients, net_data, net_office
+  # orchestrator       (Phase 18) — net_clients, net_data, net_office, net_mail
   # external-world     (Phase 21+22) — net_clients, net_data, net_mail, net_office
   # kpi-engine         (Phase 23+) — net_clients, net_data, net_office
   # branding-manager   (Phase 30) — net_clients, net_data, net_office

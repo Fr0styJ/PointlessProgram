@@ -5,18 +5,19 @@
 ## STATUS HEADER
 
 | Field | Value |
-|---|---|
-| **Current Phase** | Phase 1 — Compose topology, networks, shared Postgres, socket-proxy |
-| **Percent Complete** | ~8% (Phase 0 complete; Phase 1 code complete, runtime verification BLOCKED) |
-| **Status** | Phase 1 CODE COMPLETE — **BLOCKED on Docker installation** |
-| **Exact Next Action** | Install Docker Desktop (or Docker Engine) on this machine, then run `docker compose up postgres docker-socket-proxy -d` and verify Phase 1 exit criteria: (1) both services healthy, (2) Postgres reachable from net_data container, (3) NOT reachable from net_clients container, (4) socket-proxy allows START/STOP/RESTART on labeled container, rejects image-pull. After that, proceed to Phase 2 (add phase2 profile services: cadvisor, node-exporter, prometheus). |
-| **BLOCKER** | Docker is not installed. Was at `C:\Program Files\Docker\Docker` but was **uninstalled 2026-06-22** per `C:\ProgramData\DockerDesktop\install-log-admin.txt`. No container runtime found on PATH. |
+|---|—--|
+| **Current Phase** | Phase 14 — Roster & per-employee provisioning |
+| **Percent Complete** | ~28% (Phases 0,1,12,13 complete; Phases 2–11 code done, runtime pending Docker) |
+| **Status** | Phase 12 COMPLETE (code) — Phase 13 COMPLETE (code) — **Writing Phase 14** |
+| **Exact Next Action** | Write `provisioning/` service code: provisioning function that creates accounts on docker-mailserver, Mattermost, Zammad, Wiki.js for a given employee, idempotent re-run, fire path (deactivate not delete). Then add accounting-engine (Phase 15). |
+| **BLOCKER** | Docker is not installed (uninstalled 2026-06-22). All runtime verification deferred. Code-only work continuing. |
 
 **Environment:**
-- OS: Windows, shell: pwsh
+- OS: Windows 10 Pro, shell: pwsh
 - Repo root: `c:\code\PointlessProgram`
-- Git initialized: YES (first commit pending)
-- Docker: not yet verified (Phase 1)
+- Git initialized: YES, current HEAD: `7e825c2`
+- Docker: NOT INSTALLED (was uninstalled 2026-06-22) — runtime verification deferred
+- Ollama: present at `C:\Users\Frosty\AppData\Local\Programs\Ollama` (potential local LLM fallback — not configured yet)
 
 **Ports / credentials / tokens:** None yet established. See `.env.example` for expected credential env vars.
 

@@ -1,0 +1,581 @@
+"""
+provisioning/main.py — FakeCo "Real Appliances"
+Phase 14: Per-employee account provisioning across all appliances.
+
+Spec §9, §7, §26:
+- Creates real accounts on docker-mailserver, Mattermost, Zammad, Wiki.js
+- Writes back resulting appliance IDs to the employees roster row
+- Idempotent: re-running for the same employee does NOT create duplicate accounts
+- Fire path: status → 'terminated', deactivates (never deletes) accounts everywhere
+
+SPEC_CLARIFICATIONS #10: Placeholder roster is seeded in migration 003_employees.sql.
+
+Usage (CLI, no dashboard needed until Phase 34):
+    python main.py provision --employee-id 1
+    python main.py provision --all
+    python main.py fire --employee-id 5
+    python main.py provision-principal
+
+Environment:
+    DATABASE_URL, MAILSERVER_HOST, MATTERMOST_URL, MATTERMOST_ADMIN_TOKEN,
+    ZAMMAD_URL, ZAMMAD_ADMIN_TOKEN, WIKIJS_URL, WIKIJS_ADMIN_TOKEN,
+    MAILSERVER_DOMAIN
+"""
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import sys
+from typing import Optional
+
+import asyncpg
+import httpx
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time":"%(asctime)s","level":"%(levelname)s","service":"provisioning","msg":"%(message)s"}'
+)
+log = logging.getLogger("provisioning")
+
+# ---------------------------------------------------------------------------
+# Configuration from environment
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    f"postgresql://{os.environ.get('POSTGRES_USER','fakeco')}:"
+    f"{os.environ.get('POSTGRES_PASSWORD','fakeco')}@"
+    f"{os.environ.get('POSTGRES_HOST','postgres')}:"
+    f"{os.environ.get('POSTGRES_PORT','5432')}/"
+    f"{os.environ.get('POSTGRES_DB','fakeco')}"
+)
+MAILSERVER_DOMAIN = os.environ.get("MAILSERVER_DOMAIN", "fakecorp.internal")
+MAILSERVER_CONTAINER = os.environ.get("MAILSERVER_CONTAINER", "fakeco-mailserver")
+MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://mattermost:8065")
+MATTERMOST_ADMIN_TOKEN = os.environ.get("MATTERMOST_ADMIN_TOKEN", "")
+MATTERMOST_TEAM_ID = os.environ.get("MATTERMOST_TEAM_ID", "")  # written at first-boot
+ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad:3000")
+ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
+WIKIJS_URL = os.environ.get("WIKIJS_URL", "http://wikijs:3000")
+WIKIJS_ADMIN_TOKEN = os.environ.get("WIKIJS_ADMIN_TOKEN", "")
+PRINCIPAL_EMAIL = os.environ.get("PRINCIPAL_EMAIL", "principal@fakecorp.internal")
+PRINCIPAL_NAME = os.environ.get("PRINCIPAL_NAME", "Admin")
+
+# Provisioning bootstrap: used for setup email add command against docker-mailserver
+# In Docker context, we exec into the mailserver container.
+DOCKER_HOST = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+
+
+# ---------------------------------------------------------------------------
+# Mattermost helpers
+# ---------------------------------------------------------------------------
+class MattermostClient:
+    def __init__(self, base_url: str, admin_token: str, team_id: str = ""):
+        self.base = base_url.rstrip("/") + "/api/v4"
+        self.headers = {"Authorization": f"Bearer {admin_token}", "Content-Type": "application/json"}
+        self.team_id = team_id
+        self._client = httpx.AsyncClient(headers=self.headers, timeout=30.0)
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def get_user_by_email(self, email: str) -> Optional[dict]:
+        r = await self._client.get(f"{self.base}/users/email/{email}")
+        if r.status_code == 200:
+            return r.json()
+        return None
+
+    async def create_bot(self, username: str, display_name: str, description: str = "") -> dict:
+        """Create a bot account. Returns bot user dict."""
+        r = await self._client.post(f"{self.base}/bots", json={
+            "username": username,
+            "display_name": display_name,
+            "description": description,
+        })
+        r.raise_for_status()
+        return r.json()
+
+    async def get_bot_by_username(self, username: str) -> Optional[dict]:
+        """Check if a bot with this username exists."""
+        r = await self._client.get(f"{self.base}/users/username/{username}")
+        if r.status_code == 200:
+            return r.json()
+        return None
+
+    async def disable_user(self, user_id: str) -> None:
+        """Deactivate (disable) a Mattermost user. Does NOT delete."""
+        r = await self._client.delete(f"{self.base}/users/{user_id}")
+        r.raise_for_status()
+
+    async def add_to_team(self, user_id: str, team_id: str) -> None:
+        r = await self._client.post(f"{self.base}/teams/{team_id}/members", json={
+            "team_id": team_id,
+            "user_id": user_id,
+        })
+        if r.status_code not in (200, 201):
+            log.warning("Mattermost: could not add user %s to team %s: %s", user_id, team_id, r.text)
+
+    async def create_human_account(self, email: str, username: str, name: str, password: str) -> dict:
+        """Create a real human account (for the Principal). Returns user dict."""
+        r = await self._client.post(f"{self.base}/users", json={
+            "email": email,
+            "username": username,
+            "first_name": name.split()[0] if name else name,
+            "last_name": " ".join(name.split()[1:]) if len(name.split()) > 1 else "",
+            "password": password,
+            "email_verified": True,
+        })
+        r.raise_for_status()
+        return r.json()
+
+    async def generate_bot_token(self, user_id: str, description: str = "bot token") -> str:
+        """Create a personal access token for a bot. Returns the token string."""
+        r = await self._client.post(f"{self.base}/users/{user_id}/tokens", json={
+            "description": description
+        })
+        r.raise_for_status()
+        return r.json()["token"]
+
+
+# ---------------------------------------------------------------------------
+# Zammad helpers
+# ---------------------------------------------------------------------------
+class ZammadClient:
+    def __init__(self, base_url: str, admin_token: str):
+        self.base = base_url.rstrip("/") + "/api/v1"
+        self.headers = {"Authorization": f"Token token={admin_token}", "Content-Type": "application/json"}
+        self._client = httpx.AsyncClient(headers=self.headers, timeout=30.0)
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def get_user_by_email(self, email: str) -> Optional[dict]:
+        r = await self._client.get(f"{self.base}/users/search?query=email:{email}")
+        if r.status_code == 200:
+            users = r.json()
+            return users[0] if users else None
+        return None
+
+    async def create_user(self, email: str, firstname: str, lastname: str, role_names: list[str] = None) -> dict:
+        role_names = role_names or ["Agent"]
+        r = await self._client.post(f"{self.base}/users", json={
+            "email": email,
+            "firstname": firstname,
+            "lastname": lastname,
+            "roles": role_names,
+            "active": True,
+        })
+        r.raise_for_status()
+        return r.json()
+
+    async def deactivate_user(self, user_id: int) -> None:
+        """Deactivate a Zammad user. Does NOT delete."""
+        r = await self._client.put(f"{self.base}/users/{user_id}", json={"active": False})
+        r.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Wiki.js helpers (GraphQL)
+# ---------------------------------------------------------------------------
+class WikiJSClient:
+    def __init__(self, base_url: str, admin_token: str):
+        self.graphql_url = base_url.rstrip("/") + "/graphql"
+        self.headers = {"Authorization": f"Bearer {admin_token}", "Content-Type": "application/json"}
+        self._client = httpx.AsyncClient(headers=self.headers, timeout=30.0)
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def graphql(self, query: str, variables: dict = None) -> dict:
+        r = await self._client.post(self.graphql_url, json={"query": query, "variables": variables or {}})
+        r.raise_for_status()
+        return r.json()
+
+    async def get_user_by_email(self, email: str) -> Optional[dict]:
+        result = await self.graphql("""
+            query($email: String!) {
+                users {
+                    search(query: $email) {
+                        id
+                        email
+                        name
+                        isActive
+                    }
+                }
+            }
+        """, {"email": email})
+        users = result.get("data", {}).get("users", {}).get("search", [])
+        for user in users:
+            if user.get("email", "").lower() == email.lower():
+                return user
+        return None
+
+    async def create_user(self, email: str, name: str, password_reset: bool = True) -> dict:
+        result = await self.graphql("""
+            mutation($email: String!, $name: String!, $providerKey: String!, $groups: [Int]!) {
+                users {
+                    create(email: $email, name: $name, providerKey: $providerKey, groups: $groups) {
+                        responseResult {
+                            succeeded
+                            errorCode
+                            slug
+                            message
+                        }
+                        user {
+                            id
+                            email
+                            name
+                        }
+                    }
+                }
+            }
+        """, {
+            "email": email,
+            "name": name,
+            "providerKey": "local",
+            "groups": [1],  # Default group ID — Guests (1) or Editors (2); adjust in first-boot
+        })
+        create_result = result.get("data", {}).get("users", {}).get("create", {})
+        if not create_result.get("responseResult", {}).get("succeeded"):
+            raise RuntimeError(f"Wiki.js user creation failed: {create_result}")
+        return create_result.get("user", {})
+
+    async def deactivate_user(self, user_id: int) -> None:
+        await self.graphql("""
+            mutation($id: Int!) {
+                users {
+                    deactivate(id: $id) {
+                        responseResult { succeeded errorCode message }
+                    }
+                }
+            }
+        """, {"id": user_id})
+
+
+# ---------------------------------------------------------------------------
+# Mail helpers (docker-mailserver uses its own CLI via docker exec)
+# We call the Docker socket-proxy (or a thin shell wrapper) to exec setup commands.
+# In Phase 14, we use a simplified HTTP helper that the provisioning service calls.
+# ---------------------------------------------------------------------------
+class MailserverClient:
+    """
+    Wraps docker-mailserver account management.
+    In Docker, calls docker exec fakeco-mailserver setup email add <email> <password>
+    via a local subprocess (provisioning container must be on same Docker daemon).
+
+    Password is deterministically derived from employee email + a server secret.
+    Employees never need to know their sim-email password; they're bots.
+    """
+    def __init__(self, container_name: str = "fakeco-mailserver", mail_domain: str = "fakecorp.internal"):
+        self.container = container_name
+        self.domain = mail_domain
+
+    def _derive_password(self, email: str) -> str:
+        """
+        Deterministic bot password. NOT for human security — sim mailboxes only.
+        Derived from email + a fixed salt. Stored nowhere; re-derivable.
+        """
+        salt = os.environ.get("MAILSERVER_BOT_SECRET", "fakeco-bot-mail-secret-change-me")
+        return hashlib.sha256(f"{salt}:{email}".encode()).hexdigest()[:24]
+
+    async def account_exists(self, email: str) -> bool:
+        """Check if an email account exists by listing accounts."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", self.container,
+            "setup", "email", "list",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        return email in stdout.decode(errors="replace")
+
+    async def create_account(self, email: str) -> bool:
+        """Create mailbox. Idempotent: check first."""
+        if await self.account_exists(email):
+            log.info("mail: account %s already exists, skipping", email)
+            return False
+        password = self._derive_password(email)
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", self.container,
+            "setup", "email", "add", email, password,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"mail: create_account failed for {email}: {stderr.decode()}")
+        log.info("mail: created account %s", email)
+        return True
+
+    async def restrict_account(self, email: str) -> None:
+        """Restrict/lock a mailbox (PTO over; for termination use 'restrict')."""
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", self.container,
+            "setup", "email", "restrict", email,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        log.info("mail: restricted account %s", email)
+
+
+# ---------------------------------------------------------------------------
+# Core provisioning logic
+# ---------------------------------------------------------------------------
+async def provision_employee(
+    conn: asyncpg.Connection,
+    employee: asyncpg.Record,
+    mm: MattermostClient,
+    zammad: ZammadClient,
+    wiki: WikiJSClient,
+    mail: MailserverClient,
+) -> None:
+    """
+    Provision one employee across all four appliances.
+    Idempotent: skips any appliance where the account already exists.
+    Writes back appliance IDs to the employees row when new accounts are created.
+    """
+    emp_id = employee["id"]
+    name = employee["name"]
+    email = employee["email"]
+    parts = name.split()
+    firstname = parts[0]
+    lastname = " ".join(parts[1:]) if len(parts) > 1 else ""
+    # Mattermost username: lowercase, no spaces, no @
+    mm_username = email.split("@")[0].replace(".", "_").lower()
+
+    updates = {}
+
+    # -- docker-mailserver --
+    log.info("Provisioning mail for %s (%s)...", name, email)
+    try:
+        await mail.create_account(email)
+        updates["mailbox_address"] = email
+    except Exception as exc:
+        log.error("mail: failed for %s: %s", email, exc)
+
+    # -- Mattermost --
+    log.info("Provisioning Mattermost for %s (%s)...", name, email)
+    existing_mm = await mm.get_bot_by_username(mm_username)
+    if existing_mm:
+        mm_id = existing_mm["id"]
+        log.info("Mattermost: bot %s already exists (id=%s)", mm_username, mm_id)
+    else:
+        try:
+            bot = await mm.create_bot(
+                username=mm_username,
+                display_name=name,
+                description=f"FakeCo bot account for {name}",
+            )
+            mm_id = bot["user_id"]
+            log.info("Mattermost: created bot %s (id=%s)", mm_username, mm_id)
+        except Exception as exc:
+            log.error("Mattermost: failed for %s: %s", name, exc)
+            mm_id = None
+    if mm_id and mm.team_id:
+        await mm.add_to_team(mm_id, mm.team_id)
+    if mm_id:
+        updates["mattermost_id"] = mm_id
+
+    # -- Zammad --
+    log.info("Provisioning Zammad for %s (%s)...", name, email)
+    existing_zammad = await zammad.get_user_by_email(email)
+    if existing_zammad:
+        zammad_id = str(existing_zammad["id"])
+        log.info("Zammad: user %s already exists (id=%s)", email, zammad_id)
+    else:
+        try:
+            user = await zammad.create_user(email, firstname, lastname, role_names=["Agent"])
+            zammad_id = str(user["id"])
+            log.info("Zammad: created agent %s (id=%s)", email, zammad_id)
+        except Exception as exc:
+            log.error("Zammad: failed for %s: %s", name, exc)
+            zammad_id = None
+    if zammad_id:
+        updates["zammad_agent_id"] = zammad_id
+
+    # -- Wiki.js --
+    log.info("Provisioning Wiki.js for %s (%s)...", name, email)
+    existing_wiki = await wiki.get_user_by_email(email)
+    if existing_wiki:
+        wiki_id = str(existing_wiki["id"])
+        log.info("Wiki.js: user %s already exists (id=%s)", email, wiki_id)
+    else:
+        try:
+            user = await wiki.create_user(email, name)
+            wiki_id = str(user.get("id", ""))
+            log.info("Wiki.js: created user %s (id=%s)", email, wiki_id)
+        except Exception as exc:
+            log.error("Wiki.js: failed for %s: %s", name, exc)
+            wiki_id = None
+    if wiki_id:
+        updates["wiki_user_id"] = wiki_id
+
+    # Write back IDs to the roster row
+    if updates:
+        set_clauses = ", ".join(f"{k} = ${i+2}" for i, k in enumerate(updates.keys()))
+        values = [emp_id] + list(updates.values())
+        await conn.execute(
+            f"UPDATE employees SET {set_clauses} WHERE id = $1",
+            *values
+        )
+        log.info("Roster updated for employee %d with: %s", emp_id, list(updates.keys()))
+
+
+async def fire_employee(
+    conn: asyncpg.Connection,
+    employee: asyncpg.Record,
+    mm: MattermostClient,
+    zammad: ZammadClient,
+    wiki: WikiJSClient,
+) -> None:
+    """
+    Fire path: status → 'terminated'; deactivate (never delete) accounts everywhere.
+    Spec §9: "deactivate (never delete) accounts everywhere"
+    """
+    emp_id = employee["id"]
+    name = employee["name"]
+    email = employee["email"]
+    log.info("Firing employee %d (%s)...", emp_id, name)
+
+    # Update roster status
+    await conn.execute(
+        "UPDATE employees SET status = 'terminated', terminated_at = NOW() WHERE id = $1",
+        emp_id
+    )
+
+    # Deactivate Mattermost
+    if employee["mattermost_id"]:
+        try:
+            await mm.disable_user(employee["mattermost_id"])
+            log.info("Mattermost: deactivated user %s", employee["mattermost_id"])
+        except Exception as exc:
+            log.error("Mattermost deactivation failed for %s: %s", name, exc)
+
+    # Deactivate Zammad
+    if employee["zammad_agent_id"]:
+        try:
+            await zammad.deactivate_user(int(employee["zammad_agent_id"]))
+            log.info("Zammad: deactivated user %s", employee["zammad_agent_id"])
+        except Exception as exc:
+            log.error("Zammad deactivation failed for %s: %s", name, exc)
+
+    # Deactivate Wiki.js
+    if employee["wiki_user_id"]:
+        try:
+            await wiki.deactivate_user(int(employee["wiki_user_id"]))
+            log.info("Wiki.js: deactivated user %s", employee["wiki_user_id"])
+        except Exception as exc:
+            log.error("Wiki.js deactivation failed for %s: %s", name, exc)
+
+    # Note: mail account is left in place (mailbox preserved, just no future activity)
+    # Orphaned action_items for this employee will be handled by the orchestrator reassignment logic.
+    log.info("Fire complete for %d (%s). Accounts deactivated (not deleted).", emp_id, name)
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint
+# ---------------------------------------------------------------------------
+async def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="FakeCo employee provisioning")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_prov = sub.add_parser("provision", help="Provision one or all employees")
+    p_prov.add_argument("--employee-id", type=int, help="Provision a specific employee by ID")
+    p_prov.add_argument("--all", action="store_true", help="Provision all active employees")
+
+    p_fire = sub.add_parser("fire", help="Fire (terminate) an employee")
+    p_fire.add_argument("--employee-id", type=int, required=True)
+
+    sub.add_parser("provision-principal", help="Provision the Principal human account")
+
+    args = parser.parse_args()
+
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
+    mm = MattermostClient(MATTERMOST_URL, MATTERMOST_ADMIN_TOKEN, MATTERMOST_TEAM_ID)
+    zammad = ZammadClient(ZAMMAD_URL, ZAMMAD_ADMIN_TOKEN)
+    wiki = WikiJSClient(WIKIJS_URL, WIKIJS_ADMIN_TOKEN)
+    mail = MailserverClient(MAILSERVER_CONTAINER, MAILSERVER_DOMAIN)
+
+    try:
+        async with pool.acquire() as conn:
+            if args.command == "provision":
+                if args.all:
+                    employees = await conn.fetch(
+                        "SELECT * FROM employees WHERE status IN ('active', 'vacant') ORDER BY id"
+                    )
+                elif args.employee_id:
+                    employees = await conn.fetch(
+                        "SELECT * FROM employees WHERE id = $1", args.employee_id
+                    )
+                else:
+                    parser.error("--employee-id or --all required")
+                    return
+
+                for emp in employees:
+                    await provision_employee(conn, emp, mm, zammad, wiki, mail)
+
+            elif args.command == "fire":
+                emp = await conn.fetchrow(
+                    "SELECT * FROM employees WHERE id = $1", args.employee_id
+                )
+                if not emp:
+                    log.error("Employee %d not found", args.employee_id)
+                    sys.exit(1)
+                await fire_employee(conn, emp, mm, zammad, wiki)
+
+            elif args.command == "provision-principal":
+                # Principal gets a human Mattermost account, not a bot
+                principal_mm_username = PRINCIPAL_EMAIL.split("@")[0].replace(".", "_").lower()
+                existing = await mm.get_bot_by_username(principal_mm_username)
+                if existing:
+                    log.info("Mattermost: Principal account already exists (id=%s)", existing["id"])
+                else:
+                    principal_password = os.environ.get("PRINCIPAL_MATTERMOST_PASSWORD", "")
+                    if not principal_password:
+                        log.error("PRINCIPAL_MATTERMOST_PASSWORD env var required for provision-principal")
+                        sys.exit(1)
+                    user = await mm.create_human_account(
+                        email=PRINCIPAL_EMAIL,
+                        username=principal_mm_username,
+                        name=PRINCIPAL_NAME,
+                        password=principal_password,
+                    )
+                    log.info("Mattermost: Principal account created (id=%s)", user["id"])
+
+                # Principal gets Zammad + Wiki.js accounts too
+                # (Zammad: for approving expense requests; Wiki.js: for editing pages)
+                zammad_principal = await zammad.get_user_by_email(PRINCIPAL_EMAIL)
+                if not zammad_principal:
+                    parts = PRINCIPAL_NAME.split()
+                    await zammad.create_user(
+                        PRINCIPAL_EMAIL,
+                        parts[0],
+                        " ".join(parts[1:]) if len(parts) > 1 else "",
+                        role_names=["Admin", "Agent"],
+                    )
+                    log.info("Zammad: Principal account created")
+                else:
+                    log.info("Zammad: Principal account already exists")
+
+                wiki_principal = await wiki.get_user_by_email(PRINCIPAL_EMAIL)
+                if not wiki_principal:
+                    await wiki.create_user(PRINCIPAL_EMAIL, PRINCIPAL_NAME)
+                    log.info("Wiki.js: Principal account created")
+                else:
+                    log.info("Wiki.js: Principal account already exists")
+
+                # Mail: create principal mailbox
+                await mail.create_account(PRINCIPAL_EMAIL)
+                log.info("provision-principal: complete")
+
+    finally:
+        await mm.close()
+        await zammad.close()
+        await wiki.close()
+        await pool.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
