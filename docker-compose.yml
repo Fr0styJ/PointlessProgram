@@ -1284,6 +1284,49 @@ services:
       - phase23
 
   # ---------------------------------------------------------------------------
+  # PHASE 30: branding-manager — avatar/emoji asset library + bulk push
+  # Spec §17 — employee_id -> avatar_asset_id mapping, real per-appliance
+  # avatar-upload API calls (Mattermost/Zammad/Wiki.js), first-boot emoji pack.
+  # ---------------------------------------------------------------------------
+  branding-manager:
+    build:
+      context: ./branding-manager
+      dockerfile: Dockerfile
+    container_name: fakeco-branding-manager
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      WIKIJS_URL: "http://wikijs:3000"
+      WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"
+      WIKIJS_DB_HOST: "wikijs-db"
+      WIKIJS_DB_PASSWORD: "${WIKIJS_DB_PASSWORD:?WIKIJS_DB_PASSWORD required}"
+    networks:
+      - net_clients
+      - net_data
+      - net_office
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "branding-manager"
+      fakeco.phase: "30"
+      fakeco.managed: "true"
+    profiles:
+      - phase30
+
+  # ---------------------------------------------------------------------------
   # PHASE 16: meeting-simulator — all 5 meeting types, LLM heavy tier
   # Spec §4.2–4.5, §6
   # ---------------------------------------------------------------------------

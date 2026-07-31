@@ -47,6 +47,125 @@
 
 ---
 
+### 2026-08-01T01:15 — Phase 30 built and runtime-verified: branding-manager service, 3 real appliance-API bugs/gaps found and fixed
+
+Built the previously-stub `branding-manager/` service (spec §17): asset library, employee avatar
+picker/bulk-push, first-boot Mattermost emoji pack. Verified against a fully isolated live stack,
+not just code review.
+
+- **New files:** `branding-manager/main.py` (FastAPI service), `branding-manager/Dockerfile`,
+  `branding-manager/requirements.txt` (same `python:3.12-slim` + fastapi/uvicorn/asyncpg/httpx/
+  pydantic pattern as `accounting-engine`, including the non-`curl` Python healthcheck),
+  `narrative-db/migrations/007_branding.sql` (`employee_branding` table: `employee_id ->
+  avatar_asset_id`, next free migration number after the parallel-built `006_phase19_pto.sql`),
+  `branding-manager/assets/avatars/avatar-{01..10}.png` (256x256 solid-color + initial-letter
+  placeholders) and `branding-manager/assets/emoji/{fakeco-thumbsup,fakeco-shipit,fakeco-star,
+  fakeco-alert,fakeco-money}.png` (64x64 simple geometric shapes) — real, distinct, valid PNGs
+  generated with a small one-off Pillow script (`branding-manager/assets/generate_assets.py`, not
+  part of the runtime image's import path). Wired into `docker-compose.yml` as a new `phase30`
+  profile service on `net_clients`/`net_data`/`net_office`, depending on `postgres` (healthy) +
+  `narrative-db-migrate` (completed).
+- **Endpoints:** `GET /assets` (lists bundled avatar/emoji stems), `POST /branding/apply` (single
+  employee), `POST /branding/bulk-apply` (`randomize` / `apply-one-to-all` / `reset-to-default`
+  over an employee-ID list), `GET /branding/employee/{id}`, `POST /branding/emoji-pack/upload`.
+- **3 real bugs/gaps found doing the required live research pass** (spec explicitly flagged Zammad
+  and Wiki.js avatar-API shapes as unknowns needing confirmation against a live instance — both
+  turned out to be more fundamentally different from the plan's assumption than just "wrong field
+  names"):
+  1. **Zammad has NO admin-on-behalf-of avatar API at all** — confirmed by reading the actual
+     controller/route source (`config/routes/user.rb`, `UsersController#avatar_new/avatar_list/
+     avatar_destroy`, and the GraphQL `user/current/avatar` mutation): every one of them operates
+     on `current_user`, never a `user_id`/`id` param, and `UserAccessTokenController#create`
+     (the token-minting endpoint) is likewise `current_user`-only — unlike Mattermost, there is no
+     "admin mints a token for user X" endpoint to piggyback on. Worked around with the same spirit
+     as this codebase's existing impersonation pattern: admin token calls `PUT /api/v1/users/{id}`
+     to set a fresh ephemeral password on the target employee, then a plain HTTP Basic Auth client
+     as that employee calls the normal current-user `POST /api/v1/users/avatar` endpoint. Verified
+     live: `image` field on the target Zammad user changed to a new store hash after each push, and
+     `GET /api/v1/users/image/{hash}` served back the exact byte-identical uploaded PNG.
+  2. **Zammad's `Token.create!(preferences: {permission: {...}})` (the shape shown in Zammad's own
+     `app/models/token.rb` doc comment) throws a 500** (`TypeError (can't cast Array)` in
+     `lib/auth/permissions.rb#permissions_cache`), because `Token::Permissions#permissions` does
+     `Permission.where(name: Array(preferences[:permission]))` — `Array()` on a Hash produces an
+     array of `[key, value]` pairs, not permission-name strings, which Postgres then can't cast for
+     the `name` column. Confirmed by reproducing the crash and reading Zammad's own admin-token
+     creation code. **Real fix:** `preferences[:permission]` must be an **array of permission-name
+     strings** (`["admin.user", "ticket.agent", "admin"]`), not a hash — used this shape for the
+     admin token minted during this phase's own test-stack bootstrap (not part of the
+     branding-manager service code itself, since it only *consumes* `ZAMMAD_ADMIN_TOKEN` from env
+     like every other service — but worth flagging for whoever documents `.env` bootstrap steps).
+  3. **Wiki.js has no avatar-setting API whatsoever in this version** — the plan's assumption
+     ("avatar as a URL/base64 field on `users.update`") was wrong: schema introspection
+     (`__type(name:"UserMutation")`) shows `update`'s only args are `id/email/name/newPassword/
+     groups/location/jobTitle/timezone/dateFormat/appearance` — no `avatar`. The `User` GraphQL
+     type itself has no `avatar` field either. Reading `server/models/users.js` confirms
+     `updateUserAvatarData()` is only ever called from OAuth-provider login sync
+     (`profile.picture`), never from any controller route, and the only avatar HTTP route
+     (`server/controllers/common.js`, `GET /_userav/:uid`) is read-only — there's no POST/PUT
+     counterpart at all. **Real fix:** write directly to Wiki.js's own `userAvatars` Postgres table
+     (`id INT PK, data BYTEA` — the exact table `/_userav/:uid` reads from) via `asyncpg`, since
+     `wikijs-db` is reachable on `net_data` (added `WIKIJS_DB_HOST`/`WIKIJS_DB_PASSWORD` to
+     `branding-manager`'s compose env). Verified live: after the direct DB write,
+     `GET /_userav/{id}` through Wiki.js's own real HTTP route served back the exact
+     byte-identical PNG (confirmed via matching Content-Length). Documented as a genuine missing
+     appliance feature, not a guess-and-move-on.
+- **1 more real bug found in Zammad's own `avatar_destroy` while testing `reset-to-default`:**
+  deleting a user's last remaining Avatar record does not clear `user.image` — Zammad's controller
+  only re-points `image` at a remaining default avatar's hash *if one still exists after the
+  delete*; when none remain it silently leaves `image` pointing at the just-deleted hash, and that
+  hash still resolves via `GET /api/v1/users/image/{hash}` (the underlying Store blob isn't
+  actually removed), so the user keeps silently showing a stale previously-applied avatar instead
+  of reverting to Zammad's generated initials. Confirmed live: reset a user with a single avatar
+  record, `image` field remained the deleted hash, and that hash still served the old image bytes
+  with 200. **Fixed** by having `branding-manager`'s `reset_user_avatar()` explicitly
+  `PUT /users/{id}` with `{"image": null}` after deleting the avatar records.
+- **Verified against a fully isolated stack** (project name `fakeco-p30`, brought up from this
+  worktree with `phase5`/`phase6`/`phase7`/`phase13`/`phase14`/`phase30` profiles; main `fakeco-*`
+  stack — 38 containers — confirmed untouched before and after). Container-name collisions with
+  the main stack (same known issue as Phase 19's verification) worked around with a temporary,
+  not-committed `docker-compose.override.p30.yml` (renamed containers + host-published test ports)
+  deleted after teardown. Bootstrapped fresh admin accounts/tokens on each appliance in this
+  isolated instance (Mattermost first-user signup + PAT, Wiki.js `/finalize` +
+  `authentication.setApiState(enabled:true)` + `createApiKey`, Zammad `rails r` admin-role grant +
+  token — this instance's own credentials, independent of the main stack's `.env` values) and 3
+  test employees (`employees.id` 1/2/3 — reused the pre-seeded roster rows rather than inserting
+  new ones, which collided with `employees.email`'s unique constraint on first attempt) with real
+  Mattermost/Zammad/Wiki.js accounts, writing their appliance IDs onto the `employees` row directly
+  (skipping full `provisioning` CLI since `mailserver` wasn't part of this phase's dependency set).
+  - `POST /branding/apply` (single employee, Alice/employee 1): confirmed all three appliances
+    returned `"ok"` and independently re-fetched each appliance's own avatar endpoint
+    (`GET /users/{id}/image` w/ Mattermost admin token, `GET /users/{id}` `.image` hash w/ Zammad
+    admin token, `GET /_userav/{id}` on Wiki.js) — each served back byte-size-matching, genuinely
+    different image data than before the push.
+  - `POST /branding/bulk-apply` with `mode:"apply-one-to-all"` across 3 employees (one Mattermost-
+    only employee included to exercise the "skipped, no zammad_agent_id/wiki_user_id" path):
+    confirmed the correct subset of appliances updated per employee, all with the identical chosen
+    asset (byte-size match confirmed per appliance).
+  - `mode:"randomize"`: confirmed distinct assets assigned per employee (not just "some 200
+    response") by reading back the recorded `avatar_asset_id` per employee.
+  - `mode:"reset-to-default"`: confirmed Mattermost's own generated default avatar was restored
+    (different, smaller byte size than any bundled asset — Mattermost's native letter-avatar
+    generator), Wiki.js's `/_userav/{id}` correctly 404'd (row deleted), and Zammad's `image` field
+    was `null` (after the bug fix above).
+  - Emoji pack: `POST /branding/emoji-pack/upload` created all 5 bundled emoji on Mattermost
+    (`POST /api/v4/emoji`, confirmed each returned a real emoji `id`); posted a real message
+    containing `:fakeco-shipit: :fakeco-star:` and confirmed the post response's
+    `metadata.emojis` array resolved both to their correct, just-created emoji records — genuinely
+    rendered/resolved by Mattermost, not just accepted as literal text.
+  - Torn down cleanly: `docker compose -p fakeco-p30 ... down -v` (after re-running with the
+    profile flags included — a first attempt without them left several containers/networks behind,
+    since `docker compose down` without `--profile` flags only tears down default-profile
+    services). Confirmed zero `fakeco-p30-*` containers/networks/volumes remained; main stack's 38
+    containers still running throughout.
+- **Files touched:** `branding-manager/main.py`, `branding-manager/Dockerfile`,
+  `branding-manager/requirements.txt`, `branding-manager/assets/` (new avatar/emoji PNGs +
+  generator script), `narrative-db/migrations/007_branding.sql`, `docker-compose.yml`
+  (new `branding-manager` service block).
+- **Next:** Phase 31 (observability pass 2, Grafana-only) or Phase 29 (purge/snapshot, still
+  unstarted) — both lower-risk than this phase's appliance-API research turned out to be.
+
+---
+
 ### 2026-07-31T23:45 — Phase 23 follow-up closed: kpi-engine's live-appliance rollup verified against the main stack, 3 real bugs found and fixed (2 also affected the already-"verified" accounting-engine)
 
 Closed the gap flagged in the Phase 23 entry below (its live rollup calls against real Zammad/
