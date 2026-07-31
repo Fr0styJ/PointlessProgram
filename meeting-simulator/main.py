@@ -231,18 +231,36 @@ async def select_attendees(
             department
         )
     elif meeting_type == "cross_functional":
-        # Leads + one IC per department (ordered by hired_at for determinism)
+        # Leads (always attend) + one IC per department, chosen via relationship-weighted
+        # scoring (Phase 20 §4): among each department's active ICs, prefer whoever has the
+        # highest existing affinity with the leads already attending — ties broken by
+        # hired_at for determinism, matching this function's existing no-randomness contract.
         leads = await conn.fetch(
             "SELECT id, name, department, role_tier FROM employees WHERE role_tier = 'lead' AND status = 'active'"
         )
-        ics = await conn.fetch("""
-            SELECT DISTINCT ON (department) id, name, department, role_tier
+        lead_ids = [l["id"] for l in leads]
+        ic_candidates = await conn.fetch("""
+            SELECT id, name, department, role_tier, hired_at
             FROM employees WHERE role_tier = 'ic' AND status = 'active'
             ORDER BY department, hired_at
         """)
+        relationships = await fetch_relationship_map(conn)
+
+        by_dept: dict[str, list[dict]] = {}
+        for ic in ic_candidates:
+            by_dept.setdefault(ic["department"], []).append(dict(ic))
+
+        chosen_ics = []
+        for dept, candidates in by_dept.items():
+            best = max(
+                candidates,
+                key=lambda c: (score_candidate_by_relationships(c["id"], lead_ids, relationships), -c["hired_at"].timestamp()),
+            )
+            chosen_ics.append(best)
+
         all_emp = {e["id"]: dict(e) for e in leads}
-        for ic in ics:
-            all_emp[ic["id"]] = dict(ic)
+        for ic in chosen_ics:
+            all_emp[ic["id"]] = ic
         employees = list(all_emp.values())[:max_cross_dept]
     elif meeting_type == "pay_negotiation":
         if not target_employee_id:
@@ -277,6 +295,113 @@ async def select_attendees(
         raise ValueError(f"Unknown meeting_type: {meeting_type}")
 
     return [dict(e) for e in employees]
+
+
+# ---------------------------------------------------------------------------
+# Relationship-weighted attendee scoring (Phase 20 §4)
+# Spec §5 + exit criteria: a plain, directly-callable, deterministic scoring
+# function — NOT baked invisibly into LLM-driven selection — so it can be
+# tested with fixed relationship data and a direct assertion, no statistical
+# sampling required.
+# ---------------------------------------------------------------------------
+def score_candidate_by_relationships(
+    candidate_id: int,
+    already_selected_ids: list[int],
+    relationships: dict[tuple[int, int], int],
+) -> int:
+    """
+    Sums the affinity_score between `candidate_id` and everyone already
+    selected for the meeting. `relationships` maps canonical
+    (min_id, max_id) pairs -> affinity_score (same convention as the
+    employee_relationships table's ordering constraint). Higher score means
+    the candidate is a better (more allied) fit alongside the current
+    attendee list; unknown pairs contribute 0 (neutral, no data yet).
+    """
+    total = 0
+    for other_id in already_selected_ids:
+        if other_id == candidate_id:
+            continue
+        key = (candidate_id, other_id) if candidate_id < other_id else (other_id, candidate_id)
+        total += relationships.get(key, 0)
+    return total
+
+
+async def fetch_relationship_map(conn: asyncpg.Connection) -> dict[tuple[int, int], int]:
+    """Loads the full employee_relationships table into a {(a_id,b_id): affinity_score} dict."""
+    rows = await conn.fetch("SELECT employee_a_id, employee_b_id, affinity_score FROM employee_relationships")
+    return {(r["employee_a_id"], r["employee_b_id"]): r["affinity_score"] for r in rows}
+
+
+def decision_text(decision) -> str:
+    """Decisions ride the same LLM call as everything else (Phase 20 §2), so they're now
+    objects ({description, stances}) rather than bare strings — tolerate either shape for
+    display purposes (Mattermost/Wiki.js text, and any legacy/parse-error fallback data)."""
+    if isinstance(decision, dict):
+        return decision.get("description", "")
+    return str(decision)
+
+
+AFFINITY_DELTA = 5  # Phase 20 §3: fixed deterministic nudge per agree/disagree pair on a decision
+
+
+def compute_affinity_updates(
+    decisions: list,
+    attendees: list[dict],
+    delta: int = AFFINITY_DELTA,
+) -> dict[tuple[int, int], int]:
+    """
+    Pure, deterministic (no LLM) function: walks each decision's per-attendee `stances`
+    (added to the existing meeting-generation LLM call, Phase 20 §2) and, for every pair of
+    attendees who both took a non-neutral stance on that decision, nudges their pairwise
+    affinity up by `delta` if they agreed or down by `delta` if they disagreed. Neutral
+    stances don't participate in any pair. Returns {(a_id, b_id): total_delta} using the
+    same canonical (min_id, max_id) ordering as the employee_relationships table's CHECK
+    constraint, ready to be applied by `apply_affinity_updates`.
+    """
+    name_to_id = {a["name"]: a["id"] for a in attendees}
+    name_to_id_ci = {name.lower(): eid for name, eid in name_to_id.items()}
+
+    updates: dict[tuple[int, int], int] = {}
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        stances = d.get("stances") or {}
+        resolved: dict[int, str] = {}
+        for name, stance in stances.items():
+            eid = name_to_id.get(name) or name_to_id_ci.get(str(name).lower())
+            if eid is not None and stance in ("agree", "disagree", "neutral"):
+                resolved[eid] = stance
+
+        ids = sorted(resolved.keys())
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a_id, b_id = ids[i], ids[j]
+                stance_a, stance_b = resolved[a_id], resolved[b_id]
+                if stance_a == "neutral" or stance_b == "neutral":
+                    continue
+                change = delta if stance_a == stance_b else -delta
+                key = (a_id, b_id)  # ids is already sorted, so a_id < b_id
+                updates[key] = updates.get(key, 0) + change
+    return updates
+
+
+async def apply_affinity_updates(conn: asyncpg.Connection, updates: dict[tuple[int, int], int]) -> None:
+    """Upserts each pairwise affinity delta into employee_relationships, clamped to the
+    schema's [-100, 100] CHECK range. No LLM call — spec §5's explicit no-extra-LLM-cost
+    constraint for relationship updates."""
+    for (a_id, b_id), delta in updates.items():
+        if delta == 0:
+            continue
+        await conn.execute(
+            """
+            INSERT INTO employee_relationships (employee_a_id, employee_b_id, relationship_type, affinity_score)
+            VALUES ($1, $2, 'neutral', GREATEST(-100, LEAST(100, $3)))
+            ON CONFLICT (employee_a_id, employee_b_id) DO UPDATE
+            SET affinity_score = GREATEST(-100, LEAST(100, employee_relationships.affinity_score + $3)),
+                last_updated = NOW()
+            """,
+            a_id, b_id, delta,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +454,14 @@ async def build_meeting_prompt(
         f"{extra_context}\n\n"
         f"Produce a JSON object with these fields:\n"
         f"  transcript_summary: string (2–5 paragraph meeting summary, natural voice)\n"
-        f"  decisions: array of strings (concrete decisions made, e.g. 'Reassign ticket #42 to Carol')\n"
+        f"  decisions: array of objects, each with fields:\n"
+        f"    description: string (concrete decision made, e.g. 'Reassign ticket #42 to Carol')\n"
+        f"    stances: object mapping EACH attendee's exact name (as listed above) to their\n"
+        f"      stance on this decision: one of 'agree', 'disagree', 'neutral'. Every attendee\n"
+        f"      must have an entry for every decision, even if their stance is 'neutral'\n"
+        f"      (i.e. they went along with it without strong feelings either way). Base stances\n"
+        f"      on realistic workplace dynamics — attendees in the same department, or whose\n"
+        f"      priorities align with the decision, are more likely to agree.\n"
         f"  action_items: array of objects with fields: assignee_name, description, due_in_days\n"
         f"  outcome: object with type-specific fields (see below)\n"
         f"  short_summary: one-sentence event summary for the narrative log\n\n"
@@ -472,6 +604,13 @@ async def run_meeting(
                         VALUES ($1, $2, $3, $4, $5, 'open')
                     """, meeting_id, thread_id, assignee_id, ai.get("description", ""), due_at)
 
+            # Deterministic relationship-affinity update (Phase 20 §3) — plain Python over the
+            # per-attendee `stances` that rode this same LLM call, no second LLM call spent.
+            affinity_updates = compute_affinity_updates(parsed.get("decisions", []), attendees)
+            if affinity_updates:
+                await apply_affinity_updates(conn, affinity_updates)
+                log.info("Meeting: applied %d affinity update(s): %s", len(affinity_updates), affinity_updates)
+
             # Create narrative_event
             await conn.execute("""
                 INSERT INTO narrative_events
@@ -506,7 +645,7 @@ async def run_meeting(
             f"{parsed.get('transcript_summary', '')[:2000]}\n\n"
         )
         if parsed.get("decisions"):
-            mm_text += "**Decisions:**\n" + "\n".join(f"- {d}" for d in parsed["decisions"]) + "\n\n"
+            mm_text += "**Decisions:**\n" + "\n".join(f"- {decision_text(d)}" for d in parsed["decisions"]) + "\n\n"
         if parsed.get("action_items"):
             mm_text += "**Action Items:**\n" + "\n".join(
                 f"- [{ai.get('assignee_name', '?')}] {ai.get('description', '')}"
@@ -528,7 +667,7 @@ async def run_meeting(
             f"## Summary\n\n{parsed.get('transcript_summary', '')}\n\n"
         )
         if parsed.get("decisions"):
-            wiki_content += "## Decisions\n\n" + "\n".join(f"- {d}" for d in parsed["decisions"]) + "\n\n"
+            wiki_content += "## Decisions\n\n" + "\n".join(f"- {decision_text(d)}" for d in parsed["decisions"]) + "\n\n"
         if parsed.get("action_items"):
             wiki_content += "## Action Items\n\n" + "\n".join(
                 f"- [{ai.get('assignee_name', '?')}] {ai.get('description', '')}"

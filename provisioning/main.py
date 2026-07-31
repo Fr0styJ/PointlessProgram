@@ -456,6 +456,57 @@ async def provision_employee(
         )
         log.info("Roster updated for employee %d with: %s", emp_id, list(updates.keys()))
 
+    await seed_employee_relationships(conn, employee)
+
+
+async def seed_employee_relationships(conn: asyncpg.Connection, employee: asyncpg.Record) -> None:
+    """
+    Phase 20 (spec §5): on first provisioning, seed 1-2 lightweight starting
+    `employee_relationships` rows for the new hire — deterministic, no LLM call.
+
+    Picks up to 2 other active same-department employees (closest in hire order,
+    excluding self), default relationship_type='neutral' and a small positive
+    affinity_score. Respects the schema's canonical-ordering CHECK
+    (employee_a_id < employee_b_id) and UNIQUE(employee_a_id, employee_b_id) —
+    idempotent via ON CONFLICT DO NOTHING, so re-running provisioning never
+    duplicates or overwrites relationships that may have since evolved via
+    meeting-simulator's affinity updates (Phase 20 §3).
+    """
+    emp_id = employee["id"]
+    department = employee["department"]
+    if not department:
+        return
+
+    peers = await conn.fetch(
+        """
+        SELECT id FROM employees
+        WHERE department = $1 AND status = 'active' AND id != $2
+        ORDER BY hired_at ASC, id ASC
+        LIMIT 2
+        """,
+        department, emp_id,
+    )
+    if not peers:
+        log.info("Relationships: no same-department peers yet for employee %d, skipping seed", emp_id)
+        return
+
+    seeded = 0
+    for peer in peers:
+        peer_id = peer["id"]
+        a_id, b_id = (emp_id, peer_id) if emp_id < peer_id else (peer_id, emp_id)
+        result = await conn.execute(
+            """
+            INSERT INTO employee_relationships
+                (employee_a_id, employee_b_id, relationship_type, affinity_score, notes)
+            VALUES ($1, $2, 'neutral', 10, 'Seeded at hire time: same-department starting relationship')
+            ON CONFLICT (employee_a_id, employee_b_id) DO NOTHING
+            """,
+            a_id, b_id,
+        )
+        if result.endswith("1"):
+            seeded += 1
+    log.info("Relationships: seeded %d starting relationship row(s) for employee %d (%s)", seeded, emp_id, department)
+
 
 async def fire_employee(
     conn: asyncpg.Connection,

@@ -316,6 +316,118 @@
 
 ---
 
+### 2026-07-31T23:10 — Phase 20 (Interpersonal relationships) built and runtime-verified in an isolated `docker compose -p fakeco-p20` stack
+
+- **What was built** (per `PLAN_REMAINING_PHASES.md`'s Phase 20 section and `PHASES.md`'s exit
+  criteria — `employee_relationships` table already existed from migration 004, so this was pure
+  service-extension work, no new migration):
+  1. `provisioning/main.py`: new `seed_employee_relationships(conn, employee)`, called at the end
+     of `provision_employee()`. On first provisioning, looks up up to 2 other active
+     same-department employees (ordered by `hired_at, id` for determinism — no LLM, no
+     randomness), and `INSERT ... ON CONFLICT (employee_a_id, employee_b_id) DO NOTHING`s a
+     `neutral`/`affinity_score=10` row per pair, respecting the schema's canonical-ordering CHECK
+     (`employee_a_id < employee_b_id`, computed via `min()/max()` before insert). `ON CONFLICT DO
+     NOTHING` makes re-provisioning the same employee a true no-op — it does not reset affinity
+     that meeting-simulator may have already nudged.
+  2. `meeting-simulator/main.py`'s `build_meeting_prompt()`: extended the *existing* single LLM
+     call's JSON schema so `decisions` is now an array of `{description, stances}` objects instead
+     of bare strings — `stances` maps every attendee's exact name to `agree`/`disagree`/`neutral`
+     for that decision. No second LLM call anywhere in the path.
+  3. New pure functions in `meeting-simulator/main.py`: `compute_affinity_updates(decisions,
+     attendees, delta=5)` walks every attendee pair per decision and returns
+     `{(a_id,b_id): total_delta}` (agree/agree or disagree/disagree → +5, split → -5, any
+     `neutral` participant excluded from that pair) using the same `(min_id,max_id)` canonical
+     ordering as the schema; `apply_affinity_updates(conn, updates)` upserts each delta with
+     `GREATEST(-100, LEAST(100, ...))` clamping to respect the `affinity_score` CHECK. Wired into
+     `run_meeting()`'s existing persistence transaction, right after `action_items` creation — same
+     transaction as everything else, no extra DB round trip class.
+  4. New pure, directly-callable `score_candidate_by_relationships(candidate_id,
+     already_selected_ids, relationships_map)` — sums affinity between a candidate and everyone
+     already selected. `fetch_relationship_map(conn)` loads the whole `employee_relationships`
+     table into that `{(a,b): score}` dict once per `select_attendees()` call. Wired into the
+     `cross_functional` branch of `select_attendees()`: instead of `DISTINCT ON (department)
+     ORDER BY hired_at` picking the earliest-hired IC per department unconditionally, it now picks
+     `max(candidates, key=(relationship_score, -hired_at))` — relationship score first, earliest
+     hire only as a tie-break — so the deterministic-selection contract (spec §4.2, no LLM-invented
+     attendee lists) is preserved.
+  5. Deliberately did **not** touch `dashboard/` — Phase 20's exit criteria explicitly excludes the
+     relationship view (that's Phase 34).
+- **Verified against a real, isolated `docker compose -p fakeco-p20` stack** (own `.env` copied
+  from the main checkout, own container names via a temporary `docker-compose.p20-override.yml`
+  to avoid colliding with the always-running main-checkout containers of the same
+  `container_name`s — deleted after use). Brought up `postgres`, `narrative-db-migrate`, `litellm`,
+  `meeting-simulator`, `provisioning`, all built with `--build`. The main checkout's own 30+
+  `fakeco-*` containers were confirmed untouched/still healthy throughout and after teardown
+  (`docker compose -p fakeco-p20 ... down -v` — confirmed no orphaned containers/volumes left).
+  - **Seed relationships**: inserted a brand-new test employee (`Test Newhire`, Engineering, id 22)
+    directly into the roster and called the real `seed_employee_relationships()` against the live
+    DB (bypassing the Mattermost/Zammad/Wiki.js legs of `provision_employee`, which are Phase 14's
+    already-verified concern, not Phase 20's — see bug note below on why full-stack `provision`
+    CLI runs weren't used for this specific check). Confirmed 2 new rows appeared
+    (`(1,22)` and `(5,22)`, both `neutral`/`affinity_score=10`). Re-ran the same function against
+    the same employee: confirmed 0 additional rows (`ON CONFLICT DO NOTHING` idempotency holds).
+  - **Real meeting with stances, single LLM call**: triggered `POST /meeting/run`
+    (`standup`/Engineering, attendees included the new hire) against the live
+    `meeting-simulator` container talking to a real DeepSeek call through `litellm`. Queried
+    `meetings.decisions` afterward and confirmed each decision is a real
+    `{"description": ..., "stances": {"Eva Rossi": "neutral", "Bob Martinez": "agree", ...}}`
+    object with every attendee named. Queried LiteLLM's own `/spend/logs`: exactly **one** log
+    entry for the whole meeting (`model_group: "heavy"`, 601 prompt / 2299 completion tokens) —
+    confirms the stance field really did ride the existing call, no second LLM spend.
+  - **Deterministic affinity delta**: after the meeting, re-queried `employee_relationships` for
+    the affected pairs. Confirmed exact `+5`-per-shared-decision arithmetic: e.g. `(1,22)` (Alice
+    Johnson ↔ Test Newhire) went from the seeded `10` to `15` (they both said `agree` on exactly
+    one of the three decisions; `neutral` on the others correctly contributed nothing), and several
+    previously-unseeded pairs among the standup's attendees (e.g. `(1,2)` Alice↔Bob) were created
+    fresh at exactly `+10` (two decisions where both agreed, `+5` each) — matched the transcript's
+    stances by hand, decision by decision.
+  - **Relationship-weighted attendee scoring — direct function call, no sampling**: called
+    `score_candidate_by_relationships(100, [10,20], {(10,100): 80, (20,200): -50})` and the
+    symmetric rival/unknown cases directly (no DB, no meeting) — asserted `ally_score(80) >
+    unknown_score(0) > rival_score(-50)` exactly, per the exit criteria's explicit "deterministic
+    assertion, not a statistical sample" requirement.
+  - **End-to-end weighting inside `select_attendees()` itself** (not just the standalone
+    function): manually set `employee_relationships(Alice[lead,id1], David[ic,id4])` affinity to
+    `90` (David is the *latest*-hired Engineering IC, would never win the old `hired_at`-only
+    tie-break). Called `select_attendees(conn, "cross_functional", max_cross_dept=20)` and
+    confirmed Engineering's selected IC flipped from Eva Rossi (earliest-hired, the old
+    unconditional pick) to David Chen — proving the weighting is live inside the real selection
+    path, not just correct in isolation. Reverted the test data afterward.
+- **Real pre-existing bug found (not introduced by this phase, not fixed — flagging per session
+  convention for a dedicated follow-up):** `select_attendees()`'s `cross_functional` branch builds
+  one combined dict (`all_emp`) with department **leads inserted first**, then ICs, then truncates
+  to `max_cross_dept` (default 5) via `list(all_emp.values())[:max_cross_dept]`. With the current
+  7-department roster there are 7 active leads — since they're inserted before any IC and the
+  truncation is a flat slice of the combined list, **every IC is silently dropped from every
+  cross_functional meeting**, regardless of this phase's new relationship weighting (confirmed via
+  `max_cross_dept=20` — the correctly-weighted IC only appears once the cap is raised above the
+  lead count). `max_cross_dept` needs to apply per-role (or per-department) rather than as a flat
+  post-concatenation slice. Did not fix here since it's Phase 16 pre-existing scope, not Phase 20's
+  — but it silently defeats this phase's IC-selection weighting under the current default, so it's
+  a real, verified, user-facing gap worth prioritizing.
+- **Environment note (not a code bug, but worth recording):** the main `.env`'s
+  `LITELLM_DATABASE_URL` is unset, so LiteLLM defaults to the *same* Postgres database as the
+  narrative schema. LiteLLM's own Prisma migration on startup appears to reset/recreate the
+  `public` schema's non-LiteLLM tables if it starts before `narrative-db-migrate` — observed in
+  the isolated stack (had to re-run `narrative-db-migrate` after `litellm` to get `employees`/
+  `employee_relationships` back). Didn't affect the main checkout (already running, migrations
+  already applied), but worth a dedicated `LITELLM_DATABASE_URL` pointing at a separate database
+  before any future from-scratch bring-up, to avoid this collision on cold start.
+- **Files touched:** `provisioning/main.py` (added `seed_employee_relationships()`, called from
+  `provision_employee()`), `meeting-simulator/main.py` (extended `build_meeting_prompt()`'s JSON
+  schema; added `score_candidate_by_relationships()`, `fetch_relationship_map()`,
+  `decision_text()`, `compute_affinity_updates()`, `apply_affinity_updates()`, `AFFINITY_DELTA`
+  constant; wired weighting into `select_attendees()`'s `cross_functional` branch and affinity
+  updates into `run_meeting()`; fixed 2 decision-rendering call sites (Mattermost text, Wiki.js
+  page content) to use the new `decision_text()` helper instead of assuming decisions are bare
+  strings).
+- **Status:** Phase 20 backend + meeting-simulator hook complete and runtime-verified per every
+  bullet in `PHASES.md`'s exit criteria. No dashboard work done (correctly deferred to Phase 34).
+  One real pre-existing bug found and flagged (cross_functional's flat `max_cross_dept` truncation
+  drops all ICs at the current roster size) — not fixed, logged for a dedicated follow-up.
+
+---
+
 ### 2026-07-31T18:40 — Phase 17 PARTIALLY verified: 2 real bugs fixed in what exists, but a major architectural gap found and NOT fixed
 
 - **Major gap, not a bug — a missing feature:** re-read spec §7 carefully against
