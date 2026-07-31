@@ -1,0 +1,100 @@
+{
+  "title": "Financials (Akaunting)",
+  "uid": "fakeco-financials",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-7d", "to": "now" },
+  "description": "Reads Akaunting's MariaDB directly (MySQL-Akaunting datasource) rather than its API, to sidestep the dual Host+X-Company header quirk documented in important.md #2 -- this is a pure read-only reporting path.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Cash Balance",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT (SELECT COALESCE(SUM(opening_balance),0) FROM ak_accounts WHERE company_id = 1) + (SELECT COALESCE(SUM(CASE WHEN type = 'income' THEN amount WHEN type = 'expense' THEN -amount ELSE 0 END),0) FROM ak_transactions WHERE company_id = 1 AND deleted_at IS NULL) AS cash_balance"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 2 } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Burn Rate (avg $/day, trailing 30d)",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT COALESCE(SUM(amount),0) / 30.0 AS burn_rate_per_day FROM ak_transactions WHERE company_id = 1 AND type = 'expense' AND deleted_at IS NULL AND paid_at >= NOW() - INTERVAL 30 DAY"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 2 } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Runway (days, cash / 30d avg burn)",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT cash_balance / NULLIF(burn_rate_per_day, 0) AS runway_days FROM (SELECT (SELECT COALESCE(SUM(opening_balance),0) FROM ak_accounts WHERE company_id = 1) + (SELECT COALESCE(SUM(CASE WHEN type = 'income' THEN amount WHEN type = 'expense' THEN -amount ELSE 0 END),0) FROM ak_transactions WHERE company_id = 1 AND deleted_at IS NULL) AS cash_balance, (SELECT COALESCE(SUM(amount),0) / 30.0 FROM ak_transactions WHERE company_id = 1 AND type = 'expense' AND deleted_at IS NULL AND paid_at >= NOW() - INTERVAL 30 DAY) AS burn_rate_per_day) t"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "d", "decimals": 1 } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Payroll Total (all-time)",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT COALESCE(SUM(t.amount),0) AS payroll_total FROM ak_transactions t JOIN ak_categories c ON c.id = t.category_id WHERE t.company_id = 1 AND t.deleted_at IS NULL AND c.name = 'Payroll Expense'"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 2 } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Income vs Expense Transactions Over Time",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 6 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT paid_at AS time, amount AS income, NULL AS expense FROM ak_transactions WHERE company_id = 1 AND type = 'income' AND deleted_at IS NULL AND $__timeFilter(paid_at) UNION ALL SELECT paid_at AS time, NULL AS income, amount AS expense FROM ak_transactions WHERE company_id = 1 AND type = 'expense' AND deleted_at IS NULL AND $__timeFilter(paid_at) ORDER BY time"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Expense Breakdown by Category (all-time)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT c.name AS category, COUNT(*) AS transaction_count, SUM(t.amount) AS total FROM ak_transactions t JOIN ak_categories c ON c.id = t.category_id WHERE t.company_id = 1 AND t.type = 'expense' AND t.deleted_at IS NULL GROUP BY c.name ORDER BY total DESC"
+        }
+      ]
+    }
+  ]
+}

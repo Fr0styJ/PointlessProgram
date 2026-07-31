@@ -1,0 +1,53 @@
+{
+  "title": "KPI Trends",
+  "uid": "fakeco-kpi-trends",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Department KPI Trends",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT snapshot_date AS time, value, entity_id || ' / ' || metric AS metric FROM kpi_snapshots WHERE entity_type = 'department' AND $__timeFilter(snapshot_date) ORDER BY snapshot_date"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Latest Department KPI Snapshot",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT DISTINCT ON (entity_id, metric) entity_id AS department, metric, value, snapshot_date FROM kpi_snapshots WHERE entity_type = 'department' ORDER BY entity_id, metric, snapshot_date DESC"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Latest Per-Employee KPI Snapshot",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT DISTINCT ON (k.entity_id, k.metric) e.name AS employee, k.metric, k.value, k.snapshot_date FROM kpi_snapshots k LEFT JOIN employees e ON e.id::text = k.entity_id WHERE k.entity_type = 'employee' ORDER BY k.entity_id, k.metric, k.snapshot_date DESC"
+        }
+      ]
+    }
+  ]
+}

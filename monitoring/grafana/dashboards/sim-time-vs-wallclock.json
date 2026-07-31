@@ -1,0 +1,72 @@
+{
+  "title": "Sim-Time vs Wall-Clock",
+  "uid": "fakeco-sim-time-vs-wallclock",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "description": "sim_clock (Phase 12) is a single mutable row, not a history table, so this dashboard shows the live current state each refresh rather than a stored trend line. It computes, from that one row, how far sim_time SHOULD have advanced since last_wall_checkpoint given speed_multiplier, so a drift/consistency check is still possible without needing new schema.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Current Speed Multiplier",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT speed_multiplier FROM sim_clock WHERE id = 1"
+        }
+      ],
+      "fieldConfig": { "defaults": { "decimals": 2, "unit": "none" } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Current Sim Time",
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT sim_time FROM sim_clock WHERE id = 1"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "dateTimeAsIso" } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Wall-Clock Now (Postgres server time)",
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT now() AS postgres_now"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "dateTimeAsIso" } }
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Sim-Time / Wall-Clock Consistency Check",
+      "description": "implied_current_sim_time = sim_time + (wall seconds elapsed since last_wall_checkpoint) * speed_multiplier. Compare against the live sim-clock's own advancing sim_time (panel above) to sanity-check the ticker is applying speed_multiplier correctly.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 6 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT sim_time, to_timestamp(last_wall_checkpoint) AS last_wall_checkpoint, speed_multiplier, EXTRACT(epoch FROM now()) - last_wall_checkpoint AS wall_seconds_since_checkpoint, sim_time + make_interval(secs => (EXTRACT(epoch FROM now()) - last_wall_checkpoint) * speed_multiplier) AS implied_current_sim_time FROM sim_clock WHERE id = 1"
+        }
+      ]
+    }
+  ]
+}

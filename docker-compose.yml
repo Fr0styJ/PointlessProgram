@@ -1066,16 +1066,33 @@ services:
     image: grafana/grafana:latest
     container_name: fakeco-grafana
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
       GF_SERVER_ROOT_URL: "http://grafana.fakecorp.internal"
+      # Phase 31: read-only-in-practice datasource credentials for the new
+      # Postgres/MySQL datasources (monitoring/grafana/provisioning/datasources/
+      # datasources.yml expands these via Grafana's built-in $VAR provisioning
+      # support). Reuses existing admin DB credentials already in .env per the
+      # user's 2026-07-31 sign-off (PLAN_PHASES_27_28_31_32.md, Phase 31 §6).
+      POSTGRES_USER: "${POSTGRES_USER:-fakeco}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-fakeco}"
+      AKAUNTING_DB_PASSWORD: "${AKAUNTING_DB_PASSWORD}"
     volumes:
       - grafana_data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     networks:
       - net_mgmt
+      # Phase 31: direct read access to the shared Postgres instance (narrative-db +
+      # LiteLLM's own spend-log tables) and to Akaunting's MariaDB (net_dmz) for the
+      # new dashboards' SQL panels — no new services, just new datasource targets.
+      - net_data
+      - net_dmz
     ports:
       - "3000:3000"
     labels:

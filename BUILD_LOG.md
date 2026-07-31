@@ -122,6 +122,64 @@ verification purposes only.
 
 ---
 
+### 2026-07-31T20:15 — Phase 31 built and runtime-verified: Grafana observability pass 2 (7 new dashboards, Postgres + Akaunting MySQL datasources)
+
+Built per `PLAN_PHASES_27_28_31_32.md`'s Phase 31 section (dashboards-only, no new services, no
+docker-compose service additions — per spec §21/`PHASES.md:679`). Recommended build order in that
+doc was 31 → 27 → 28; found live during this pass that a `pending_actions` table already exists in
+the running DB (Phase 27 apparently landed concurrently by another session) — the narrative-backlog
+panel handles both cases (table present or absent) via a `to_regclass()` guard, so it didn't matter
+which landed first.
+
+- **`monitoring/grafana/provisioning/datasources/datasources.yml`**: added two new datasources —
+  `Postgres-Fakeco` (uid `PostgresFakeco`, points at the shared `postgres` instance/`fakeco` DB —
+  covers narrative-db tables AND LiteLLM's own `LiteLLM_SpendLogs` table, which lives in that same
+  DB per `litellm`'s `DATABASE_URL`) and `MySQL-Akaunting` (uid `MySQLAkaunting`, points directly at
+  `akaunting-db`'s MariaDB — reads Akaunting's ledger tables directly instead of its API, sidestepping
+  the dual Host+X-Company header quirk in `important.md` #2 entirely, per the plan's own recommendation).
+  **Credential decision** (per the 2026-07-31 user sign-off, open question #3): reused the existing
+  admin DB credentials already in `.env` (`POSTGRES_USER`/`POSTGRES_PASSWORD`, `AKAUNTING_DB_PASSWORD`)
+  rather than provisioning new read-only DB roles. Live-checked whether a read-only role would've been
+  meaningfully easier: it would require a new narrative-db migration (`CREATE ROLE ... GRANT SELECT`)
+  re-run on every fresh bring-up plus an equivalent MariaDB grant for Akaunting — real extra work for a
+  purely read-only reporting path against a credential every other custom service in this repo already
+  trusts, so reuse was the right call, matching the plan's own risk assessment (low risk, not destructive).
+- **`docker-compose.yml`**: `grafana` service gained `net_data` and `net_dmz` network memberships (to
+  reach `postgres` and `akaunting-db` respectively — `net_mgmt` alone couldn't reach either), a
+  `depends_on: postgres: service_healthy`, and four new env vars so the datasource YAML's `${VAR}`
+  provisioning-expansion has values to read. No new services; Grafana dashboard JSON auto-loads via
+  the existing provisioning volume mount, no compose change needed for that part.
+- **7 new dashboard JSON files** in `monitoring/grafana/dashboards/`: `sim-time-vs-wallclock.json`
+  (sim_clock is a single mutable row, not a history table — built as a live-snapshot dashboard with a
+  drift-consistency-check panel rather than a fabricated trend line), `headcount-by-status.json`
+  (pie/bar/table by `employees.status`), `narrative-backlog.json` (open threads/action items/pending
+  approvals/pending reactions + the `pending_actions` queue-depth panel described above),
+  `financials.json` (cash balance, 30d burn rate, runway, payroll total, expense-by-category — all
+  direct MySQL reads against `ak_accounts`/`ak_transactions`/`ak_categories`), `kpi-trends.json`
+  (`kpi_snapshots` timeseries + latest-snapshot tables for department/employee), `customer-pipeline-
+  revenue.json` (customers-by-status from narrative-db + realized-revenue from Akaunting, both on one
+  dashboard via mixed Postgres/MySQL panels), `llm-spend.json` (`LiteLLM_SpendLogs` total spend/tokens/
+  by-model + a "current speed_multiplier" stat panel for the speed-annotation requirement, read from
+  `sim_clock`).
+- **Verification (live, against the real 39-container stack, not an isolated environment)**: recreated
+  just the `grafana` container in place (`docker compose -p pointlessprogram ... up -d --no-deps
+  grafana`) so the other 38 containers were untouched; confirmed both new datasources report
+  `"status":"OK"` via `/api/datasources/uid/{uid}/health`; confirmed all 7 new dashboards plus the 2
+  pre-existing ones show up via `/api/search`; then spot-checked every panel's exact SQL via Grafana's
+  `/api/ds/query` HTTP API and independently via raw `psql`/`mariadb` CLI queries against the same
+  tables, confirming exact numeric matches — e.g. cash balance `-46821.73` (opening balance 0 + income
+  500 − expenses 47321.73, both routes agreed), payroll total `47269.23` (matches the single seeded
+  payroll transaction), headcount `17 active / 3 terminated` (matches `employees` table directly),
+  `pending_actions` queue depth `1` row in `retrying` status (matches `pending_actions` table directly,
+  confirming the table exists live from Phase 27 and the graceful-omission guard still returns the
+  correct real number rather than always forcing 0), and the financials/customer-pipeline timeseries
+  panels' `$__timeFilter`/union queries all returned rows without error.
+- No `docker-compose.yml` service additions beyond the `grafana` network/env changes noted above; no
+  alerting was added (the plan explicitly flagged the task prompt's "maybe... alerting" framing as not
+  in spec §21's scope, and no alerting scope was added here).
+
+---
+
 ### 2026-07-31T20:05 — Phase 29 built and runtime-verified: snapshot-manager + purge-manager, real client/server version bug found and fixed via live disposable-environment round-trip test
 
 Built the previously-stub `snapshot-manager/` and `purge-manager/` services per `PHASE29_PLAN.md`

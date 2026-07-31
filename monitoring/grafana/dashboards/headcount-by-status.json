@@ -1,0 +1,69 @@
+{
+  "title": "Headcount by Status",
+  "uid": "fakeco-headcount-by-status",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "piechart",
+      "title": "Headcount by Status",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT status, count(*) AS headcount FROM employees GROUP BY status ORDER BY status"
+        }
+      ],
+      "options": { "displayLabels": ["name", "value"], "legend": { "displayMode": "table", "placement": "right", "values": ["value", "percent"] } }
+    },
+    {
+      "id": 2,
+      "type": "bargauge",
+      "title": "Headcount by Status (bars)",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT status, count(*) AS headcount FROM employees GROUP BY status ORDER BY status"
+        }
+      ],
+      "fieldConfig": { "defaults": { "min": 0 } }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Total Active Headcount",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 10 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS active_headcount FROM employees WHERE status = 'active'"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Headcount by Status and Department",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT department, status, count(*) AS headcount FROM employees GROUP BY department, status ORDER BY department, status"
+        }
+      ]
+    }
+  ]
+}

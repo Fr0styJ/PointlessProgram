@@ -15,3 +15,47 @@ datasources:
     access: proxy
     url: http://loki:3100
     editable: false
+
+  # Phase 31: direct read access to the shared fakeco Postgres instance (narrative-db
+  # tables: sim_clock, employees, customers, kpi_snapshots, narrative_threads,
+  # action_items, pending_approvals, pending_reactions — plus LiteLLM's own
+  # "LiteLLM_SpendLogs" table, which lives in this same DB per litellm's DATABASE_URL).
+  # Credential decision (2026-07-31 user sign-off, PLAN_PHASES_27_28_31_32.md Phase 31
+  # §6): reuse the existing admin Postgres credentials already in .env
+  # (POSTGRES_USER/POSTGRES_PASSWORD) rather than provisioning a new read-only DB role.
+  # A dedicated read-only role would need a new narrative-db migration to CREATE ROLE +
+  # GRANT SELECT-only on every table Grafana touches, re-run on every fresh environment
+  # bring-up — non-trivial extra effort for a purely read-only reporting path against a
+  # credential every other custom service in this repo already trusts. Reuse is fine
+  # here; revisit if this ever needs multi-tenant isolation.
+  - name: Postgres-Fakeco
+    uid: PostgresFakeco
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: "${POSTGRES_USER}"
+    secureJsonData:
+      password: "${POSTGRES_PASSWORD}"
+    jsonData:
+      database: "${POSTGRES_DB}"
+      sslmode: "disable"
+      postgresVersion: 1600
+      timescaledb: false
+    editable: false
+
+  # Phase 31: direct read access to Akaunting's own MariaDB instance, for the
+  # financials and customer-pipeline-revenue panels — reading tables directly avoids
+  # Akaunting's API dual Host+X-Company header quirk entirely (important.md #2).
+  # Same credential-reuse decision as above: existing AKAUNTING_DB_PASSWORD admin
+  # credential from .env, not a new read-only DB role.
+  - name: MySQL-Akaunting
+    uid: MySQLAkaunting
+    type: mysql
+    access: proxy
+    url: akaunting-db:3306
+    user: akaunting
+    secureJsonData:
+      password: "${AKAUNTING_DB_PASSWORD}"
+    jsonData:
+      database: akaunting
+    editable: false

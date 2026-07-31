@@ -1,0 +1,84 @@
+{
+  "title": "Customer Pipeline & Revenue",
+  "uid": "fakeco-customer-pipeline-revenue",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-30d", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "piechart",
+      "title": "Customer Pipeline by Relationship Status",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT relationship_status, count(*) AS customers FROM customers GROUP BY relationship_status ORDER BY relationship_status"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total Pipeline Deal Size (prospects + active)",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT COALESCE(SUM(deal_size), 0) AS total_pipeline_deal_size FROM customers WHERE relationship_status IN ('prospect', 'active')"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 2 } }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Customers by Status and Assigned Reps",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 10 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT c.company_name, c.relationship_status, c.deal_size, sr.name AS sales_rep, sp.name AS support_rep, c.created_at FROM customers c LEFT JOIN employees sr ON sr.id = c.assigned_sales_rep_id LEFT JOIN employees sp ON sp.id = c.assigned_support_rep_id ORDER BY c.created_at DESC"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Realized Revenue (Akaunting, all-time)",
+      "description": "Reads Akaunting's MariaDB directly (net_dmz) for realized/booked revenue -- the customers table above tracks pipeline/CRM status in narrative-db, this panel is the actual-dollars counterpart from the accounting system.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT COALESCE(SUM(amount), 0) AS realized_revenue FROM ak_transactions WHERE company_id = 1 AND type = 'income' AND deleted_at IS NULL"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 2 } }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Revenue Transactions Over Time (Akaunting)",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "mysql", "uid": "MySQLAkaunting" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT paid_at AS time, amount AS revenue FROM ak_transactions WHERE company_id = 1 AND type = 'income' AND deleted_at IS NULL AND $__timeFilter(paid_at) ORDER BY paid_at"
+        }
+      ]
+    }
+  ]
+}

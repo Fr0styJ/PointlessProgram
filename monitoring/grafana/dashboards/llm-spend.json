@@ -1,0 +1,99 @@
+{
+  "title": "LLM Spend (LiteLLM)",
+  "uid": "fakeco-llm-spend",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "description": "LiteLLM's own usage/cost tracking table (LiteLLM_SpendLogs) lives in the shared fakeco Postgres instance under the default schema (see litellm's DATABASE_URL in docker-compose.yml). Speed-annotated per spec: current sim_clock.speed_multiplier is shown alongside spend so a wall-clock $/hour figure can be read against the current sim-speed context.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total LLM Spend (all-time)",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT COALESCE(SUM(spend), 0) AS total_spend FROM \"LiteLLM_SpendLogs\""
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total Tokens (all-time)",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT COALESCE(SUM(total_tokens), 0) AS total_tokens FROM \"LiteLLM_SpendLogs\""
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Estimated $/Wall-Clock-Hour (trailing 1h)",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT COALESCE(SUM(spend), 0) AS spend_per_wallclock_hour FROM \"LiteLLM_SpendLogs\" WHERE \"startTime\" >= now() - interval '1 hour'"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Current Speed Multiplier (sim_clock)",
+      "description": "Speed-annotation context for the burn-rate panel: at speed_multiplier > 1, each wall-clock hour represents more sim-hours, so the true 'burn per sim-hour' is spend_per_wallclock_hour / speed_multiplier.",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT speed_multiplier FROM sim_clock WHERE id = 1"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "LLM Spend Over Time (5m buckets)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 6 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawSql": "SELECT $__timeGroup(\"startTime\", '5m') AS time, SUM(spend) AS spend FROM \"LiteLLM_SpendLogs\" WHERE $__timeFilter(\"startTime\") GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Spend by Model (all-time)",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT model, COUNT(*) AS calls, SUM(total_tokens) AS tokens, SUM(spend) AS spend FROM \"LiteLLM_SpendLogs\" GROUP BY model ORDER BY spend DESC"
+        }
+      ]
+    }
+  ]
+}

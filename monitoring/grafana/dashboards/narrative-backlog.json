@@ -1,0 +1,104 @@
+{
+  "title": "Narrative Backlog",
+  "uid": "fakeco-narrative-backlog",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "description": "Phase 27's pending_actions retry-queue table has not landed yet as of this dashboard's build (2026-07-31) — the 'Pending Actions Queue Depth' panel below uses a defensive to_regclass() check so it renders 0 gracefully instead of erroring until that table exists; no schema from Phase 27 is assumed or depended on.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Open Narrative Threads",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS open_threads FROM narrative_threads WHERE status IN ('open', 'in_progress')"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Open Action Items",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS open_action_items FROM action_items WHERE status IN ('open', 'overdue')"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Pending Approvals",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS pending_approvals FROM pending_approvals WHERE status = 'pending'"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Pending Reactions",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS pending_reactions FROM pending_reactions WHERE status = 'pending'"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Pending Actions Queue Depth (Phase 27, not yet built)",
+      "description": "Placeholder: returns 0 until Phase 27's pending_actions table exists. Uses to_regclass() so this panel never errors regardless of whether that table has landed.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 6 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT CASE WHEN to_regclass('public.pending_actions') IS NULL THEN 0 ELSE (SELECT count(*) FROM pending_actions WHERE status IN ('pending', 'retrying')) END AS pending_actions_queue_depth"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "special", "options": { "match": "null", "result": { "text": "0 (table not built yet)" } } }
+          ]
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "table",
+      "title": "Open Narrative Threads Detail",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 12 },
+      "datasource": { "type": "postgres", "uid": "PostgresFakeco" },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawSql": "SELECT id, topic, department, status, updated_at FROM narrative_threads WHERE status IN ('open', 'in_progress') ORDER BY updated_at DESC LIMIT 50"
+        }
+      ]
+    }
+  ]
+}
