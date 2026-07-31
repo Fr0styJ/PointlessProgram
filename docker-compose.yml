@@ -1064,12 +1064,146 @@ services:
       - phase15
 
   # ---------------------------------------------------------------------------
-  # PHASES 16+: Custom services — added as their phases execute.
+  # PHASE 16: meeting-simulator — all 5 meeting types, LLM heavy tier
+  # Spec §4.2–4.5, §6
+  # ---------------------------------------------------------------------------
+  meeting-simulator:
+    build:
+      context: ./meeting-simulator
+      dockerfile: Dockerfile
+    container_name: fakeco-meeting-simulator
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      LITELLM_URL: "http://litellm:4000"
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY required}"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_BOT_TOKEN: "${MATTERMOST_BOT_TOKEN:-}"
+      MATTERMOST_TEAM_ID: "${MATTERMOST_TEAM_ID:-}"
+      SIM_CLOCK_URL: "http://sim-clock:8000"
+      ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
+    networks:
+      - net_clients
+      - net_data
+      - net_office
+      - net_llm_bridge
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "meeting-simulator"
+      fakeco.phase: "16"
+      fakeco.managed: "true"
+    profiles:
+      - phase16
+
+  # ---------------------------------------------------------------------------
+  # PHASE 17: human-bridge — Principal control panel backend
+  # Spec §17: inject actions as employees, approve expenses, update directives
+  # ---------------------------------------------------------------------------
+  human-bridge:
+    build:
+      context: ./human-bridge
+      dockerfile: Dockerfile
+    container_name: fakeco-human-bridge
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      MAILSERVER_HOST: "mailserver"
+      MAILSERVER_SMTP_PORT: "25"
+      MAILSERVER_BOT_SECRET: "${MAILSERVER_BOT_SECRET:?MAILSERVER_BOT_SECRET required}"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      ZAMMAD_URL: "http://zammad:3000"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      WIKIJS_URL: "http://wikijs:3000"
+      WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"
+      ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
+      MEETING_SIM_URL: "http://meeting-simulator:8000"
+      PRINCIPAL_EMAIL: "${PRINCIPAL_EMAIL:-principal@fakecorp.internal}"
+      PRINCIPAL_NAME: "${PRINCIPAL_NAME:-Admin}"
+    networks:
+      - net_clients
+      - net_data
+      - net_mail
+      - net_office
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "human-bridge"
+      fakeco.phase: "17"
+      fakeco.managed: "true"
+    profiles:
+      - phase17
+
+  # ---------------------------------------------------------------------------
+  # PHASE 18: orchestrator — central simulation heartbeat (NO LLM calls)
+  # Spec §18: schedules all periodic jobs, fires meeting-simulator + accounting-engine
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: fakeco-orchestrator
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+      sim-clock:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      SIM_CLOCK_URL: "http://sim-clock:8000"
+      MEETING_SIM_URL: "http://meeting-simulator:8000"
+      ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
+      KPI_ENGINE_URL: "http://kpi-engine:8000"
+      EXTERNAL_WORLD_URL: "http://external-world:8000"
+      ORCHESTRATOR_TICK_INTERVAL: "${ORCHESTRATOR_TICK_INTERVAL:-60}"
+      STANDUP_SIM_HOUR: "9"
+      CROSS_DEPT_INTERVAL_DAYS: "14"
+      PERF_REVIEW_INTERVAL_DAYS: "30"
+      PAYROLL_INTERVAL_DAYS: "14"
+      STALE_THREAD_DAYS: "2"
+      APPROVAL_REMINDER_DAYS: "1"
+    networks:
+      - net_clients
+      - net_data
+      - net_office
+      - net_mail
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      fakeco.service: "orchestrator"
+      fakeco.phase: "18"
+      fakeco.managed: "true"
+    profiles:
+      - phase18
+
+  # ---------------------------------------------------------------------------
+  # PHASES 19+: Custom services — added as their phases execute.
   # Placeholders listed here for topology documentation:
   #
-  # meeting-simulator  (Phase 16) — net_clients, net_data, net_office
-  # human-bridge       (Phase 17) — net_clients, net_data, net_mail, net_office
-  # orchestrator       (Phase 18) — net_clients, net_data, net_office, net_mail
   # external-world     (Phase 21+22) — net_clients, net_data, net_mail, net_office
   # kpi-engine         (Phase 23+) — net_clients, net_data, net_office
   # branding-manager   (Phase 30) — net_clients, net_data, net_office
