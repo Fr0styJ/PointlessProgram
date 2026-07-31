@@ -51,10 +51,10 @@ DATABASE_URL = os.environ.get(
     f"{os.environ.get('POSTGRES_DB','fakeco')}"
 )
 MAILSERVER_HOST = os.environ.get("MAILSERVER_HOST", "mailserver")
-MAILSERVER_PORT = int(os.environ.get("MAILSERVER_SMTP_PORT", "25"))
+MAILSERVER_PORT = int(os.environ.get("MAILSERVER_SMTP_PORT", "587"))
 MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://mattermost:8065")
 MATTERMOST_ADMIN_TOKEN = os.environ.get("MATTERMOST_ADMIN_TOKEN", "")
-ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad:3000")
+ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad-nginx:8080")
 ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
 WIKIJS_URL = os.environ.get("WIKIJS_URL", "http://wikijs:3000")
 WIKIJS_ADMIN_TOKEN = os.environ.get("WIKIJS_ADMIN_TOKEN", "")
@@ -164,6 +164,17 @@ async def post_mattermost_as_employee(
         )
         r.raise_for_status()
         token = r.json()["token"]
+
+        # Ensure the bot is actually a member of the target channel first — team membership
+        # (granted at provisioning time) does not imply channel membership, and Mattermost
+        # returns a bare 403 "You do not have the appropriate permissions" on /posts otherwise,
+        # not a more specific "not a channel member" error. Idempotent: 201 if newly added,
+        # error ignored if already a member.
+        await http.post(
+            f"{MATTERMOST_URL}/api/v4/channels/{channel_id}/members",
+            headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
+            json={"user_id": mattermost_id},
+        )
 
         # Post using the employee's token
         r2 = await http.post(
@@ -396,6 +407,9 @@ async def action_create_zammad_ticket(req: ZammadTicketRequest, pool: PoolDep):
             json={
                 "title": req.title,
                 "group": req.group,
+                # `customer_id` is a hard-required field on ticket creation — Zammad accepts a
+                # "guess:<email>" shorthand that resolves to (or auto-creates) that customer.
+                "customer_id": f"guess:{PRINCIPAL_EMAIL}",
                 "article": {"subject": req.title, "body": req.body, "type": "note"},
             }
         )

@@ -57,10 +57,10 @@ DATABASE_URL = os.environ.get(
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000")
 LITELLM_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 MAILSERVER_HOST = os.environ.get("MAILSERVER_HOST", "mailserver")
-MAILSERVER_PORT = int(os.environ.get("MAILSERVER_SMTP_PORT", "25"))
+MAILSERVER_PORT = int(os.environ.get("MAILSERVER_SMTP_PORT", "587"))
 MAILSERVER_DOMAIN = os.environ.get("MAILSERVER_DOMAIN", "fakecorp.internal")
 ACCOUNTING_ENGINE_URL = os.environ.get("ACCOUNTING_ENGINE_URL", "http://accounting-engine:8000")
-ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad:3000")
+ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad-nginx:8080")
 ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
 SIM_CLOCK_URL = os.environ.get("SIM_CLOCK_URL", "http://sim-clock:8000")
 

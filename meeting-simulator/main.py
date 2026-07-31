@@ -67,6 +67,8 @@ MATTERMOST_BOT_TOKEN = os.environ.get("MATTERMOST_BOT_TOKEN", "")     # the orch
 MATTERMOST_TEAM_ID = os.environ.get("MATTERMOST_TEAM_ID", "")
 SIM_CLOCK_URL = os.environ.get("SIM_CLOCK_URL", "http://sim-clock:8000")
 ACCOUNTING_ENGINE_URL = os.environ.get("ACCOUNTING_ENGINE_URL", "http://accounting-engine:8000")
+WIKIJS_URL = os.environ.get("WIKIJS_URL", "http://wikijs:3000")
+WIKIJS_ADMIN_TOKEN = os.environ.get("WIKIJS_ADMIN_TOKEN", "")
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +138,57 @@ class MattermostClient:
         r = await self._client.post(f"{self.base}/posts", json=payload)
         r.raise_for_status()
         return r.json()["id"]
+
+
+# ---------------------------------------------------------------------------
+# Wiki.js client (minimal — just page creation via GraphQL)
+# ---------------------------------------------------------------------------
+class WikiJSClient:
+    def __init__(self, base_url: str, admin_token: str):
+        self.graphql_url = base_url.rstrip("/") + "/graphql"
+        self.headers = {"Authorization": f"Bearer {admin_token}", "Content-Type": "application/json"}
+        self._client = httpx.AsyncClient(headers=self.headers, timeout=30.0)
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def graphql(self, query: str, variables: dict = None) -> dict:
+        r = await self._client.post(self.graphql_url, json={"query": query, "variables": variables or {}})
+        r.raise_for_status()
+        body = r.json()
+        if body.get("errors"):
+            raise RuntimeError(f"Wiki.js GraphQL error: {body['errors']}")
+        return body
+
+    async def create_page(self, path: str, title: str, content: str, description: str = "", tags: list[str] = None) -> dict:
+        """Create a Wiki.js page. Returns the responseResult dict (succeeded/errorCode/message)."""
+        result = await self.graphql("""
+            mutation($content: String!, $description: String!, $editor: String!, $isPublished: Boolean!, $isPrivate: Boolean!, $locale: String!, $path: String!, $tags: [String]!, $title: String!) {
+                pages {
+                    create(content: $content, description: $description, editor: $editor, isPublished: $isPublished, isPrivate: $isPrivate, locale: $locale, path: $path, tags: $tags, title: $title) {
+                        responseResult { succeeded errorCode message }
+                        page { id path title }
+                    }
+                }
+            }
+        """, {
+            "content": content,
+            "description": description or title,
+            "editor": "markdown",
+            "isPublished": True,
+            "isPrivate": False,
+            "locale": "en",
+            "path": path,
+            "tags": tags or [],
+            "title": title,
+        })
+        create_result = ((result.get("data") or {}).get("pages") or {}).get("create") or {}
+        # `.get("responseResult", {})` only falls back to {} when the key is missing, not when
+        # it's explicitly `null` — guard against None too (same Wiki.js quirk as provisioning).
+        response_result = create_result.get("responseResult") or {}
+        if not response_result.get("succeeded"):
+            raise RuntimeError(f"Wiki.js page creation failed: {create_result}")
+        return response_result
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +355,7 @@ async def run_meeting(
     pool: asyncpg.Pool,
     llm: LLMClient,
     mm: MattermostClient,
+    wiki: WikiJSClient,
     meeting_type: str,
     department: Optional[str] = None,
     target_employee_id: Optional[int] = None,
@@ -463,6 +517,33 @@ async def run_meeting(
     except Exception as exc:
         log.warning("Failed to post meeting to Mattermost: %s", exc)
 
+    # Create Wiki.js meeting-notes page
+    try:
+        wiki_path = f"meeting-notes/{department.lower()}/{sim_time.strftime('%Y-%m-%d')}-{meeting_id}" \
+            if department else f"meeting-notes/cross-team/{sim_time.strftime('%Y-%m-%d')}-{meeting_id}"
+        wiki_title = f"{meeting_type.replace('_', ' ').title()} — {sim_time.strftime('%Y-%m-%d')} ({department or 'Cross-Team'})"
+        wiki_content = (
+            f"# {wiki_title}\n\n"
+            f"**Attendees:** {', '.join(a['name'] for a in attendees)}\n\n"
+            f"## Summary\n\n{parsed.get('transcript_summary', '')}\n\n"
+        )
+        if parsed.get("decisions"):
+            wiki_content += "## Decisions\n\n" + "\n".join(f"- {d}" for d in parsed["decisions"]) + "\n\n"
+        if parsed.get("action_items"):
+            wiki_content += "## Action Items\n\n" + "\n".join(
+                f"- [{ai.get('assignee_name', '?')}] {ai.get('description', '')}"
+                for ai in parsed["action_items"]
+            ) + "\n"
+        await wiki.create_page(
+            path=wiki_path,
+            title=wiki_title,
+            content=wiki_content,
+            tags=[meeting_type],
+        )
+        log.info("Meeting %d: created Wiki.js meeting-notes page at %s", meeting_id, wiki_path)
+    except Exception as exc:
+        log.warning("Failed to create Wiki.js meeting-notes page for meeting %d: %s", meeting_id, exc)
+
     # Handle outcome consequences for certain meeting types
     outcome = parsed.get("outcome", {})
     if meeting_type == "performance_review":
@@ -493,20 +574,24 @@ async def run_meeting(
 _pool: asyncpg.Pool | None = None
 _llm: LLMClient | None = None
 _mm: MattermostClient | None = None
+_wiki: WikiJSClient | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _llm, _mm
+    global _pool, _llm, _mm, _wiki
     _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     _llm = LLMClient(LITELLM_URL, LITELLM_API_KEY)
     _mm = MattermostClient(MATTERMOST_URL, MATTERMOST_BOT_TOKEN, MATTERMOST_TEAM_ID)
+    _wiki = WikiJSClient(WIKIJS_URL, WIKIJS_ADMIN_TOKEN)
     log.info("meeting-simulator: ready")
     yield
     if _llm:
         await _llm.close()
     if _mm:
         await _mm.close()
+    if _wiki:
+        await _wiki.close()
     if _pool:
         await _pool.close()
 
@@ -555,13 +640,14 @@ async def health():
 @app.post("/meeting/run", response_model=MeetingResult)
 async def trigger_meeting(req: RunMeetingRequest, pool: PoolDep):
     """Trigger a single meeting run. Called by the orchestrator on its schedule."""
-    if _llm is None or _mm is None:
-        raise HTTPException(status_code=503, detail="LLM or Mattermost client not ready")
+    if _llm is None or _mm is None or _wiki is None:
+        raise HTTPException(status_code=503, detail="LLM, Mattermost, or Wiki.js client not ready")
 
     result = await run_meeting(
         pool=pool,
         llm=_llm,
         mm=_mm,
+        wiki=_wiki,
         meeting_type=req.meeting_type,
         department=req.department,
         target_employee_id=req.target_employee_id,

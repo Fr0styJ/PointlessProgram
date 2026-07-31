@@ -27,7 +27,24 @@
 #   Phase 12: sim-clock (custom)
 #   Phase 13+: custom services added as their phases execute
 
-version: "3.9"
+# =============================================================================
+# SHARED FRAGMENTS (extension fields — ignored by Compose's service schema)
+# =============================================================================
+# `ghcr.io/zammad/zammad` is a single base image that runs different roles
+# depending on the command given — it is NOT a monolith. Every zammad-* process
+# below shares this environment block.
+x-zammad-common-env: &zammad-common-env
+  POSTGRESQL_HOST: zammad-db
+  POSTGRESQL_PORT: 5432
+  POSTGRESQL_DB: zammad
+  POSTGRESQL_USER: zammad
+  POSTGRESQL_PASS: ${ZAMMAD_DB_PASSWORD}
+  ELASTICSEARCH_HOST: zammad-elasticsearch
+  ELASTICSEARCH_PORT: 9200
+  ELASTICSEARCH_SCHEMA: http
+  MEMCACHE_SERVERS: zammad-memcached:11211
+  REDIS_URL: "redis://zammad-redis:6379"
+  TZ: UTC
 
 # =============================================================================
 # NETWORKS — §22
@@ -337,7 +354,9 @@ services:
       - "--api.insecure=true"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=net_clients"
+      # No global default network: routed services live on net_mail/net_office/net_dmz,
+      # not net_clients (that network has no appliance containers on it). Each routed
+      # service instead carries its own `traefik.docker.network` label below.
       - "--entrypoints.web.address=:80"
       - "--log.level=INFO"
       - "--accesslog=true"
@@ -433,6 +452,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.roundcube.rule: "Host(`mail.fakecorp.internal`)"
       traefik.http.services.roundcube.loadbalancer.server.port: "80"
+      traefik.docker.network: "pointlessprogram_net_mail"
     profiles:
       - phase4
 
@@ -477,6 +497,7 @@ services:
       MM_SQLSETTINGS_DATASOURCE: "postgres://mattermost:${MATTERMOST_DB_PASSWORD}@mattermost-db/mattermost?sslmode=disable&connect_timeout=10"
       MM_SERVICESETTINGS_SITEURL: ${MATTERMOST_SITE_URL:-http://chat.fakecorp.internal}
       MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
       MM_PLUGINSETTINGS_ENABLEUPLOADS: "true"
     volumes:
       - mattermost_config:/mattermost/config
@@ -494,6 +515,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.mattermost.rule: "Host(`chat.fakecorp.internal`)"
       traefik.http.services.mattermost.loadbalancer.server.port: "8065"
+      traefik.docker.network: "pointlessprogram_net_office"
     profiles:
       - phase5
 
@@ -542,16 +564,50 @@ services:
     profiles:
       - phase6
 
+  # Required even though the sim doesn't use Sidekiq/ActionCable pub-sub across nodes:
+  # Zammad's own boot-time initializer (lib/zammad/service/redis.rb) makes an
+  # unconditional Redis connectivity check and calls exit(1) — silently, no Ruby
+  # exception printed — on ECONNREFUSED, regardless of REDIS_URL being blank. Found via
+  # strace during Phase 6 verification: setting REDIS_URL="" only changes which backend
+  # ActionCable *sessions* use, it does not skip this check.
+  zammad-redis:
+    image: redis:7-alpine
+    container_name: fakeco-zammad-redis
+    restart: unless-stopped
+    networks:
+      - net_office
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      fakeco.service: "zammad-redis"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
   zammad-elasticsearch:
-    image: bitnami/elasticsearch:8
+    # NOTE: bitnami/elasticsearch:8 was removed from Docker Hub (Bitnami's 2025 catalog
+    # restructuring) — switched to Elastic's own image, which is what Zammad's own
+    # reference docker-compose ships.
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
     container_name: fakeco-zammad-es
     restart: unless-stopped
     environment:
-      ELASTICSEARCH_CLUSTER_NAME: zammad
-      ELASTICSEARCH_NODE_NAME: zammad-es
-      ELASTICSEARCH_HEAP_SIZE: 512m
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      cluster.name: zammad
+      node.name: zammad-es
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     volumes:
-      - zammad_es:/bitnami/elasticsearch/data
+      - zammad_es:/usr/share/elasticsearch/data
     networks:
       - net_office
     labels:
@@ -561,36 +617,117 @@ services:
     profiles:
       - phase6
 
-  zammad:
+  zammad-init:
     image: ghcr.io/zammad/zammad:latest
-    container_name: fakeco-zammad
-    restart: unless-stopped
+    container_name: fakeco-zammad-init
+    restart: "no"
+    command: ["zammad-init"]
     depends_on:
       zammad-db:
         condition: service_healthy
-    environment:
-      ZAMMAD_RAILS_TRUSTED_PROXIES: "['127.0.0.1', '::1', 'traefik']"
-      POSTGRESQL_HOST: zammad-db
-      POSTGRESQL_PORT: 5432
-      POSTGRESQL_DB: zammad
-      POSTGRESQL_USER: zammad
-      POSTGRESQL_PASS: ${ZAMMAD_DB_PASSWORD}
-      ELASTICSEARCH_HOST: zammad-elasticsearch
-      ELASTICSEARCH_PORT: 9200
-      MEMCACHE_SERVERS: zammad-memcached
-      REDIS_URL: ""
+    environment: *zammad-common-env
     volumes:
       - zammad_storage:/opt/zammad/storage
     networks:
       - net_office
       - net_data
     labels:
-      fakeco.service: "zammad"
+      fakeco.service: "zammad-init"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
+  zammad-railsserver:
+    image: ghcr.io/zammad/zammad:latest
+    container_name: fakeco-zammad-railsserver
+    restart: unless-stopped
+    command: ["zammad-railsserver"]
+    depends_on:
+      zammad-init:
+        condition: service_completed_successfully
+    environment: *zammad-common-env
+    volumes:
+      - zammad_storage:/opt/zammad/storage
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "zammad-railsserver"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
+  zammad-scheduler:
+    image: ghcr.io/zammad/zammad:latest
+    container_name: fakeco-zammad-scheduler
+    restart: unless-stopped
+    command: ["zammad-scheduler"]
+    depends_on:
+      zammad-init:
+        condition: service_completed_successfully
+    environment: *zammad-common-env
+    volumes:
+      - zammad_storage:/opt/zammad/storage
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "zammad-scheduler"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
+  zammad-websocket:
+    image: ghcr.io/zammad/zammad:latest
+    container_name: fakeco-zammad-websocket
+    restart: unless-stopped
+    command: ["zammad-websocket"]
+    depends_on:
+      zammad-init:
+        condition: service_completed_successfully
+    environment: *zammad-common-env
+    volumes:
+      - zammad_storage:/opt/zammad/storage
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "zammad-websocket"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
+  zammad-nginx:
+    image: ghcr.io/zammad/zammad:latest
+    container_name: fakeco-zammad-nginx
+    restart: unless-stopped
+    command: ["zammad-nginx"]
+    depends_on:
+      zammad-railsserver:
+        condition: service_started
+      zammad-websocket:
+        condition: service_started
+    environment:
+      <<: *zammad-common-env
+      NGINX_SERVER_NAME: tickets.fakecorp.internal
+      NGINX_PORT: "8080"
+    volumes:
+      - zammad_storage:/opt/zammad/storage
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "zammad-nginx"
       fakeco.phase: "6"
       fakeco.managed: "true"
       traefik.enable: "true"
       traefik.http.routers.zammad.rule: "Host(`tickets.fakecorp.internal`)"
-      traefik.http.services.zammad.loadbalancer.server.port: "3000"
+      traefik.http.services.zammad.loadbalancer.server.port: "8080"
+      traefik.docker.network: "pointlessprogram_net_office"
     profiles:
       - phase6
 
@@ -647,6 +784,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.wikijs.rule: "Host(`wiki.fakecorp.internal`)"
       traefik.http.services.wikijs.loadbalancer.server.port: "3000"
+      traefik.docker.network: "pointlessprogram_net_office"
     profiles:
       - phase7
 
@@ -706,6 +844,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.nextcloud.rule: "Host(`portal.fakecorp.internal`)"
       traefik.http.services.nextcloud.loadbalancer.server.port: "80"
+      traefik.docker.network: "pointlessprogram_net_office"
     profiles:
       - phase8
 
@@ -753,6 +892,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.wordpress.rule: "Host(`www.fakecorp.internal`)"
       traefik.http.services.wordpress.loadbalancer.server.port: "80"
+      traefik.docker.network: "pointlessprogram_net_dmz"
     profiles:
       - phase8
 
@@ -789,15 +929,40 @@ services:
     restart: unless-stopped
     depends_on:
       - akaunting-db
+    # NOTE: the akaunting/akaunting entrypoint (/usr/local/bin/akaunting.sh) only runs
+    # `php artisan install` (auto chart-of-accounts/company/admin bootstrap) when
+    # AKAUNTING_SETUP=true or --setup is passed, and it expects DB_NAME/DB_PORT/DB_PREFIX/
+    # COMPANY_EMAIL/LOCALE — DB_DATABASE (used originally here) is not a variable the
+    # entrypoint reads at all, so auto-install silently never fired.
+    # It also unconditionally re-runs `php artisan install` on every container start
+    # whenever AKAUNTING_SETUP=true (checking only the env var, not whether the schema
+    # is already populated), and that install is not idempotent — it errors with
+    # "Not able to create a new user." against an already-installed DB. Left as-is, any
+    # restart of this container (crash, host reboot, `docker restart`) crash-loops
+    # forever and the appliance never serves traffic again. entrypoint-idempotent.sh
+    # wraps the vendor entrypoint to skip install when the schema already exists.
+    entrypoint: ["/akaunting-init/entrypoint-idempotent.sh"]
     environment:
       APP_URL: "http://accounting.fakecorp.internal"
+      AKAUNTING_SETUP: "true"
+      # An empty DB_PREFIX is not "no prefix" to Akaunting's installer — it silently
+      # generates a random prefix instead (e.g. "7ry_") for install-time table names,
+      # while the running app keeps reading DB_PREFIX="" from the env at request time and
+      # queries unprefixed tables, causing every query to 42S02 (table not found). Must be
+      # a fixed non-empty value so install-time and runtime agree.
       DB_HOST: akaunting-db
-      DB_DATABASE: akaunting
+      DB_PORT: "3306"
+      DB_NAME: akaunting
+      DB_PREFIX: "ak_"
       DB_USERNAME: akaunting
       DB_PASSWORD: ${AKAUNTING_DB_PASSWORD}
       COMPANY_NAME: ${AKAUNTING_COMPANY_NAME:-FakeCo}
+      COMPANY_EMAIL: ${AKAUNTING_ADMIN_EMAIL:?AKAUNTING_ADMIN_EMAIL required}
       ADMIN_EMAIL: ${AKAUNTING_ADMIN_EMAIL:?AKAUNTING_ADMIN_EMAIL required}
       ADMIN_PASSWORD: ${AKAUNTING_ADMIN_PASSWORD:?AKAUNTING_ADMIN_PASSWORD required}
+      LOCALE: en-GB
+    volumes:
+      - ./akaunting-init:/akaunting-init:ro
     networks:
       - net_office
       - net_dmz
@@ -808,6 +973,7 @@ services:
       traefik.enable: "true"
       traefik.http.routers.akaunting.rule: "Host(`accounting.fakecorp.internal`)"
       traefik.http.services.akaunting.loadbalancer.server.port: "80"
+      traefik.docker.network: "pointlessprogram_net_office"
     profiles:
       - phase9
 
@@ -995,7 +1161,7 @@ services:
       MATTERMOST_URL: "http://mattermost:8065"
       MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
       MATTERMOST_TEAM_ID: "${MATTERMOST_TEAM_ID:-}"
-      ZAMMAD_URL: "http://zammad:3000"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
       ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
       WIKIJS_URL: "http://wikijs:3000"
       WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"
@@ -1042,7 +1208,10 @@ services:
       AKAUNTING_EXPENSE_ACCOUNT_ID: "${AKAUNTING_EXPENSE_ACCOUNT_ID:-0}"
       AKAUNTING_REVENUE_ACCOUNT_ID: "${AKAUNTING_REVENUE_ACCOUNT_ID:-0}"
       AKAUNTING_LLM_EXPENSE_ACCOUNT_ID: "${AKAUNTING_LLM_EXPENSE_ACCOUNT_ID:-0}"
-      ZAMMAD_URL: "http://zammad:3000"
+      AKAUNTING_PAYROLL_CATEGORY_ID: "${AKAUNTING_PAYROLL_CATEGORY_ID:-0}"
+      AKAUNTING_EXPENSE_CATEGORY_ID: "${AKAUNTING_EXPENSE_CATEGORY_ID:-0}"
+      AKAUNTING_REVENUE_CATEGORY_ID: "${AKAUNTING_REVENUE_CATEGORY_ID:-0}"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
       ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
       IC_AUTO_APPROVE_LIMIT: "${IC_AUTO_APPROVE_LIMIT:-25.00}"
       LEAD_AUTO_APPROVE_LIMIT: "${LEAD_AUTO_APPROVE_LIMIT:-500.00}"
@@ -1087,6 +1256,8 @@ services:
       MATTERMOST_TEAM_ID: "${MATTERMOST_TEAM_ID:-}"
       SIM_CLOCK_URL: "http://sim-clock:8000"
       ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
+      WIKIJS_URL: "http://wikijs:3000"
+      WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"
     networks:
       - net_clients
       - net_data
@@ -1121,11 +1292,11 @@ services:
     environment:
       DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
       MAILSERVER_HOST: "mailserver"
-      MAILSERVER_SMTP_PORT: "25"
+      MAILSERVER_SMTP_PORT: "587"  # port 25 has no AUTH; docker-mailserver only offers AUTH on submission (587)
       MAILSERVER_BOT_SECRET: "${MAILSERVER_BOT_SECRET:?MAILSERVER_BOT_SECRET required}"
       MATTERMOST_URL: "http://mattermost:8065"
       MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
-      ZAMMAD_URL: "http://zammad:3000"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
       ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
       WIKIJS_URL: "http://wikijs:3000"
       WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"

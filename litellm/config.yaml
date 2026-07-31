@@ -9,24 +9,39 @@
 #   heavy  — meetings, meeting-derived content, Principal reactions (§4.3 priority 1)
 #
 # API KEYS: Never stored here — loaded from environment variables only.
+#
+# NOTE (found during Phase 16 verification): the original config put all 3 providers under the
+# SAME `model_name` per tier (e.g. three deployments all named "cheap") with
+# `routing_strategy: "latency-based-routing"`. LiteLLM treats same-named deployments as
+# interchangeable load-balancing targets, not an ordered fallback chain — with no
+# Anthropic/OpenAI keys configured, this intermittently picked one of the two broken deployments
+# and returned a hard 401 instead of falling through to the working DeepSeek one (reproduced: a
+# meeting-simulator call worked, then the very next identical call failed outright). Fixed by
+# giving every deployment a distinct model_name and using `model_group_alias` + explicit
+# `fallbacks` so DeepSeek is always tried first, deterministically, and only cascades to
+# Anthropic/OpenAI on a real failure.
 
 model_list:
   # --- Cheap/routine tier ---
-  - model_name: "cheap"
+  # deepseek-chat/deepseek-reasoner legacy aliases were retired 2026-07-24 — migrated to the
+  # real V4 model names. "cheap" and "mid" both use v4-flash (non-thinking); "heavy" explicitly
+  # uses v4-pro rather than v4-flash+thinking, since deepseek-reasoner used to silently route to
+  # Flash, not Pro — for the heavy/reasoning tier we want the actual stronger model.
+  - model_name: "cheap-deepseek"
     litellm_params:
-      model: "deepseek/deepseek-chat"
+      model: "deepseek/deepseek-v4-flash"
       api_key: "os.environ/DEEPSEEK_API_KEY"
     model_info:
       mode: chat
 
-  - model_name: "cheap"
+  - model_name: "cheap-anthropic"
     litellm_params:
       model: "claude-haiku-20240307"
       api_key: "os.environ/ANTHROPIC_API_KEY"
     model_info:
       mode: chat
 
-  - model_name: "cheap"
+  - model_name: "cheap-openai"
     litellm_params:
       model: "gpt-4o-mini"
       api_key: "os.environ/OPENAI_API_KEY"
@@ -34,21 +49,21 @@ model_list:
       mode: chat
 
   # --- Mid tier ---
-  - model_name: "mid"
+  - model_name: "mid-deepseek"
     litellm_params:
-      model: "deepseek/deepseek-chat"
+      model: "deepseek/deepseek-v4-flash"
       api_key: "os.environ/DEEPSEEK_API_KEY"
     model_info:
       mode: chat
 
-  - model_name: "mid"
+  - model_name: "mid-anthropic"
     litellm_params:
       model: "claude-3-5-haiku-20241022"
       api_key: "os.environ/ANTHROPIC_API_KEY"
     model_info:
       mode: chat
 
-  - model_name: "mid"
+  - model_name: "mid-openai"
     litellm_params:
       model: "gpt-4o-mini"
       api_key: "os.environ/OPENAI_API_KEY"
@@ -56,16 +71,17 @@ model_list:
       mode: chat
 
   # --- Heavy/reasoning tier (meetings, meeting-derived content, Principal reactions) ---
-  - model_name: "heavy"
+  - model_name: "heavy-deepseek"
     litellm_params:
-      model: "deepseek/deepseek-reasoner"
+      model: "deepseek/deepseek-v4-pro"
       api_key: "os.environ/DEEPSEEK_API_KEY"
+      reasoning_effort: "high"
       # Enable DeepSeek prompt caching (§20.1 tip 1)
       cache_control: true
     model_info:
       mode: chat
 
-  - model_name: "heavy"
+  - model_name: "heavy-anthropic"
     litellm_params:
       model: "claude-sonnet-4-5"
       api_key: "os.environ/ANTHROPIC_API_KEY"
@@ -74,7 +90,7 @@ model_list:
     model_info:
       mode: chat
 
-  - model_name: "heavy"
+  - model_name: "heavy-openai"
     litellm_params:
       model: "gpt-4o"
       api_key: "os.environ/OPENAI_API_KEY"
@@ -82,9 +98,16 @@ model_list:
       mode: chat
 
 router_settings:
-  # Enable fallback routing per tier — tries providers in list order
-  routing_strategy: "latency-based-routing"
-  enable_pre_call_checks: true
+  # Callers still request "cheap"/"mid"/"heavy" — aliased to the DeepSeek deployment, which is
+  # always tried first. `fallbacks` below defines the deterministic cascade on failure.
+  model_group_alias:
+    cheap: "cheap-deepseek"
+    mid: "mid-deepseek"
+    heavy: "heavy-deepseek"
+  fallbacks:
+    - cheap-deepseek: ["cheap-anthropic", "cheap-openai"]
+    - mid-deepseek: ["mid-anthropic", "mid-openai"]
+    - heavy-deepseek: ["heavy-anthropic", "heavy-openai"]
   num_retries: 3
   retry_after: 5
 

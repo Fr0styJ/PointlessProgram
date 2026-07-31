@@ -54,7 +54,7 @@ MAILSERVER_CONTAINER = os.environ.get("MAILSERVER_CONTAINER", "fakeco-mailserver
 MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://mattermost:8065")
 MATTERMOST_ADMIN_TOKEN = os.environ.get("MATTERMOST_ADMIN_TOKEN", "")
 MATTERMOST_TEAM_ID = os.environ.get("MATTERMOST_TEAM_ID", "")  # written at first-boot
-ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad:3000")
+ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad-nginx:8080")
 ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
 WIKIJS_URL = os.environ.get("WIKIJS_URL", "http://wikijs:3000")
 WIKIJS_ADMIN_TOKEN = os.environ.get("WIKIJS_ADMIN_TOKEN", "")
@@ -189,9 +189,17 @@ class WikiJSClient:
     async def graphql(self, query: str, variables: dict = None) -> dict:
         r = await self._client.post(self.graphql_url, json={"query": query, "variables": variables or {}})
         r.raise_for_status()
-        return r.json()
+        body = r.json()
+        if body.get("errors"):
+            raise RuntimeError(f"Wiki.js GraphQL error: {body['errors']}")
+        return body
 
     async def get_user_by_email(self, email: str) -> Optional[dict]:
+        # NOTE: requesting `isActive` here used to crash the whole query with
+        # "Cannot return null for non-nullable field UserMinimal.isActive" — Wiki.js's search
+        # index returns a null isActive for at least some freshly-created accounts even though
+        # the field is declared non-nullable in its own schema. We don't need it for lookup
+        # purposes, so just don't ask for it.
         result = await self.graphql("""
             query($email: String!) {
                 users {
@@ -199,22 +207,29 @@ class WikiJSClient:
                         id
                         email
                         name
-                        isActive
                     }
                 }
             }
         """, {"email": email})
-        users = result.get("data", {}).get("users", {}).get("search", [])
+        users = (result.get("data") or {}).get("users") or {}
+        users = users.get("search") or []
         for user in users:
             if user.get("email", "").lower() == email.lower():
                 return user
         return None
 
     async def create_user(self, email: str, name: str, password_reset: bool = True) -> dict:
+        # Wiki.js's `passwordRaw` arg is nullable in the schema but the resolver rejects a blank
+        # password for the "local" provider at runtime ("Password raw can't be blank") — bot
+        # accounts never log in interactively, so derive a password the same deterministic way
+        # mail accounts do rather than requiring a human-entered one.
+        password = hashlib.sha256(
+            f"{os.environ.get('MAILSERVER_BOT_SECRET', 'fakeco-bot-mail-secret-change-me')}:wikijs:{email}".encode()
+        ).hexdigest()[:24]
         result = await self.graphql("""
-            mutation($email: String!, $name: String!, $providerKey: String!, $groups: [Int]!) {
+            mutation($email: String!, $name: String!, $passwordRaw: String!, $providerKey: String!, $groups: [Int]!, $mustChangePassword: Boolean, $sendWelcomeEmail: Boolean) {
                 users {
-                    create(email: $email, name: $name, providerKey: $providerKey, groups: $groups) {
+                    create(email: $email, name: $name, passwordRaw: $passwordRaw, providerKey: $providerKey, groups: $groups, mustChangePassword: $mustChangePassword, sendWelcomeEmail: $sendWelcomeEmail) {
                         responseResult {
                             succeeded
                             errorCode
@@ -232,13 +247,18 @@ class WikiJSClient:
         """, {
             "email": email,
             "name": name,
+            "passwordRaw": password,
             "providerKey": "local",
             "groups": [1],  # Default group ID — Guests (1) or Editors (2); adjust in first-boot
+            "mustChangePassword": False,
+            "sendWelcomeEmail": False,
         })
-        create_result = result.get("data", {}).get("users", {}).get("create", {})
+        create_result = ((result.get("data") or {}).get("users") or {}).get("create") or {}
         if not create_result.get("responseResult", {}).get("succeeded"):
             raise RuntimeError(f"Wiki.js user creation failed: {create_result}")
-        return create_result.get("user", {})
+        # `.get("user", {})` only falls back to {} when the key is missing, not when it's
+        # explicitly `null` (which is what Wiki.js returns here) — guard against None too.
+        return create_result.get("user") or {}
 
     async def deactivate_user(self, user_id: int) -> None:
         await self.graphql("""
@@ -308,15 +328,25 @@ class MailserverClient:
         return True
 
     async def restrict_account(self, email: str) -> None:
-        """Restrict/lock a mailbox (PTO over; for termination use 'restrict')."""
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", self.container,
-            "setup", "email", "restrict", email,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
-        log.info("mail: restricted account %s", email)
+        """
+        Restrict/lock a mailbox for termination — blocks send AND receive without deleting
+        the mailbox or its contents (spec §9: deactivate everywhere, never delete).
+        Real docker-mailserver CLI syntax is `setup email restrict <add|del|list> <send|receive>
+        <email>` — a single `setup email restrict <email>` (no direction) is not a valid
+        invocation and silently no-ops (docker-mailserver still exits 0 on an unrecognized
+        subcommand shape here, so this went unnoticed without an actual runtime check).
+        """
+        for direction in ("send", "receive"):
+            proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", self.container,
+                "setup", "email", "restrict", "add", direction, email,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(f"mail: restrict ({direction}) failed for {email}: {stderr.decode()}")
+        log.info("mail: restricted account %s (send+receive blocked, mailbox preserved)", email)
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +434,11 @@ async def provision_employee(
         try:
             user = await wiki.create_user(email, name)
             wiki_id = str(user.get("id", ""))
+            if not wiki_id:
+                # Wiki.js's `create` mutation response has `user: null` even on success in
+                # this version — look the account up by email to get its real ID.
+                created = await wiki.get_user_by_email(email)
+                wiki_id = str(created["id"]) if created else ""
             log.info("Wiki.js: created user %s (id=%s)", email, wiki_id)
         except Exception as exc:
             log.error("Wiki.js: failed for %s: %s", name, exc)
@@ -428,6 +463,7 @@ async def fire_employee(
     mm: MattermostClient,
     zammad: ZammadClient,
     wiki: WikiJSClient,
+    mail: MailserverClient,
 ) -> None:
     """
     Fire path: status → 'terminated'; deactivate (never delete) accounts everywhere.
@@ -468,7 +504,13 @@ async def fire_employee(
         except Exception as exc:
             log.error("Wiki.js deactivation failed for %s: %s", name, exc)
 
-    # Note: mail account is left in place (mailbox preserved, just no future activity)
+    # Restrict mail: blocks send+receive without deleting the mailbox/contents
+    if employee["mailbox_address"]:
+        try:
+            await mail.restrict_account(employee["mailbox_address"])
+        except Exception as exc:
+            log.error("Mail restriction failed for %s: %s", name, exc)
+
     # Orphaned action_items for this employee will be handled by the orchestrator reassignment logic.
     log.info("Fire complete for %d (%s). Accounts deactivated (not deleted).", emp_id, name)
 
@@ -523,7 +565,7 @@ async def main() -> None:
                 if not emp:
                     log.error("Employee %d not found", args.employee_id)
                     sys.exit(1)
-                await fire_employee(conn, emp, mm, zammad, wiki)
+                await fire_employee(conn, emp, mm, zammad, wiki, mail)
 
             elif args.command == "provision-principal":
                 # Principal gets a human Mattermost account, not a bot

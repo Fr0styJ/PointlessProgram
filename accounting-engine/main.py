@@ -57,7 +57,7 @@ AKAUNTING_URL = os.environ.get("AKAUNTING_URL", "http://akaunting")
 AKAUNTING_EMAIL = os.environ.get("AKAUNTING_ADMIN_EMAIL", "")
 AKAUNTING_PASSWORD = os.environ.get("AKAUNTING_ADMIN_PASSWORD", "")
 AKAUNTING_COMPANY_ID = int(os.environ.get("AKAUNTING_COMPANY_ID", "1"))
-ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad:3000")
+ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad-nginx:8080")
 ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
 
 # Approval policy thresholds (spec §10.2 defaults — all tunable via env)
@@ -69,6 +69,12 @@ AKAUNTING_PAYROLL_ACCOUNT_ID = int(os.environ.get("AKAUNTING_PAYROLL_ACCOUNT_ID"
 AKAUNTING_EXPENSE_ACCOUNT_ID = int(os.environ.get("AKAUNTING_EXPENSE_ACCOUNT_ID", "0"))
 AKAUNTING_REVENUE_ACCOUNT_ID = int(os.environ.get("AKAUNTING_REVENUE_ACCOUNT_ID", "0"))
 AKAUNTING_LLM_EXPENSE_ACCOUNT_ID = int(os.environ.get("AKAUNTING_LLM_EXPENSE_ACCOUNT_ID", "0"))
+# Akaunting *category* IDs — distinct from the account (bank) IDs above. `category_id` is a
+# separate required field on every transaction (income/expense classification); omitting it
+# entirely was a bug (every post 422'd with "The category id field is required").
+AKAUNTING_PAYROLL_CATEGORY_ID = int(os.environ.get("AKAUNTING_PAYROLL_CATEGORY_ID", "0"))
+AKAUNTING_EXPENSE_CATEGORY_ID = int(os.environ.get("AKAUNTING_EXPENSE_CATEGORY_ID", "0"))
+AKAUNTING_REVENUE_CATEGORY_ID = int(os.environ.get("AKAUNTING_REVENUE_CATEGORY_ID", "0"))
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +103,15 @@ class AkauntingClient:
         contact_id: Optional[int] = None,
         category_id: Optional[int] = None,
         reference: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> dict:
         """Post a transaction to Akaunting. Returns the created transaction dict."""
+        # `number` and `payment_method` are both required by Akaunting's transaction
+        # validation (neither was being sent before, so every post 422'd) — `number` needs to
+        # be unique per transaction, so derive it from the idempotency key when the caller has
+        # one (every financial mutation in this service is meant to be idempotency-keyed per
+        # spec §23), falling back to a timestamp otherwise. `payment_method` is fixed to the
+        # seeded offline "Cash" method since this sim only ever uses one bank account.
         payload = {
             "company_id": self.company_id,
             "type": transaction_type,  # "income" or "expense"
@@ -108,6 +121,8 @@ class AkauntingClient:
             "currency_rate": 1,
             "paid_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "description": description,
+            "payment_method": "offline-payments.cash.1",
+            "number": idempotency_key or f"TXN-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
         }
         if contact_id:
             payload["contact_id"] = contact_id
@@ -292,6 +307,7 @@ async def submit_expense_request(
             try:
                 tx = await akaunting.post_transaction(
                     account_id=AKAUNTING_EXPENSE_ACCOUNT_ID,
+                    category_id=AKAUNTING_EXPENSE_CATEGORY_ID,
                     amount=amount,
                     description=f"[AUTO-APPROVED] {description}",
                     transaction_type="expense",
@@ -371,6 +387,7 @@ async def approve_expense(
             # Post to Akaunting
             tx = await akaunting.post_transaction(
                 account_id=AKAUNTING_EXPENSE_ACCOUNT_ID,
+                category_id=AKAUNTING_EXPENSE_CATEGORY_ID,
                 amount=approval["amount"],
                 description=f"[APPROVED by {approved_by}] {approval['expense_request_ref']}",
                 transaction_type="expense",
@@ -441,6 +458,7 @@ async def run_payroll(
         try:
             tx = await akaunting.post_transaction(
                 account_id=AKAUNTING_PAYROLL_ACCOUNT_ID,
+                category_id=AKAUNTING_PAYROLL_CATEGORY_ID,
                 amount=total_pay,
                 description=f"Payroll: {employee_count} active employees",
                 transaction_type="expense",
@@ -515,6 +533,7 @@ async def post_revenue(
 
         tx = await akaunting.post_transaction(
             account_id=AKAUNTING_REVENUE_ACCOUNT_ID,
+            category_id=AKAUNTING_REVENUE_CATEGORY_ID,
             amount=deal_amount,
             description=f"[REVENUE] {description} — {customer['company_name']}",
             transaction_type="income",
@@ -615,6 +634,7 @@ async def run_books_audit(
             try:
                 tx = await akaunting.post_transaction(
                     account_id=AKAUNTING_EXPENSE_ACCOUNT_ID,
+                    category_id=AKAUNTING_EXPENSE_CATEGORY_ID,
                     amount=Decimal(str(expense["amount"])),
                     description=f"[AUDIT CORRECTION] Missed expense post — approval {expense['id']}",
                     transaction_type="expense",
