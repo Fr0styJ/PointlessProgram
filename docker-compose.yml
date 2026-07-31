@@ -1466,6 +1466,9 @@ services:
       MAILSERVER_DOMAIN: "${MAILSERVER_DOMAIN:-fakecorp.internal}"
       MATTERMOST_URL: "http://mattermost:8065"
       MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      # Phase 27: Chaos — service availability controls (docker-socket-proxy is
+      # never reached via raw docker exec/socket; POST-only start/stop/restart).
+      DOCKER_SOCKET_PROXY_URL: "http://docker-socket-proxy:2375"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro  # Phase 19: for `docker exec fakeco-mailserver doveadm sieve ...`
     networks:
@@ -1473,6 +1476,7 @@ services:
       - net_data
       - net_office
       - net_mail
+      - net_mgmt  # Phase 27: reach docker-socket-proxy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 15s
@@ -1481,7 +1485,7 @@ services:
       start_period: 20s
     labels:
       fakeco.service: "orchestrator"
-      fakeco.phase: "18"
+      fakeco.phase: "18"  # Phase 19 PTO, Phase 27 chaos controls folded into this container
       fakeco.managed: "true"
     profiles:
       - phase18

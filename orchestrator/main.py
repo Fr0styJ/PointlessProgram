@@ -34,6 +34,7 @@ from typing import Optional
 import asyncpg
 import httpx
 from fastapi import FastAPI, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Annotated
 from contextlib import asynccontextmanager
@@ -60,6 +61,25 @@ MEETING_SIM_URL = os.environ.get("MEETING_SIM_URL", "http://meeting-simulator:80
 ACCOUNTING_ENGINE_URL = os.environ.get("ACCOUNTING_ENGINE_URL", "http://accounting-engine:8000")
 KPI_ENGINE_URL = os.environ.get("KPI_ENGINE_URL", "http://kpi-engine:8000")
 EXTERNAL_WORLD_URL = os.environ.get("EXTERNAL_WORLD_URL", "http://external-world:8000")
+
+# Phase 27: Chaos — service availability controls
+DOCKER_SOCKET_PROXY_URL = os.environ.get("DOCKER_SOCKET_PROXY_URL", "http://docker-socket-proxy:2375")
+PENDING_ACTIONS_RETRY_SECONDS = float(os.environ.get("PENDING_ACTIONS_RETRY_SECONDS", "60.0"))
+PENDING_ACTIONS_MAX_ATTEMPTS = int(os.environ.get("PENDING_ACTIONS_MAX_ATTEMPTS", "20"))
+
+# Explicit allow-list of containers a chaos test may reasonably start/stop/restart.
+# Deliberately excludes postgres, docker-socket-proxy, and any other core-infra
+# container — stopping those would break the whole stack, not just simulate an
+# appliance outage. Only appliance/application containers a chaos test would
+# reasonably target are listed here.
+CHAOS_ALLOWED_CONTAINERS = {
+    "fakeco-mattermost",
+    "fakeco-zammad",
+    "fakeco-wikijs",
+    "fakeco-akaunting",
+    "fakeco-nextcloud",
+    "fakeco-wordpress",
+}
 
 TICK_INTERVAL_SECONDS = float(os.environ.get("ORCHESTRATOR_TICK_INTERVAL", "60.0"))
 STANDUP_HOUR = int(os.environ.get("STANDUP_SIM_HOUR", "9"))     # fire standup at 9am sim-time
@@ -108,6 +128,52 @@ async def get_sim_time() -> datetime:
 
 
 # ---------------------------------------------------------------------------
+# Phase 27: Chaos — docker-socket-proxy client
+#
+# tecnativa/docker-socket-proxy is locked down (see docker-compose.yml:199-241)
+# to CONTAINERS=1, POST=1 only, EXEC=0 — this client therefore ONLY exposes
+# start/stop/restart of a named container, matching the proxy's own lockdown.
+# NEVER use `docker exec` through this client (that's a different mechanism,
+# already used elsewhere in this file for mailserver/Sieve — unrelated to
+# docker-socket-proxy and does not go through it).
+# ---------------------------------------------------------------------------
+class SocketProxyClient:
+    def __init__(self, base_url: str, http: httpx.AsyncClient):
+        self._base_url = base_url.rstrip("/")
+        self._http = http
+
+    async def _post_action(self, container_name: str, action: str) -> dict:
+        # docker-socket-proxy proxies the real Docker Engine API 1:1 for the
+        # verbs it allows; container actions are POST /containers/{name}/{action}
+        r = await self._http.post(
+            f"{self._base_url}/containers/{container_name}/{action}",
+            timeout=30.0,
+        )
+        # Docker's engine API returns 204 on success for start/stop/restart
+        if r.status_code not in (200, 204):
+            r.raise_for_status()
+        return {"container": container_name, "action": action, "status_code": r.status_code}
+
+    async def start(self, container_name: str) -> dict:
+        return await self._post_action(container_name, "start")
+
+    async def stop(self, container_name: str) -> dict:
+        return await self._post_action(container_name, "stop")
+
+    async def restart(self, container_name: str) -> dict:
+        return await self._post_action(container_name, "restart")
+
+
+_socket_proxy: Optional[SocketProxyClient] = None
+
+
+def get_socket_proxy() -> SocketProxyClient:
+    if _socket_proxy is None:
+        raise RuntimeError("SocketProxyClient not initialized")
+    return _socket_proxy
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator state tracking (persisted in Postgres)
 # ---------------------------------------------------------------------------
 async def get_last_run(conn: asyncpg.Connection, job_name: str) -> Optional[datetime]:
@@ -131,6 +197,135 @@ async def record_run(conn: asyncpg.Connection, job_name: str, sim_time: datetime
         "orchestrator_job_ran",
         json.dumps({"job_name": job_name, "sim_time": sim_time.isoformat(), **(detail or {})}),
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 27: Chaos — reachability wrapper + pending_actions retry queue
+#
+# Per the user's 2026-07-31 sign-off (PLAN_PHASES_27_28_31_32.md): idempotency
+# keys apply to ALL pending_actions rows, not just money-touching ones.
+# ---------------------------------------------------------------------------
+def _is_connection_error(exc: Exception) -> bool:
+    """True for outage-style failures (appliance unreachable), as opposed to
+    an application-level error (4xx/5xx from a live service) which should
+    just be logged, not queued for a wall-clock retry."""
+    return isinstance(exc, (
+        httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+        httpx.PoolTimeout, httpx.NetworkError,
+    ))
+
+
+def _make_idempotency_key(action_type: str, target_service: str, payload: dict) -> str:
+    basis = json.dumps(
+        {"action_type": action_type, "target_service": target_service, "payload": payload},
+        sort_keys=True, default=str,
+    )
+    return hashlib.sha256(basis.encode()).hexdigest()
+
+
+async def queue_pending_action(
+    conn: asyncpg.Connection,
+    action_type: str,
+    target_service: str,
+    method: str,
+    url: str,
+    json_body: Optional[dict],
+    last_error: Exception | str,
+    idempotency_key: Optional[str] = None,
+) -> None:
+    """Insert/update (upsert on idempotency_key) a pending_actions row instead
+    of letting a connection failure raise/crash the tick loop."""
+    stored_payload = {"method": method, "url": url, "json": json_body}
+    key = idempotency_key or _make_idempotency_key(action_type, target_service, stored_payload)
+    await conn.execute("""
+        INSERT INTO pending_actions
+            (action_type, target_service, payload, idempotency_key, status, attempts, next_retry_at, last_error)
+        VALUES ($1, $2, $3, $4, 'pending', 1, now() + make_interval(secs => $5), $6)
+        ON CONFLICT (idempotency_key) DO UPDATE SET
+            attempts      = pending_actions.attempts + 1,
+            status        = CASE WHEN pending_actions.status = 'done' THEN pending_actions.status ELSE 'retrying' END,
+            next_retry_at = now() + make_interval(secs => $5),
+            last_error    = EXCLUDED.last_error
+    """, action_type, target_service, json.dumps(stored_payload), key, PENDING_ACTIONS_RETRY_SECONDS, str(last_error)[:2000])
+    log.warning("Queued pending_action (%s/%s) after connection failure: %s", action_type, target_service, last_error)
+
+
+async def handle_outbound_failure(
+    conn: asyncpg.Connection,
+    exc: Exception,
+    action_type: str,
+    target_service: str,
+    method: str,
+    url: str,
+    json_body: Optional[dict],
+    log_context: str,
+) -> None:
+    """Reachability wrapper: call this from every scheduled job's except-block.
+    Queues a retryable pending_action on connection-style failures; otherwise
+    just logs (application-level errors from a live, reachable service are not
+    outages and don't belong in the wall-clock retry queue)."""
+    if _is_connection_error(exc):
+        await queue_pending_action(conn, action_type, target_service, method, url, json_body, exc)
+    else:
+        log.error("%s: %s", log_context, exc)
+
+
+async def process_pending_actions(conn: asyncpg.Connection, sim_time: datetime) -> None:
+    """Scheduled job: retry every due pending_actions row (wall-clock
+    next_retry_at, independent of sim speed — a container being down is a
+    physical fact). On success, mark done and write a narrative_event phrased
+    using the sim_time read AT retry-success time (the true narrative-relevant
+    moment), not the original failure time."""
+    rows = await conn.fetch("""
+        SELECT id, action_type, target_service, payload, attempts
+        FROM pending_actions
+        WHERE status IN ('pending', 'retrying') AND next_retry_at <= now()
+        ORDER BY id
+    """)
+    for row in rows:
+        payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+        method = (payload.get("method") or "POST").upper()
+        url = payload.get("url")
+        json_body = payload.get("json")
+        try:
+            if method == "GET":
+                r = await _http.get(url, timeout=30.0)
+            else:
+                r = await _http.post(url, json=json_body, timeout=30.0)
+            r.raise_for_status()
+        except Exception as exc:
+            if _is_connection_error(exc) and row["attempts"] < PENDING_ACTIONS_MAX_ATTEMPTS:
+                await conn.execute("""
+                    UPDATE pending_actions
+                    SET attempts = attempts + 1, status = 'retrying',
+                        next_retry_at = now() + make_interval(secs => $2), last_error = $3
+                    WHERE id = $1
+                """, row["id"], PENDING_ACTIONS_RETRY_SECONDS, str(exc)[:2000])
+                log.info("pending_action %d (%s/%s) still unreachable, requeued", row["id"], row["action_type"], row["target_service"])
+            else:
+                await conn.execute("""
+                    UPDATE pending_actions SET attempts = attempts + 1, status = 'failed', last_error = $2
+                    WHERE id = $1
+                """, row["id"], str(exc)[:2000])
+                log.error("pending_action %d (%s/%s) failed permanently: %s", row["id"], row["action_type"], row["target_service"], exc)
+            continue
+
+        await conn.execute("""
+            UPDATE pending_actions SET status = 'done', attempts = attempts + 1 WHERE id = $1
+        """, row["id"])
+        # Sim-time read fresh at retry-success time — the true narrative-relevant moment,
+        # not the original (wall-clock) failure time.
+        retry_sim_time = await get_sim_time()
+        phrased = (
+            f"A queued action for {row['target_service']} ({row['action_type']}) succeeded after "
+            f"retrying — the appliance had been unreachable and came back by "
+            f"{retry_sim_time.strftime('%A %I:%M%p')} sim-time."
+        )
+        await conn.execute("""
+            INSERT INTO narrative_events (thread_id, employee_id, origin, source_type, source_ref, short_summary, created_at)
+            VALUES (NULL, NULL, 'system', 'outage', $1, $2, $3)
+        """, f"pending_action:{row['id']}", phrased, retry_sim_time)
+        log.info("pending_action %d (%s/%s) succeeded on retry", row["id"], row["action_type"], row["target_service"])
 
 
 # ---------------------------------------------------------------------------
@@ -447,16 +642,15 @@ async def maybe_run_standups(conn: asyncpg.Connection, sim_time: datetime) -> No
             continue  # Already ran for this department today
 
         log.info("Orchestrator: firing standup for %s", dept)
+        url = f"{MEETING_SIM_URL}/meeting/run"
+        body = {"meeting_type": "standup", "department": dept}
         try:
-            r = await _http.post(f"{MEETING_SIM_URL}/meeting/run", json={
-                "meeting_type": "standup",
-                "department": dept,
-            }, timeout=120.0)
+            r = await _http.post(url, json=body, timeout=120.0)
             r.raise_for_status()
             result = r.json()
             await record_run(conn, job_name, sim_time, {"meeting_id": result.get("meeting_id")})
         except Exception as exc:
-            log.error("Standup for %s failed: %s", dept, exc)
+            await handle_outbound_failure(conn, exc, job_name, "meeting-simulator", "POST", url, body, f"Standup for {dept} failed")
 
 
 async def maybe_run_cross_functional(conn: asyncpg.Connection, sim_time: datetime) -> None:
@@ -469,15 +663,15 @@ async def maybe_run_cross_functional(conn: asyncpg.Connection, sim_time: datetim
             return
 
     log.info("Orchestrator: firing cross-functional meeting")
+    url = f"{MEETING_SIM_URL}/meeting/run"
+    body = {"meeting_type": "cross_functional"}
     try:
-        r = await _http.post(f"{MEETING_SIM_URL}/meeting/run", json={
-            "meeting_type": "cross_functional",
-        }, timeout=120.0)
+        r = await _http.post(url, json=body, timeout=120.0)
         r.raise_for_status()
         result = r.json()
         await record_run(conn, job_name, sim_time, {"meeting_id": result.get("meeting_id")})
     except Exception as exc:
-        log.error("Cross-functional meeting failed: %s", exc)
+        await handle_outbound_failure(conn, exc, job_name, "meeting-simulator", "POST", url, body, "Cross-functional meeting failed")
 
 
 async def maybe_run_performance_reviews(conn: asyncpg.Connection, sim_time: datetime) -> None:
@@ -503,17 +697,15 @@ async def maybe_run_performance_reviews(conn: asyncpg.Connection, sim_time: date
             continue
 
         log.info("Orchestrator: firing performance_review for employee %d (%s)", emp["id"], emp["name"])
+        url = f"{MEETING_SIM_URL}/meeting/run"
+        body = {"meeting_type": "performance_review", "department": emp["department"], "target_employee_id": emp["id"]}
         try:
-            r = await _http.post(f"{MEETING_SIM_URL}/meeting/run", json={
-                "meeting_type": "performance_review",
-                "department": emp["department"],
-                "target_employee_id": emp["id"],
-            }, timeout=120.0)
+            r = await _http.post(url, json=body, timeout=120.0)
             r.raise_for_status()
             result = r.json()
             await record_run(conn, job_name, sim_time, {"meeting_id": result.get("meeting_id")})
         except Exception as exc:
-            log.error("Performance review for %d failed: %s", emp["id"], exc)
+            await handle_outbound_failure(conn, exc, job_name, "meeting-simulator", "POST", url, body, f"Performance review for {emp['id']} failed")
 
 
 async def maybe_handle_stale_threads(conn: asyncpg.Connection, sim_time: datetime) -> None:
@@ -535,17 +727,19 @@ async def maybe_handle_stale_threads(conn: asyncpg.Connection, sim_time: datetim
             continue
 
         log.info("Orchestrator: stale thread %d ('%s') — triggering crisis_response", thread["id"], thread["topic"])
+        url = f"{MEETING_SIM_URL}/meeting/run"
+        body = {
+            "meeting_type": "crisis_response",
+            "thread_id": thread["id"],
+            "extra_context": f"Thread '{thread['topic']}' has had no activity in {STALE_THREAD_THRESHOLD_SIM_DAYS}+ days.",
+        }
         try:
-            r = await _http.post(f"{MEETING_SIM_URL}/meeting/run", json={
-                "meeting_type": "crisis_response",
-                "thread_id": thread["id"],
-                "extra_context": f"Thread '{thread['topic']}' has had no activity in {STALE_THREAD_THRESHOLD_SIM_DAYS}+ days.",
-            }, timeout=120.0)
+            r = await _http.post(url, json=body, timeout=120.0)
             r.raise_for_status()
             result = r.json()
             await record_run(conn, job_name, sim_time, {"meeting_id": result.get("meeting_id")})
         except Exception as exc:
-            log.error("Crisis response for thread %d failed: %s", thread["id"], exc)
+            await handle_outbound_failure(conn, exc, job_name, "meeting-simulator", "POST", url, body, f"Crisis response for thread {thread['id']} failed")
 
 
 async def maybe_run_payroll(conn: asyncpg.Connection, sim_time: datetime) -> None:
@@ -559,15 +753,15 @@ async def maybe_run_payroll(conn: asyncpg.Connection, sim_time: datetime) -> Non
 
     cycle_tag = sim_time.strftime("%Y-W%V")  # ISO week
     log.info("Orchestrator: triggering payroll run for cycle %s", cycle_tag)
+    url = f"{ACCOUNTING_ENGINE_URL}/payroll/run"
+    body = {"idempotency_key": f"payroll:{cycle_tag}"}
     try:
-        r = await _http.post(f"{ACCOUNTING_ENGINE_URL}/payroll/run", json={
-            "idempotency_key": f"payroll:{cycle_tag}"
-        }, timeout=60.0)
+        r = await _http.post(url, json=body, timeout=60.0)
         r.raise_for_status()
         result = r.json()
         await record_run(conn, job_name, sim_time, result)
     except Exception as exc:
-        log.error("Payroll run failed: %s", exc)
+        await handle_outbound_failure(conn, exc, job_name, "accounting-engine", "POST", url, body, "Payroll run failed")
 
 
 async def maybe_run_books_audit(conn: asyncpg.Connection, sim_time: datetime) -> None:
@@ -578,13 +772,14 @@ async def maybe_run_books_audit(conn: asyncpg.Connection, sim_time: datetime) ->
         return
 
     log.info("Orchestrator: running daily books audit")
+    url = f"{ACCOUNTING_ENGINE_URL}/audit/run"
     try:
-        r = await _http.post(f"{ACCOUNTING_ENGINE_URL}/audit/run", timeout=60.0)
+        r = await _http.post(url, timeout=60.0)
         r.raise_for_status()
         result = r.json()
         await record_run(conn, job_name, sim_time, result)
     except Exception as exc:
-        log.error("Books audit failed: %s", exc)
+        await handle_outbound_failure(conn, exc, job_name, "accounting-engine", "POST", url, None, "Books audit failed")
 
 
 async def maybe_run_kpi_rollup(conn: asyncpg.Connection, sim_time: datetime) -> None:
@@ -643,6 +838,9 @@ async def tick_loop(pool: asyncpg.Pool) -> None:
                 await maybe_run_payroll(conn, sim_time)
                 await maybe_run_books_audit(conn, sim_time)
                 await maybe_run_kpi_rollup(conn, sim_time)
+                # Phase 27: retry any queued pending_actions whose wall-clock
+                # next_retry_at is due — independent of the jobs above.
+                await process_pending_actions(conn, sim_time)
 
         except Exception as exc:
             log.error("Orchestrator tick error: %s", exc)
@@ -655,9 +853,10 @@ async def tick_loop(pool: asyncpg.Pool) -> None:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _http
+    global _pool, _http, _socket_proxy
     _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     _http = httpx.AsyncClient(timeout=30.0)
+    _socket_proxy = SocketProxyClient(DOCKER_SOCKET_PROXY_URL, httpx.AsyncClient(timeout=30.0))
     tick_task = asyncio.create_task(tick_loop(_pool))
     log.info("Orchestrator: service ready")
     yield
@@ -667,6 +866,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     await _http.aclose()
+    await _socket_proxy._http.aclose()
     await _pool.close()
 
 
@@ -724,3 +924,87 @@ async def manual_trigger(job_name: str, pool: PoolDep):
         else:
             return {"status": "unknown_job", "job": job_name}
     return {"status": "triggered", "job": job_name, "sim_time": sim_time.isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# Phase 27: Chaos — service availability control API
+#
+# Dashboard toggle backend only (the dashboard UI itself is Phase 36's job,
+# per PLAN_PHASES_27_28_31_32.md). Every {name} is validated against
+# CHAOS_ALLOWED_CONTAINERS before ever reaching docker-socket-proxy — this is
+# the application-layer rejection of disallowed containers (postgres,
+# docker-socket-proxy itself, and any other core-infra container are never on
+# the list). The proxy itself additionally blocks anything but
+# CONTAINERS/POST at the transport layer (EXEC=0, etc. — see
+# docker-compose.yml:199-241), so a disallowed call is rejected twice over.
+# ---------------------------------------------------------------------------
+def _validate_chaos_container(name: str) -> str:
+    """Map a bare appliance name (e.g. 'mattermost') or a full container name
+    (e.g. 'fakeco-mattermost') to the real container name, only if allowed."""
+    candidate = name if name.startswith("fakeco-") else f"fakeco-{name}"
+    if candidate not in CHAOS_ALLOWED_CONTAINERS:
+        return ""
+    return candidate
+
+
+@app.post("/chaos/appliances/{name}/stop")
+async def chaos_stop(name: str):
+    container = _validate_chaos_container(name)
+    if not container:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "container not on chaos allow-list", "name": name,
+                     "allowed": sorted(CHAOS_ALLOWED_CONTAINERS)},
+        )
+    try:
+        result = await get_socket_proxy().stop(container)
+    except Exception as exc:
+        log.error("chaos stop %s failed: %s", container, exc)
+        return JSONResponse(status_code=502, content={"error": str(exc), "container": container})
+    return {"status": "stopped", **result}
+
+
+@app.post("/chaos/appliances/{name}/start")
+async def chaos_start(name: str):
+    container = _validate_chaos_container(name)
+    if not container:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "container not on chaos allow-list", "name": name,
+                     "allowed": sorted(CHAOS_ALLOWED_CONTAINERS)},
+        )
+    try:
+        result = await get_socket_proxy().start(container)
+    except Exception as exc:
+        log.error("chaos start %s failed: %s", container, exc)
+        return JSONResponse(status_code=502, content={"error": str(exc), "container": container})
+    return {"status": "started", **result}
+
+
+@app.post("/chaos/appliances/{name}/restart")
+async def chaos_restart(name: str):
+    container = _validate_chaos_container(name)
+    if not container:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "container not on chaos allow-list", "name": name,
+                     "allowed": sorted(CHAOS_ALLOWED_CONTAINERS)},
+        )
+    try:
+        result = await get_socket_proxy().restart(container)
+    except Exception as exc:
+        log.error("chaos restart %s failed: %s", container, exc)
+        return JSONResponse(status_code=502, content={"error": str(exc), "container": container})
+    return {"status": "restarted", **result}
+
+
+@app.get("/chaos/pending-actions")
+async def chaos_pending_actions(pool: PoolDep):
+    """Inspect the pending_actions retry queue — useful for the queue-and-retry
+    verification test and (later) Phase 31's narrative-backlog dashboard panel."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, action_type, target_service, status, attempts, next_retry_at, created_at, last_error
+            FROM pending_actions ORDER BY id DESC LIMIT 50
+        """)
+    return [dict(r) for r in rows]
