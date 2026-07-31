@@ -512,7 +512,53 @@ async def fire_employee(
             log.error("Mail restriction failed for %s: %s", name, exc)
 
     # Orphaned action_items for this employee will be handled by the orchestrator reassignment logic.
+    await reassign_pending_reactions(conn, employee)
     log.info("Fire complete for %d (%s). Accounts deactivated (not deleted).", emp_id, name)
+
+
+async def reassign_pending_reactions(conn: asyncpg.Connection, employee: asyncpg.Record) -> None:
+    """
+    Phase 17 exit criteria: firing an employee with a pending pending_reactions
+    row must reassign it (not orphan it) — pending_reactions.target_employee_id
+    is ON DELETE CASCADE but employees rows are never actually deleted (soft
+    delete only, status='terminated'), so no DB cascade will ever fire here;
+    reassignment has to be explicit.
+
+    Selection: same-department, same-role_tier active employee (closest
+    substitute), falling back to any active employee. No action_items
+    reassignment logic exists yet to mirror exactly (see comment above), so
+    this is a simple, self-consistent version of that same idea.
+    """
+    emp_id = employee["id"]
+    pending = await conn.fetch(
+        "SELECT id FROM pending_reactions WHERE target_employee_id = $1 AND status = 'pending'",
+        emp_id,
+    )
+    if not pending:
+        return
+
+    replacement_id = await conn.fetchval("""
+        SELECT id FROM employees
+        WHERE status = 'active' AND id != $1 AND department = $2 AND role_tier = $3
+        ORDER BY hired_at ASC LIMIT 1
+    """, emp_id, employee["department"], employee["role_tier"])
+
+    if not replacement_id:
+        replacement_id = await conn.fetchval("""
+            SELECT id FROM employees WHERE status = 'active' AND id != $1
+            ORDER BY hired_at ASC LIMIT 1
+        """, emp_id)
+
+    if not replacement_id:
+        log.warning("Fire: no active employee available to reassign %d pending_reactions from %s",
+                    len(pending), employee["name"])
+        return
+
+    await conn.execute("""
+        UPDATE pending_reactions SET target_employee_id = $1
+        WHERE target_employee_id = $2 AND status = 'pending'
+    """, replacement_id, emp_id)
+    log.info("Fire: reassigned %d pending_reactions row(s) from %d to %d", len(pending), emp_id, replacement_id)
 
 
 # ---------------------------------------------------------------------------

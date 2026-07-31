@@ -73,6 +73,19 @@ def derive_mail_password(email: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase 17 detection layer config
+# ---------------------------------------------------------------------------
+MATTERMOST_TEAM_ID = os.environ.get("MATTERMOST_TEAM_ID", "")
+MAILSERVER_IMAP_PORT = int(os.environ.get("MAILSERVER_IMAP_PORT", "143"))
+DETECTION_POLL_INTERVAL_SECONDS = float(os.environ.get("DETECTION_POLL_INTERVAL_SECONDS", "8"))
+
+# In-memory cache of the Principal's resolved account IDs on each appliance.
+# provision-principal doesn't persist these anywhere, so we resolve at runtime
+# and cache for the life of the process (refreshed on a cache miss).
+_principal_ids: dict[str, str] = {}
+
+
+# ---------------------------------------------------------------------------
 # Database pool
 # ---------------------------------------------------------------------------
 _pool: asyncpg.Pool | None = None
@@ -203,14 +216,455 @@ async def post_mattermost_as_employee(
 
 
 # ---------------------------------------------------------------------------
+# Phase 17: DETECTION layer
+#
+# The Principal is a real human who can act directly in the Mattermost,
+# Zammad, Wiki.js and webmail UIs (not through the /action/* injection API
+# above). This section detects that human-authored activity and converts it
+# into narrative_events(origin='human') + pending_reactions rows so the
+# orchestrator's continuity loop (Phase 18) knows an employee owes a reaction.
+#
+# Implementation choice — polling, not webhooks: Mattermost outgoing webhooks
+# only fire on trigger words (not full-message capture), Zammad/Wiki.js don't
+# have first-class outbound webhook registration flows that are simpler than
+# polling here, and the spec's own phrasing ("via native webhooks... or IMAP
+# polling") already treats polling as an accepted mechanism for at least one
+# of the four sources. We extend that same pragmatic choice to all four: an
+# asyncio background task per source, each polling its appliance's REST/
+# GraphQL API every DETECTION_POLL_INTERVAL_SECONDS. See BUILD_LOG.md Phase 17
+# entry for the full trade-off writeup.
+# ---------------------------------------------------------------------------
+
+async def _ensure_detection_tables(conn: asyncpg.Connection) -> None:
+    """Small cursor-tracking table so polling survives a human-bridge restart
+    without reprocessing already-seen posts/articles/pages/emails."""
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS human_bridge_cursors (
+            source TEXT PRIMARY KEY,
+            cursor_value TEXT NOT NULL DEFAULT '',
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+
+async def _get_cursor(conn: asyncpg.Connection, source: str) -> str:
+    val = await conn.fetchval("SELECT cursor_value FROM human_bridge_cursors WHERE source = $1", source)
+    return val or ""
+
+
+async def _set_cursor(conn: asyncpg.Connection, source: str, value: str) -> None:
+    await conn.execute("""
+        INSERT INTO human_bridge_cursors (source, cursor_value, updated_at) VALUES ($1, $2, NOW())
+        ON CONFLICT (source) DO UPDATE SET cursor_value = $2, updated_at = NOW()
+    """, source, str(value))
+
+
+async def _get_or_create_thread(conn: asyncpg.Connection, employee: asyncpg.Record) -> int:
+    """Reuse the most recently active open thread for the employee's department,
+    matching the convention meeting-simulator uses (narrative_threads keyed by
+    topic/department/status), or open a new one."""
+    thread_id = await conn.fetchval("""
+        SELECT id FROM narrative_threads
+        WHERE department = $1 AND status = 'open'
+        ORDER BY updated_at DESC LIMIT 1
+    """, employee["department"])
+    if thread_id:
+        return thread_id
+    return await conn.fetchval("""
+        INSERT INTO narrative_threads (topic, department, status, summary)
+        VALUES ($1, $2, 'open', '')
+        RETURNING id
+    """, f"Human interaction — {employee['name']}", employee["department"])
+
+
+async def _record_human_event(
+    conn: asyncpg.Connection,
+    employee: asyncpg.Record,
+    source_type: str,
+    source_ref: str,
+    summary: str,
+) -> None:
+    """Write narrative_events(origin='human') + pending_reactions targeting the
+    employee, per Phase 17 exit criteria. Skips duplicates on source_ref."""
+    dup = await conn.fetchval(
+        "SELECT id FROM narrative_events WHERE source_type = $1 AND source_ref = $2",
+        source_type, source_ref,
+    )
+    if dup:
+        return
+    thread_id = await _get_or_create_thread(conn, employee)
+    event_id = await conn.fetchval("""
+        INSERT INTO narrative_events (thread_id, employee_id, origin, source_type, source_ref, short_summary)
+        VALUES ($1, $2, 'human', $3, $4, $5)
+        RETURNING id
+    """, thread_id, employee["id"], source_type, source_ref, summary[:500])
+    await conn.execute("""
+        INSERT INTO pending_reactions (thread_id, target_employee_id, triggering_event_id, status)
+        VALUES ($1, $2, $3, 'pending')
+    """, thread_id, employee["id"], event_id)
+    await audit_log(conn, "principal", "human_activity_detected", {
+        "employee_id": employee["id"], "source_type": source_type, "source_ref": source_ref,
+    })
+    log.info("Detected human activity (%s) addressed to %s -> event %d, pending_reactions created",
+              source_type, employee["name"], event_id)
+
+
+def _mattermost_username_for(email: str) -> str:
+    return email.split("@")[0].replace(".", "_").lower()
+
+
+async def _resolve_employee_by_mattermost_mention(conn: asyncpg.Connection, text: str) -> Optional[asyncpg.Record]:
+    employees = await conn.fetch("SELECT * FROM employees WHERE status = 'active'")
+    for emp in employees:
+        uname = _mattermost_username_for(emp["email"])
+        if f"@{uname}" in text:
+            return emp
+    return None
+
+
+async def _resolve_employee_by_email(conn: asyncpg.Connection, address: str) -> Optional[asyncpg.Record]:
+    address = address.strip().lower()
+    return await conn.fetchrow(
+        "SELECT * FROM employees WHERE status = 'active' AND (lower(email) = $1 OR lower(mailbox_address) = $1)",
+        address,
+    )
+
+
+async def _resolve_employee_by_zammad_agent(conn: asyncpg.Connection, agent_id) -> Optional[asyncpg.Record]:
+    if agent_id is None:
+        return None
+    return await conn.fetchrow(
+        "SELECT * FROM employees WHERE status = 'active' AND zammad_agent_id = $1", str(agent_id)
+    )
+
+
+async def _resolve_employee_by_wiki_tag(conn: asyncpg.Connection, tags: list[str]) -> Optional[asyncpg.Record]:
+    """Convention established here (no prior tagging convention existed):
+    a wiki page "related to" an employee carries a tag 'emp-<employee_id>'."""
+    for tag in tags or []:
+        if tag.startswith("emp-"):
+            try:
+                emp_id = int(tag[len("emp-"):])
+            except ValueError:
+                continue
+            emp = await conn.fetchrow("SELECT * FROM employees WHERE id = $1 AND status = 'active'", emp_id)
+            if emp:
+                return emp
+    return None
+
+
+# --- Principal identity resolution (cached in-memory) -----------------------
+
+async def _resolve_principal_mattermost_id(http: httpx.AsyncClient) -> Optional[str]:
+    if "mattermost" in _principal_ids:
+        return _principal_ids["mattermost"]
+    username = _mattermost_username_for(PRINCIPAL_EMAIL)
+    r = await http.get(
+        f"{MATTERMOST_URL}/api/v4/users/username/{username}",
+        headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
+    )
+    if r.status_code == 200:
+        uid = r.json()["id"]
+        _principal_ids["mattermost"] = uid
+        return uid
+    log.warning("human-bridge: could not resolve Principal Mattermost id (status=%s)", r.status_code)
+    return None
+
+
+async def _resolve_principal_zammad_id(http: httpx.AsyncClient) -> Optional[int]:
+    if "zammad" in _principal_ids:
+        return _principal_ids["zammad"]
+    r = await http.get(
+        f"{ZAMMAD_URL}/api/v1/users/search",
+        headers={"Authorization": f"Token token={ZAMMAD_ADMIN_TOKEN}"},
+        params={"query": PRINCIPAL_EMAIL},
+    )
+    if r.status_code == 200:
+        users = r.json()
+        for u in users:
+            if u.get("email", "").lower() == PRINCIPAL_EMAIL.lower():
+                _principal_ids["zammad"] = u["id"]
+                return u["id"]
+    log.warning("human-bridge: could not resolve Principal Zammad id (status=%s)", r.status_code)
+    return None
+
+
+async def _resolve_principal_wiki_id(http: httpx.AsyncClient) -> Optional[int]:
+    if "wiki" in _principal_ids:
+        return _principal_ids["wiki"]
+    r = await http.post(
+        f"{WIKIJS_URL}/graphql",
+        headers={"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}"},
+        json={"query": """
+            query {
+              users { list { id email } }
+            }
+        """},
+    )
+    if r.status_code == 200:
+        data = r.json()
+        for u in data.get("data", {}).get("users", {}).get("list", []) or []:
+            if (u.get("email") or "").lower() == PRINCIPAL_EMAIL.lower():
+                _principal_ids["wiki"] = u["id"]
+                return u["id"]
+    log.warning("human-bridge: could not resolve Principal Wiki.js id (status=%s)", r.status_code)
+    return None
+
+
+# --- Mattermost polling ------------------------------------------------------
+
+async def _poll_mattermost_once(pool: asyncpg.Pool) -> None:
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        principal_id = await _resolve_principal_mattermost_id(http)
+        if not principal_id:
+            return
+        headers = {"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"}
+        r = await http.get(f"{MATTERMOST_URL}/api/v4/users/{principal_id}/teams/{MATTERMOST_TEAM_ID}/channels",
+                            headers=headers)
+        if r.status_code != 200:
+            log.warning("human-bridge: mattermost channel list failed (%s)", r.status_code)
+            return
+        channels = r.json()
+
+        async with pool.acquire() as conn:
+            for ch in channels:
+                channel_id = ch["id"]
+                cursor_key = f"mattermost:{channel_id}"
+                since = await _get_cursor(conn, cursor_key)
+                params = {"page": 0, "per_page": 50}
+                if since:
+                    params["since"] = since
+                pr = await http.get(f"{MATTERMOST_URL}/api/v4/channels/{channel_id}/posts", headers=headers, params=params)
+                if pr.status_code != 200:
+                    continue
+                posts_data = pr.json()
+                posts = posts_data.get("posts", {})
+                latest_update = int(since) if since else 0
+                for post_id, post in posts.items():
+                    latest_update = max(latest_update, int(post.get("update_at", 0)))
+                    if post.get("user_id") != principal_id:
+                        continue
+                    message = post.get("message", "") or ""
+                    emp = await _resolve_employee_by_mattermost_mention(conn, message)
+                    if emp:
+                        await _record_human_event(
+                            conn, emp, "chat", f"mattermost:{post_id}",
+                            f"Principal posted in Mattermost mentioning {emp['name']}: {message[:200]}",
+                        )
+                if latest_update:
+                    await _set_cursor(conn, cursor_key, latest_update)
+
+
+# --- Zammad polling -----------------------------------------------------------
+
+async def _poll_zammad_once(pool: asyncpg.Pool) -> None:
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        principal_id = await _resolve_principal_zammad_id(http)
+        if not principal_id:
+            return
+        headers = {"Authorization": f"Token token={ZAMMAD_ADMIN_TOKEN}"}
+        r = await http.get(f"{ZAMMAD_URL}/api/v1/ticket_articles", headers=headers)
+        if r.status_code != 200:
+            log.warning("human-bridge: zammad article list failed (%s)", r.status_code)
+            return
+        articles = r.json()
+
+        async with pool.acquire() as conn:
+            cursor_key = "zammad:article"
+            since_id = int(await _get_cursor(conn, cursor_key) or 0)
+            max_id = since_id
+            for art in articles:
+                art_id = art.get("id", 0)
+                max_id = max(max_id, art_id)
+                if art_id <= since_id:
+                    continue
+                if art.get("created_by_id") != principal_id and art.get("origin_by_id") != principal_id:
+                    continue
+                ticket_id = art.get("ticket_id")
+                tr = await http.get(f"{ZAMMAD_URL}/api/v1/tickets/{ticket_id}", headers=headers)
+                if tr.status_code != 200:
+                    continue
+                ticket = tr.json()
+                agent_id = ticket.get("owner_id")
+                emp = await _resolve_employee_by_zammad_agent(conn, agent_id)
+                if emp:
+                    body = (art.get("body") or "")[:200]
+                    await _record_human_event(
+                        conn, emp, "ticket", f"zammad:{art_id}",
+                        f"Principal commented on Zammad ticket #{ticket_id} assigned to {emp['name']}: {body}",
+                    )
+            if max_id > since_id:
+                await _set_cursor(conn, cursor_key, max_id)
+
+
+# --- Wiki.js polling ----------------------------------------------------------
+
+async def _poll_wikijs_once(pool: asyncpg.Pool) -> None:
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        principal_id = await _resolve_principal_wiki_id(http)
+        if not principal_id:
+            return
+        r = await http.post(
+            f"{WIKIJS_URL}/graphql",
+            headers={"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}"},
+            json={"query": """
+                query {
+                  pages { list(orderBy: UPDATED, orderByDirection: DESC, limit: 50) {
+                      id path title updatedAt authorId tags
+                  } }
+                }
+            """},
+        )
+        if r.status_code != 200:
+            log.warning("human-bridge: wikijs page list failed (%s)", r.status_code)
+            return
+        pages = r.json().get("data", {}).get("pages", {}).get("list", []) or []
+
+        async with pool.acquire() as conn:
+            cursor_key = "wikijs:page"
+            since = await _get_cursor(conn, cursor_key)
+            latest = since
+            for page in pages:
+                updated_at = page.get("updatedAt", "")
+                if since and updated_at <= since:
+                    continue
+                if updated_at > latest:
+                    latest = updated_at
+                if page.get("authorId") != principal_id:
+                    continue
+                # tags aren't returned with detail by the list query in all Wiki.js
+                # versions; fetch the single page for full tag info if missing.
+                tags = page.get("tags") or []
+                if not tags:
+                    sr = await http.post(
+                        f"{WIKIJS_URL}/graphql",
+                        headers={"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}"},
+                        json={"query": "query($id: Int!) { pages { single(id: $id) { tags } } }",
+                              "variables": {"id": page["id"]}},
+                    )
+                    if sr.status_code == 200:
+                        tags = sr.json().get("data", {}).get("pages", {}).get("single", {}).get("tags", []) or []
+                emp = await _resolve_employee_by_wiki_tag(conn, tags)
+                if emp:
+                    await _record_human_event(
+                        conn, emp, "wiki", f"wikijs:{page['id']}:{updated_at}",
+                        f"Principal edited Wiki.js page '{page['title']}' related to {emp['name']}",
+                    )
+            if latest and latest != since:
+                await _set_cursor(conn, cursor_key, latest)
+
+
+# --- Mail (IMAP) polling ------------------------------------------------------
+# The Principal's mailbox is provisioned via the same MailserverClient path
+# (and password derivation) as employee bot mailboxes — `provision-principal`
+# calls `mail.create_account(PRINCIPAL_EMAIL)` which uses the identical
+# `_derive_password()` scheme. So we can IMAP-login as the Principal directly
+# and poll their Sent folder for replies they authored, rather than needing to
+# poll every employee's INBOX for `From: principal`. Confirmed against the
+# live mailserver (see BUILD_LOG.md Phase 17 entry) that docker-mailserver's
+# default Sent folder is named "Sent".
+
+import email as email_lib
+import imaplib
+
+
+def _imap_fetch_sent_since_uid(last_uid: int) -> list[tuple[int, bytes]]:
+    """Blocking IMAP call — always run via asyncio.to_thread."""
+    password = derive_mail_password(PRINCIPAL_EMAIL)
+    results: list[tuple[int, bytes]] = []
+    conn = imaplib.IMAP4(MAILSERVER_HOST, MAILSERVER_IMAP_PORT)
+    try:
+        try:
+            conn.starttls()
+        except Exception:
+            pass
+        conn.login(PRINCIPAL_EMAIL, password)
+        folder = "Sent"
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            status, _ = conn.select("INBOX.Sent", readonly=True)
+            folder = "INBOX.Sent"
+            if status != "OK":
+                return results
+        typ, data = conn.uid("search", None, f"UID {last_uid + 1}:*")
+        if typ != "OK":
+            return results
+        uids = [int(u) for u in data[0].split()] if data and data[0] else []
+        for uid in uids:
+            if uid <= last_uid:
+                continue
+            typ, msg_data = conn.uid("fetch", str(uid), "(RFC822)")
+            if typ == "OK" and msg_data and msg_data[0]:
+                results.append((uid, msg_data[0][1]))
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
+    return results
+
+
+async def _poll_mail_once(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        cursor_key = "mail:principal_sent_uid"
+        last_uid = int(await _get_cursor(conn, cursor_key) or 0)
+
+    try:
+        messages = await asyncio.to_thread(_imap_fetch_sent_since_uid, last_uid)
+    except Exception as exc:
+        log.warning("human-bridge: IMAP poll failed: %s", exc)
+        return
+
+    if not messages:
+        return
+
+    async with pool.acquire() as conn:
+        max_uid = last_uid
+        for uid, raw in messages:
+            max_uid = max(max_uid, uid)
+            msg = email_lib.message_from_bytes(raw)
+            to_addr = email_lib.utils.parseaddr(msg.get("To", ""))[1]
+            subject = msg.get("Subject", "")
+            if not to_addr:
+                continue
+            emp = await _resolve_employee_by_email(conn, to_addr)
+            if emp:
+                await _record_human_event(
+                    conn, emp, "email", f"mail:{uid}",
+                    f"Principal emailed {emp['name']} ({to_addr}): {subject}",
+                )
+        await _set_cursor(conn, cursor_key, max_uid)
+
+
+# --- Polling supervisor -------------------------------------------------------
+
+async def _detection_loop(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await _ensure_detection_tables(conn)
+    while True:
+        for poller in (_poll_mattermost_once, _poll_zammad_once, _poll_wikijs_once, _poll_mail_once):
+            try:
+                await poller(pool)
+            except Exception as exc:
+                log.error("human-bridge: detection poller %s failed: %s", poller.__name__, exc)
+        await asyncio.sleep(DETECTION_POLL_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _pool
     _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    detection_task = asyncio.create_task(_detection_loop(_pool))
     log.info("human-bridge: ready")
     yield
+    detection_task.cancel()
+    try:
+        await detection_task
+    except (asyncio.CancelledError, Exception):
+        pass
     await _pool.close()
 
 
@@ -274,6 +728,21 @@ class WikiPageRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "human-bridge"}
+
+
+@app.post("/detection/poll-now")
+async def detection_poll_now(pool: PoolDep):
+    """Manually trigger one round of all detection pollers immediately
+    (verification helper — the background loop already runs this on its own
+    schedule every DETECTION_POLL_INTERVAL_SECONDS)."""
+    results = {}
+    for poller in (_poll_mattermost_once, _poll_zammad_once, _poll_wikijs_once, _poll_mail_once):
+        try:
+            await poller(pool)
+            results[poller.__name__] = "ok"
+        except Exception as exc:
+            results[poller.__name__] = f"error: {exc}"
+    return results
 
 
 @app.get("/state/employees")
