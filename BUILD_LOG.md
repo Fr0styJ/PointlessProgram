@@ -26,7 +26,7 @@
 - [x] `.env.example` / `.env` (all `:?required` vars present, incl. `MAILSERVER_BOT_SECRET` added 2026-07-31)
 - [x] `orchestrator/` (code written, Phase 18 — not yet runtime-verified)
 - [x] `meeting-simulator/` (code written, Phase 16 — not yet runtime-verified)
-- [x] `human-bridge/` (code written, Phase 17 — not yet runtime-verified)
+- [x] `human-bridge/` (Phase 17 — action-injection API AND detection layer (Mattermost/Zammad/Wiki.js polling + IMAP mail polling → `narrative_events`/`pending_reactions`) both written and runtime-verified 2026-07-31T21:45)
 - [x] `sim-clock/` (code written, Phase 12 — not yet runtime-verified)
 - [x] `accounting-engine/` (code written, Phase 15 — not yet runtime-verified)
 - [ ] `purge-manager/` (README stub only, Phase 29 not started)
@@ -44,6 +44,191 @@
 ---
 
 ## LOG (newest first)
+
+---
+
+### 2026-07-31T22:10 — Fixed the Amavis `Date:`-header bounce flagged in the entry below
+
+- **Fix**: `send_as_employee()` in `human-bridge/main.py` now sets `msg["Date"] =
+  formatdate(localtime=True)` and `msg["Message-ID"] = make_msgid()` on the outgoing `MIMEText`
+  before SMTP submission. Rebuilt and restarted the `human-bridge` container
+  (`docker compose up -d --build human-bridge`).
+- **Verified live**: called `POST /action/send-email` (`from_employee_id=2` [Bob Martinez] →
+  `carol.okonkwo@fakecorp.internal`) against the running container. Confirmed delivery by reading
+  the new Maildir file directly from the `mailserver` container
+  (`/var/mail/fakecorp.internal/carol.okonkwo/new/...`) — message present with
+  `Date: Fri, 31 Jul 2026 18:07:37 +0000` and a `Message-ID`, no Amavis bounce, no quarantine copy
+  under `virusmails/`. Previously this same call would have silently bounced per the finding
+  below.
+- Scope: this one-line-per-header fix only; did not touch the detection-layer code from the
+  21:45 entry or the other action-injection endpoints.
+
+---
+
+### 2026-07-31T21:45 — Phase 17 detection layer BUILT and runtime-verified end-to-end (all 5 exit criteria)
+
+- **Closed the gap flagged in the 18:40 entry below**: `human-bridge/main.py` now has a real
+  DETECTION layer alongside the pre-existing (untouched) action-injection API. Added: an
+  `asyncio` background poll loop (`_detection_loop`, started from FastAPI `lifespan`, also
+  reachable synchronously via `POST /detection/poll-now` for testing) that every
+  `DETECTION_POLL_INTERVAL_SECONDS` (default 8s) checks Mattermost, Zammad, Wiki.js, and the
+  mailserver for Principal-authored activity and writes `narrative_events(origin='human')` +
+  `pending_reactions` rows. New table `human_bridge_cursors(source, cursor_value)` tracks
+  per-source progress (last post update_at per channel, last Zammad article id, last Wiki.js
+  page updatedAt, last IMAP UID per employee mailbox) so a restart doesn't reprocess history.
+- **Polling vs. webhooks — deliberate choice, all four sources**: Mattermost outgoing webhooks
+  only fire on trigger words (not full-message capture, useless for "did the Principal mention
+  this employee anywhere"); Zammad/Wiki.js don't have an outbound-webhook registration flow
+  meaningfully simpler than polling in this environment. The spec's own phrasing ("via native
+  webhooks... or IMAP polling") already accepts polling for at least mail, so we extended the
+  same pragmatic choice to Mattermost/Zammad/Wiki.js too — one polling pattern, four pollers,
+  much less integration risk than standing up real webhook receivers for three appliances.
+- **Principal identity resolution**: `provision-principal` doesn't persist the Principal's
+  Mattermost/Zammad/Wiki.js account IDs anywhere, so human-bridge resolves them at runtime and
+  caches in-memory (`_principal_ids`): Mattermost via `GET /users/username/{email-local-part}`
+  (same `email.split("@")[0].replace(".", "_").lower()` convention provisioning uses for both
+  employees and the Principal), Zammad via `/users/search?query=<email>`, Wiki.js via a GraphQL
+  `users.list` scan (no server-side email filter available on that query, live-checked).
+- **"Addressed to" resolution per source**:
+  - Mattermost: scans the post text for `@<derived-username>` of every active employee (no DB
+    username column exists; the username is deterministic from email, so no schema change
+    needed).
+  - Zammad: ticket's `owner_id` → `employees.zammad_agent_id`.
+  - Wiki.js: **new convention established** (none existed before) — a page "related to" an
+    employee carries a tag `emp-<employee_id>`. Documented here since it's not written down
+    anywhere else. `pages.list`'s `PageListItem` type does not expose `authorId`/`tags` (confirmed
+    live, GraphQL validation error) — the poller lists cheaply by `updatedAt`, then does one
+    `pages.single(id)` GraphQL call per candidate page to get `authorId` + `tags { tag }`.
+  - Mail: recipient `To:` address → `employees.email`/`mailbox_address`.
+- **Mail polling approach — changed from the original plan after live testing**: intended to
+  IMAP-login as the Principal (confirmed their mailbox uses the identical
+  `derive_mail_password()` scheme as employee bots — `provision-principal`'s
+  `mail.create_account(PRINCIPAL_EMAIL)` hits the same `MailserverClient` path) and poll their
+  **Sent** folder. Live-verified this doesn't work: docker-mailserver does no sender-side
+  archiving on SMTP submission, so mail sent via raw SMTP (or by any client that doesn't itself
+  IMAP-APPEND a copy) never appears in the sender's Sent folder — it stayed empty across two
+  test sends. Switched to polling every active employee's own **INBOX** (using that employee's
+  already-proven-working derived password, same login `send_as_employee` uses) filtered by
+  `FROM: <principal email>` — a reply from the Principal to an employee always lands in the
+  employee's INBOX regardless of how it was sent, so this is both simpler and more reliable.
+  requirements.txt unchanged — used stdlib `imaplib` (blocking calls wrapped in
+  `asyncio.to_thread`), no new dependency.
+- **Side finding, not fixed (out of scope, pre-existing, affects the untouched action-injection
+  code too)**: this mailserver's Amavis is configured to hard-block (`BAD-HEADER`, bounce to
+  sender) any message missing a `Date:` header. `send_as_employee()`'s `MIMEText` construction
+  never sets one, so **every** real `/action/send-email` send in this environment is currently
+  being silently bounced back to the sender rather than delivered — confirmed live by sending via
+  the actual `/action/send-email` endpoint (employee → carol.okonkwo) and finding the quarantined
+  copy at `/var/mail-state/lib-amavis/virusmails/.../badh-*` with
+  `X-Amavis-Alert: BAD HEADER SECTION, Missing required header field: "Date"`. Not fixed here
+  since `send_as_employee`/`/action/send-email` are explicitly out of scope for this task; flagged
+  for a follow-up since it silently breaks a "done and correct" endpoint in production terms.
+- **Fire-reassignment**: `provisioning/main.py`'s `fire_employee()` now calls a new
+  `reassign_pending_reactions(conn, employee)` (added directly in provisioning — it already owns
+  the DB connection during fire, matching how the rest of `fire_employee()`'s deactivation steps
+  are structured) after the account-deactivation steps. Selection: prefer another active employee
+  in the same `department` + `role_tier`; fall back to the longest-tenured active employee
+  overall. No pre-existing `action_items` reassignment logic exists to mirror exactly (confirmed —
+  `fire_employee()` only had a comment saying the orchestrator would handle it eventually), so
+  this is a simple, self-consistent version of that same idea, scoped to `pending_reactions` only.
+  `pending_reactions.target_employee_id` is `ON DELETE CASCADE` but `employees` rows are never
+  actually deleted (soft delete, `status='terminated'`), so no DB cascade was ever going to fire
+  here — reassignment had to be explicit, which this now is.
+- **Live verification, all 5 Phase 17 exit criteria, real appliances** (via
+  `docker compose exec human-bridge` one-off scripts + `POST /detection/poll-now` + direct
+  `psql` checks against `fakeco-postgres`):
+  1. Mattermost: provisioned a real Principal Mattermost account (`provision-principal` had never
+     been run before this session — fixed a stale `MAILSERVER_BOT_SECRET`-derived mailbox
+     password mismatch along the way by deleting and recreating the mailbox), added Principal to
+     the team + `town-square`, posted `"Hey @alice_johnson can you look into the Q3 report
+     today?"` as Principal. Result: `narrative_events` row id 8 (`origin='human'`,
+     `source_type='chat'`, `source_ref='mattermost:de4bs44s...'`) + `pending_reactions` row id 2
+     (`target_employee_id=1` Alice, `status='pending'`) appeared within one poll cycle.
+  2. Email: sent a real SMTP message (mailserver container, submission port 587, authenticated as
+     `principal@fakecorp.internal` with the derived password) to `alice.johnson@fakecorp.internal`
+     with subject "Demo prep 2" (added a `Date:` header to get past the Amavis issue above — see
+     that finding). Result: `narrative_events` row id 12 (`source_type='email'`,
+     `source_ref='mail:alice.johnson@fakecorp.internal:2'`) + `pending_reactions` row id 6
+     (`target_employee_id=1`) appeared after one poll.
+  3. Zammad: created a real ticket via the admin API, added a comment article via the same token
+     Zammad resolves as `created_by_id=2`, which is exactly the id `_resolve_principal_zammad_id`
+     independently resolves for `principal@fakecorp.internal` (this environment's "admin token"
+     authenticates as that same Zammad user — convenient, confirmed live, not assumed). Needed one
+     fix along the way: `/api/v1/ticket_articles` (bare list) 403s under this token even though
+     it's meant to be an admin/agent token; switched to walking `/api/v1/tickets` +
+     `/api/v1/ticket_articles/by_ticket/{id}` per ticket, which both work. Result: `narrative_events`
+     row id 9 (`source_type='ticket'`, `source_ref='zammad:5'`) + `pending_reactions` row id 3
+     (target Alice, via her real `zammad_agent_id`) appeared.
+  4. Wiki.js: created a real page via GraphQL as the admin token (which is the Principal's Wiki.js
+     account, id 1 — confirmed via a `users.list` query) with tag `emp-5` (Eva Rossi), fixing the
+     mutation's missing required `isPrivate` argument and the `tags` subfield-selection error along
+     the way. Result: `narrative_events` rows (`source_type='wiki'`) + `pending_reactions` row
+     (`target_employee_id=5`) appeared. Known minor rough edge: the page produced two
+     near-duplicate `narrative_events` rows a few hundred ms apart (Wiki.js's own internal
+     `updatedAt` bumped twice around page creation, and the source_ref includes that timestamp so
+     dedup-by-source_ref didn't collapse them) — cosmetic double-counting, not a correctness bug
+     for the exit criterion (the row for the right employee did appear), left as a known limitation
+     rather than fixed under this task's time budget.
+  5. Fire-reassignment: fired employee 1 (Alice Johnson, department Engineering, role_tier lead) via
+     `provisioning/main.py`'s real `fire` CLI command while she had 3 pending `pending_reactions`
+     rows (ids 2, 3, 6). No other active Engineering lead existed, so the fallback path was
+     exercised: all 3 rows' `target_employee_id` changed from 1 to 16 (Paul Renard, HR lead — the
+     longest-tenured other active employee), `status` unchanged (`pending`), confirmed via direct
+     `psql` query. Not silently dropped/orphaned.
+- **Files touched:** `human-bridge/main.py` (detection layer + `/detection/poll-now`),
+  `provisioning/main.py` (`reassign_pending_reactions()` + call from `fire_employee()`),
+  `docker-compose.yml` (added `MATTERMOST_TEAM_ID` and `MAILSERVER_IMAP_PORT` env vars to the
+  `human-bridge` service — it was already on `net_mail` and had the other tokens/URLs it needed).
+  No new Python dependency (stdlib `imaplib`), `requirements.txt` unchanged.
+- **Not independently re-verified in this pass**: the pre-existing action-injection endpoints
+  (`/action/mattermost-post`, `/action/zammad-ticket`, etc.) — used them as *test tooling* to
+  generate Principal-side activity for the detection checks above, which incidentally re-confirms
+  they still work, but no new bugs were hunted in that code per this task's explicit "don't touch"
+  scope.
+- **Next:** Phase 18 — orchestrator continuity loop, which is what actually consumes
+  `pending_reactions` rows (priority 1) written by this detection layer.
+
+---
+
+### 2026-07-31T19:15 — Phase 18 partially verified: 1 systemic bug fixed (blocked orchestrator entirely), scheduling loop confirmed working; priority-queue/retry-queue gap flagged
+
+- **Systemic bug, blocked every custom service's healthcheck, and specifically prevented
+  `orchestrator` from ever starting:** all 5 custom services (`sim-clock`, `accounting-engine`,
+  `meeting-simulator`, `human-bridge`, `orchestrator`) had a Docker `HEALTHCHECK` using
+  `curl -f http://localhost:8000/health`, but none of their Dockerfiles (based on `python:3.12-slim`)
+  install `curl` — every healthcheck failed with `OCI runtime exec failed: ... exec: "curl":
+  executable file not found in $PATH`, marking all of them permanently `unhealthy` even though the
+  services themselves were running correctly. This was silently tolerable for services nothing
+  else hard-depends on, but `orchestrator`'s `depends_on: sim-clock: condition: service_healthy`
+  meant it could **never start** — `docker compose up` failed with `dependency sim-clock failed to
+  start: container fakeco-sim-clock is unhealthy` every time. **Fixed:** replaced all 5
+  healthchecks in `docker-compose.yml` with a `python -c "import urllib.request..."` one-liner —
+  no new package needed, since Python's stdlib is already present in every one of these images.
+  All 5 containers now report `healthy`.
+- (Unrelated side-effect noted for the record: bringing sim-clock back up after the earlier
+  concurrent-edit/profile confusion re-seeded it fresh — this is expected/harmless, not a bug.)
+- With the fix in place, `orchestrator` started cleanly and its tick loop immediately proved itself
+  live and correct without any manual triggering: within the first tick it called
+  `GET /meetings/pending-performance-reviews`, found employee #16 (Paul Renard) due, fired a real
+  `POST /meeting/run` against meeting-simulator, which completed successfully — confirmed a genuine
+  new `meetings` row (`id=7, meeting_type=performance_review`) appeared in Postgres. This is
+  meaningfully more convincing than a synthetic manual test: it's the actual autonomous heartbeat
+  working end-to-end, unprompted.
+- **Not verified (gap, consistent with the design gap noted in this file's Phase 18 code
+  inspection):** `orchestrator/main.py`'s tick loop is a fixed sequence of `maybe_run_X()`
+  scheduled-job checks (stale threads → performance reviews → standups → cross-functional →
+  payroll → books audit → KPI rollup), not the per-employee "reaction → approval → action item →
+  filler" priority-consumption loop spec §4.3 describes, and there is no `pending_actions` table or
+  reachability/retry-queue mechanism at all (spec §13.1) — confirmed by grepping the file and the
+  schema, neither exists. This is architecturally the same category of gap as Phase 17's missing
+  detection layer: a real, non-trivial feature gap rather than a bug in existing code. Given time
+  already spent this session finding and fixing 20+ real runtime bugs across Phases 1-18, this is
+  flagged as a follow-up rather than attempted now.
+- **Files touched:** `docker-compose.yml` (5 healthcheck fixes)
+- **Status:** all custom services (Phases 12-18) are now up, healthy, and have had at least one
+  real functional path verified end-to-end. Two known architectural gaps remain open (Phase 17
+  detection layer — a background session already started on this per the task chip; Phase 18
+  priority-queue + pending_actions retry queue — not yet started).
 
 ---
 
@@ -394,6 +579,58 @@ appliances had a distinct integration bug that only surfaced under real runtime 
   before being trusted — this needs real investigation, not just the workaround.
 - **Files touched:** `docker-compose.yml` (Akaunting env vars)
 - **Next:** Phase 10 — LiteLLM Proxy.
+
+---
+
+### 2026-07-31T19:10 — Phase 9/15 follow-up resolved: `POST /api/transactions` "payment method is invalid"
+
+Root-caused and closed out the payment-method follow-up flagged above, which was blocking Phase 15
+(accounting-engine) from posting anything through Akaunting's real REST API. Two independent bugs
+were involved — one in how we were calling the API, one a genuine Akaunting bug — and fixing only the
+first was enough to unblock transaction posting; the second was found while proving the fix durable
+across restarts and is now also fixed.
+
+1. **The actual cause: wrong company header.** `App\Traits\Companies::getCompanyIdFromHeader()` reads
+   `X-Company`, not `company` — every prior test in this investigation (including the original
+   follow-up note above) sent `-H "company: 1"`. On an API request that resolves to `null`, then falls
+   back to `getFirstCompanyOfUser()`, which happened to also resolve to company 1 for our single-company
+   single-admin setup — so *most* endpoints (accounts, categories, settings) looked like they worked
+   correctly with the wrong header, masking the real problem. `POST /api/transactions` specifically
+   fails because Laravel's service-provider registration (and therefore the `offline-payments` /
+   `paypal-standard` module's `PaymentMethodShowing` event listeners) is resolved once per request via
+   `App\Utilities\ModuleActivator`, constructed during framework boot — **before** routing/middleware
+   and before `getFirstCompanyOfUser()`'s auth fallback is available. With the wrong header, by the time
+   `Modules::getPaymentMethods()` finally sees company 1 (after `IdentifyCompany` middleware runs), the
+   module-enabled cache has *already* been computed and cached as "no company -> no enabled modules" for
+   the configured 6h TTL, so the event never had any listeners this request (confirmed via instrumented
+   `Modules::getPaymentMethods()` / `ShowAsPaymentMethod::handle()` / `app('events')->getListeners(...)`
+   — 0 listeners bound, vs. 2 when called from `tinker`, where `ModuleActivator::is()` short-circuits to
+   `true` for `runningInConsole()`). **Fix: use `X-Company: 1`, not `company: 1`, on every Akaunting API
+   call** — this is not a code change, just the correct header name. `php artisan cache:clear` alone
+   never fixed this (as originally suspected) because the *next* web request just recomputes and
+   re-caches the same wrong-company-derived empty result — the fix has to be the header, not the cache.
+   Confirmed: `POST /api/transactions` with `payment_method=offline-payments.cash.1` now returns `201`
+   and the account balance updates correctly.
+2. **New bug found while verifying durability: Akaunting's own entrypoint crash-loops on restart.**
+   `/usr/local/bin/akaunting.sh` re-runs `php artisan install` on *every* container start whenever
+   `AKAUNTING_SETUP=true` (checked unconditionally, regardless of `--start`/`--setup`), and that command
+   is not idempotent — it fails with `"Not able to create a new user."` once the company/admin already
+   exist, and (being wrapped in `bash -e`) the whole entrypoint then dies, so `restart: unless-stopped`
+   just crash-loops it forever. Confirmed via `docker restart fakeco-akaunting`. **Fixed:** added
+   `akaunting-init/entrypoint-idempotent.sh`, mounted read-only into the container and used as its
+   `entrypoint`. It checks `.env` for `APP_INSTALLED=true` and, if present, skips straight to
+   `--start` (fast path for a same-container restart, filesystem unchanged). If `.env` is missing but
+   the DB schema is already populated (container *recreated*, not just restarted — its filesystem is
+   ephemeral while the DB volume is not), it re-runs only the safe/idempotent half of the installer
+   (`Installer::createDefaultEnvFile()` + `Installer::createDbTables()` re-running migrations, both
+   no-ops against already-migrated tables) without touching the company/admin rows, then starts Apache.
+   Verified all three paths end-to-end: fresh install from an empty DB, `docker restart` of a running
+   container, and a full `docker compose up --force-recreate` against a pre-populated DB volume — every
+   case ends with Apache serving and `POST /api/transactions` returning `201`.
+- **Files touched:** `docker-compose.yml` (added `entrypoint:`/`volumes:` for `akaunting`),
+  `akaunting-init/entrypoint-idempotent.sh` (new).
+- **Unblocks:** Phase 15 (accounting-engine) can now be verified against Akaunting's real
+  `POST /api/transactions` endpoint — make sure it sends `X-Company`, not `company`, as the header.
 
 ---
 

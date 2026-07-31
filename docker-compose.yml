@@ -1100,7 +1100,7 @@ services:
       - net_clients
       - net_data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -1220,7 +1220,7 @@ services:
       - net_data
       - net_office
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -1264,7 +1264,7 @@ services:
       - net_office
       - net_llm_bridge
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -1312,7 +1312,7 @@ services:
       - net_mail
       - net_office
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -1361,7 +1361,7 @@ services:
       - net_office
       - net_mail
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -1374,10 +1374,54 @@ services:
       - phase18
 
   # ---------------------------------------------------------------------------
-  # PHASES 19+: Custom services — added as their phases execute.
+  # PHASE 21+22: external-world — BetaCorp rival + customer/revenue generator
+  # Spec §11.1, §11.2
+  # ---------------------------------------------------------------------------
+  external-world:
+    build:
+      context: ./external-world
+      dockerfile: Dockerfile
+    container_name: fakeco-external-world
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      LITELLM_URL: "http://litellm:4000"
+      LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY required}"
+      MAILSERVER_HOST: "mailserver"
+      MAILSERVER_SMTP_PORT: "587"
+      MAILSERVER_DOMAIN: "${MAILSERVER_DOMAIN:-fakecorp.internal}"
+      MAILSERVER_BOT_SECRET: "${MAILSERVER_BOT_SECRET:?MAILSERVER_BOT_SECRET required}"
+      ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      SIM_CLOCK_URL: "http://sim-clock:8000"
+    networks:
+      - net_clients
+      - net_data
+      - net_mail
+      - net_office
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "external-world"
+      fakeco.phase: "21"
+      fakeco.managed: "true"
+    profiles:
+      - phase21
+
+  # ---------------------------------------------------------------------------
+  # PHASES 23+: Custom services — added as their phases execute.
   # Placeholders listed here for topology documentation:
   #
-  # external-world     (Phase 21+22) — net_clients, net_data, net_mail, net_office
   # kpi-engine         (Phase 23+) — net_clients, net_data, net_office
   # branding-manager   (Phase 30) — net_clients, net_data, net_office
   # purge-manager      (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
