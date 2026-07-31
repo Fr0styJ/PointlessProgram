@@ -1233,6 +1233,57 @@ services:
       - phase15
 
   # ---------------------------------------------------------------------------
+  # PHASE 23: kpi-engine — deterministic KPI rollups + performance-review formula
+  # Spec §12.1, §12.2 — zero LLM calls anywhere in this service.
+  # ---------------------------------------------------------------------------
+  kpi-engine:
+    build:
+      context: ./kpi-engine
+      dockerfile: Dockerfile
+    container_name: fakeco-kpi-engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      WIKIJS_URL: "http://wikijs:3000"
+      WIKIJS_ADMIN_TOKEN: "${WIKIJS_ADMIN_TOKEN:-}"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      AKAUNTING_URL: "http://akaunting"
+      AKAUNTING_ADMIN_EMAIL: "${AKAUNTING_ADMIN_EMAIL:?AKAUNTING_ADMIN_EMAIL required}"
+      AKAUNTING_ADMIN_PASSWORD: "${AKAUNTING_ADMIN_PASSWORD:?AKAUNTING_ADMIN_PASSWORD required}"
+      AKAUNTING_COMPANY_ID: "${AKAUNTING_COMPANY_ID:-1}"
+      ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
+      KPI_REVIEW_TOP_RAISE_PCT: "${KPI_REVIEW_TOP_RAISE_PCT:-0.05}"
+      KPI_REVIEW_SECOND_RAISE_PCT: "${KPI_REVIEW_SECOND_RAISE_PCT:-0.02}"
+      KPI_REVIEW_MIN_TENURE_DAYS: "${KPI_REVIEW_MIN_TENURE_DAYS:-90}"
+      KPI_REVIEW_MIN_DEPT_SIZE: "${KPI_REVIEW_MIN_DEPT_SIZE:-2}"
+      KPI_REVIEW_LOOKBACK_DAYS: "${KPI_REVIEW_LOOKBACK_DAYS:-30}"
+      KPI_REVIEW_APPROVAL_MODE: "${KPI_REVIEW_APPROVAL_MODE:-off}"
+    networks:
+      - net_clients
+      - net_data
+      - net_office
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "kpi-engine"
+      fakeco.phase: "23"
+      fakeco.managed: "true"
+    profiles:
+      - phase23
+
+  # ---------------------------------------------------------------------------
   # PHASE 16: meeting-simulator — all 5 meeting types, LLM heavy tier
   # Spec §4.2–4.5, §6
   # ---------------------------------------------------------------------------
@@ -1419,10 +1470,9 @@ services:
       - phase21
 
   # ---------------------------------------------------------------------------
-  # PHASES 23+: Custom services — added as their phases execute.
+  # PHASES 29+: Custom services — added as their phases execute.
   # Placeholders listed here for topology documentation:
   #
-  # kpi-engine         (Phase 23+) — net_clients, net_data, net_office
   # branding-manager   (Phase 30) — net_clients, net_data, net_office
   # purge-manager      (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
   # snapshot-manager   (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz

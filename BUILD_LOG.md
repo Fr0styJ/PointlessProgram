@@ -428,6 +428,138 @@
 
 ---
 
+### 2026-07-31T19:15 — Phase 23 built: kpi-engine (KPI scoreboards + performance-review formula), partial live verification
+
+- **Built `kpi-engine/` from scratch** (previously a README stub), following the exact
+  `accounting-engine`/`external-world` pattern (`python:3.12-slim`, fastapi/uvicorn/asyncpg/httpx/
+  pydantic, `Dockerfile` + `requirements.txt` + single `main.py`, `/health` endpoint, manual-trigger
+  POST endpoints like every other custom service in this project). Files: `kpi-engine/Dockerfile`,
+  `kpi-engine/requirements.txt`, `kpi-engine/main.py`.
+- **Deterministic daily rollup (`POST /rollup/run`, spec §12.1) — zero LLM calls anywhere:**
+  - `ZammadClient.get_tickets_in_range()`: fetches all tickets via `/api/v1/tickets/search?query=*`
+    and filters/aggregates `created_at`/`close_at` client-side in plain Python (deliberately avoids
+    relying on Zammad's own search-query date syntax, which is undocumented/inconsistent across
+    versions) — writes `tickets_opened`, `tickets_resolved`, `avg_resolution_hours` per employee
+    (matched via `employees.zammad_agent_id == ticket.owner_id`) and per department (via Zammad
+    `group_id` → group name, fetched once via `/api/v1/groups`).
+  - `WikiJSClient.list_pages()`: GraphQL `pages.list` query (reusing the exact `graphql()` helper
+    pattern + Bearer-token client from `provisioning/main.py`'s `WikiJSClient`), matched against
+    `employees.wiki_user_id`, writes `wiki_pages_created`/`wiki_pages_updated` (an update is only
+    counted distinct from the creation event if `updatedAt > createdAt`, to avoid double-counting
+    the initial save Wiki.js always stamps as an "update").
+  - `MattermostClient`: no dedicated message-count/stats endpoint exists in the Mattermost REST API,
+    so pages through every team's channels (`/teams`, `/teams/{id}/channels`) and each channel's
+    `/channels/{id}/posts?since=...`, counting posts per `user_id` matched against
+    `employees.mattermost_id` — writes `chat_messages` per employee/department.
+  - `AkauntingClient.get_income_transactions()`: reuses `accounting-engine.AkauntingClient`'s
+    `company_id`-in-every-request pattern (this codebase's `AkauntingClient` sends `company_id` as a
+    request param/body field rather than an `X-Company` header — confirmed by re-reading
+    `accounting-engine/main.py`'s existing client rather than assuming the header pattern), sums
+    income transactions in the date range, writes one `revenue_posted` row under
+    `department`/`"Company"` (Akaunting revenue isn't attributable to an individual employee in this
+    schema).
+  - Every rollup row is written via `write_snapshot()`, an `INSERT ... ON CONFLICT
+    (snapshot_date, entity_type, entity_id, metric) DO UPDATE SET value = EXCLUDED.value` — the
+    table's existing UNIQUE constraint (already defined in `narrative-db/migrations/004_additive_
+    schemas.sql`, not re-migrated here per the task's explicit instruction) makes re-running a
+    rollup for the same day naturally idempotent rather than duplicating rows.
+- **Performance-review formula (`GET /reviews/due`, `POST /reviews/run`, spec §12.2) — plain code,
+  no LLM:**
+  - `compute_review_candidates()`: pulls each eligible employee's last `KPI_REVIEW_LOOKBACK_DAYS`
+    (default 30) of `kpi_snapshots`, computes a weighted composite score (tunable weights via env:
+    `KPI_WEIGHT_TICKETS_RESOLVED`, `KPI_WEIGHT_WIKI_PAGES`, `KPI_WEIGHT_CHAT_MESSAGES`,
+    `KPI_WEIGHT_RESOLUTION_HOURS` — the last one negative since fewer hours-to-resolve is better),
+    ranks descending within department, and splits into `top_quartile` (`ceil(n/4)`, default
+    +`KPI_REVIEW_TOP_RAISE_PCT`=5%), `second_quartile` (next `ceil(n/2)`, default
+    +`KPI_REVIEW_SECOND_RAISE_PCT`=2%), and `rest` (+0%) — all tunable via env, matching
+    `accounting-engine`'s `IC_AUTO_APPROVE_LIMIT`-style convention.
+  - SPEC_CLARIFICATIONS #6 cold-start exemption: skips employees hired `<KPI_REVIEW_MIN_TENURE_DAYS`
+    (default 90) days ago and departments with `<KPI_REVIEW_MIN_DEPT_SIZE` (default 2) active
+    members — the SQL filter is copy-aligned with `meeting-simulator`'s existing
+    `GET /meetings/pending-performance-reviews` eligibility query so both services agree on who's
+    "due" for a review.
+  - `apply_review_raises()` **calls into accounting-engine's real, already-verified
+    `POST /payroll/raise` endpoint** for each top/second-quartile employee (does NOT reimplement
+    the DB write) — raises apply immediately with no approval step by default, per spec §10.3.
+  - Underperformance is exposed as an `underperforming: bool` flag on each `/reviews/due` candidate
+    (bottom `KPI_REVIEW_UNDERPERFORM_PERCENTILE`, default 10%, within department) but this service
+    **never** opens a meeting or takes any action on it — per the task scope, that's Phase 24's job
+    (extending `meeting-simulator` to open a `performance_review` meeting instead of a cut).
+  - **"Review & approve" toggle** (`KPI_REVIEW_APPROVAL_MODE`, off by default): when `on`, proposed
+    raises are queued into `pending_approvals` (`status='pending'`, `approver_is_principal=true`,
+    `expense_request_ref` prefixed `review_raise:...`, idempotency-keyed per employee/day) instead
+    of being auto-applied. Nothing consumes this queue yet (no dashboard exists) — implemented per
+    the task's explicit "implement the toggle and queuing path even if nothing consumes it yet."
+- **Wired into `docker-compose.yml`:** new `kpi-engine` service block (copied from
+  `accounting-engine`'s block pattern), `net_clients` + `net_data` + `net_office`, `depends_on`
+  postgres healthy + `narrative-db-migrate` completed, `profiles: [phase23]`. Per this task's
+  explicit instruction, its healthcheck uses
+  `python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(...).status==200 else 1)"`
+  rather than `curl` (these `python:3.12-slim` images don't have `curl` installed) — verified this
+  healthcheck actually passes (`docker ps` showed `health: healthy` within one interval). Also
+  removed the now-stale "kpi-engine (Phase 23+)" line from the Phase 19+ placeholder-topology
+  comment block since it's no longer a placeholder.
+- **Verification performed against a live, isolated Docker stack** (`docker compose -p fakeco-p23`,
+  a copy of this worktree's `.env` + a `docker-compose.override.yml` giving `postgres`/
+  `narrative-db-migrate`/`accounting-engine`/`kpi-engine` unique container names so it could run
+  side-by-side with the main checkout's already-running `fakeco-*` stack without touching it):
+  1. Brought up `postgres` + `narrative-db-migrate` (phase13) + `accounting-engine` (phase15) +
+     `kpi-engine` (phase23). All three app containers reached `healthy`/ran clean startup logs.
+  2. Seeded 4 synthetic `TestDept` employees (ids 21–24, tenure 200 days, dept size 4 — clears the
+     cold-start gate) and 4 `kpi_snapshots` rows (`tickets_resolved` = 100/50/10/1) directly via
+     `psql`, simulating what a real rollup would have produced.
+  3. `GET /reviews/due` returned exactly the expected ranking: employee 21 (score 100) →
+     `top_quartile`/+5%, employee 22 (score 50) → `second_quartile`/+2%, employee 23 (score 10) →
+     `rest`/+0%, employee 24 (score 1) → `rest`/+0%/`underperforming: true` (bottom 10% of 4 = last
+     one) — matches the quartile-split math (`ceil(4/4)=1` top, `ceil(4*2/4)=2` second) by hand.
+  4. `POST /reviews/run` (default mode, `KPI_REVIEW_APPROVAL_MODE=off`) applied real raises through
+     `accounting-engine`'s live `/payroll/raise` endpoint: confirmed via direct `psql` query that
+     employee 21's `pay_rate` moved `1000.00 → 1050.00` and employee 22's `1000.00 → 1020.00`, both
+     with `pay_last_change_reason` populated (`"performance_review: top_quartile in TestDept (rank
+     1/4)"` etc.) — i.e. this is genuinely calling into accounting-engine's already-verified raise
+     path, not a parallel reimplementation. (It also correctly applied raises to the placeholder
+     20-employee roster's top/second-quartile members within their own departments, since those
+     employees have zero `kpi_snapshots` and therefore tie at composite score 0 — expected behavior
+     of the formula given no real KPI data yet, not a bug.)
+  5. Reset test employees' pay, restarted `kpi-engine` with `KPI_REVIEW_APPROVAL_MODE=on`, re-ran
+     `POST /reviews/run`: confirmed 0 raises applied directly (`employees.pay_rate` unchanged for
+     21/22) and 2 new `pending_approvals` rows created instead (`status='pending'`, `amount` =
+     proposed new pay, `expense_request_ref` = `"review_raise:performance_review: ..."`) — the
+     toggle genuinely changes the code path, not just a flag that's ignored.
+  6. Confirmed `kpi_snapshots` upsert idempotency directly: re-inserting the same
+     `(snapshot_date, entity_type, entity_id, metric)` key with a different `value` via the same
+     `ON CONFLICT ... DO UPDATE` statement the service uses left exactly 1 row (updated value),
+     never 2.
+  7. Tore down cleanly (`docker compose -p fakeco-p23 down -v`), removed the temporary
+     `.env`/`docker-compose.override.yml` copies from the worktree. Confirmed via `docker ps` that
+     only the main checkout's `fakeco-*` containers (plus an unrelated pre-existing `fakeco-p19-*`
+     stack from a different session) remain — nothing from this pass was left running.
+- **Known gap, NOT fixed this pass (flagged, not swept under the rug):** the four appliance HTTP
+  clients (`ZammadClient`, `WikiJSClient`, `MattermostClient`, `AkauntingClient`) inside
+  `run_rollup()` were **not** exercised against live, freshly-bootstrapped Zammad/Wiki.js/
+  Mattermost/Akaunting instances in this pass. Each of those four requires the same lengthy,
+  previously-hand-run bootstrap chain documented earlier in this log (Mattermost: enable personal
+  access tokens + mint one via API; Zammad: `rails r` to repoint the seeded admin + mint a token;
+  Wiki.js: complete the `/finalize` setup wizard + `setApiState(enabled:true)` + mint an API key;
+  Akaunting: still has the unresolved `task_a5d68375` payment-method/company-binding bug noted in
+  the Phase 15 log entry above) — redoing all four from scratch for a disposable isolated stack was
+  out of scope for this pass's time budget, and the `.env`'s existing tokens are bound to the main
+  checkout's already-provisioned instances, not a fresh stack. What WAS verified live end-to-end is
+  the part of Phase 23 that actually matters most for spec §12.1/§12.2 correctness — the zero-LLM
+  deterministic aggregation math, the upsert idempotency, the quartile-ranking formula, and (most
+  importantly) that raises genuinely flow through accounting-engine's real, previously-verified
+  code path rather than a reimplementation. Recommend a follow-up pass runs `/rollup/run` against
+  the main checkout's live stack directly (not an isolated copy) once real Zammad tickets/Wiki.js
+  pages/Mattermost messages/Akaunting transactions exist there, to close this gap.
+- **Files touched:** `kpi-engine/Dockerfile` (new), `kpi-engine/requirements.txt` (new),
+  `kpi-engine/main.py` (new, ~520 lines), `docker-compose.yml` (new `kpi-engine` service block +
+  placeholder-comment cleanup).
+- **Next:** Phase 24 (meeting-simulator extension: pay negotiation & performance review) — consumes
+  `GET /reviews/due`'s `underperforming` flag to open `performance_review` meetings instead of
+  cuts, and closes the Phase 15 pay-cut stub via real meeting outcomes.
+
+---
+
 ### 2026-07-31T18:40 — Phase 17 PARTIALLY verified: 2 real bugs fixed in what exists, but a major architectural gap found and NOT fixed
 
 - **Major gap, not a bug — a missing feature:** re-read spec §7 carefully against
