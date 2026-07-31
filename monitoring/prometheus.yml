@@ -1,0 +1,33 @@
+# Prometheus configuration — FakeCo "Real Appliances"
+# Populated in Phase 2 (cAdvisor, node-exporter scrape targets).
+# Additional scrape targets added in later phases.
+# Spec §21
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: "fakecorp"
+
+scrape_configs:
+  # Phase 1 placeholder — Prometheus itself (always useful baseline)
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Phase 2: cAdvisor — container metrics
+  # (enabled when phase2 profile services come up)
+  - job_name: "cadvisor"
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  # Phase 2: node-exporter — host metrics
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Phase 1: Postgres — basic connection check via postgres-exporter (future)
+  # Placeholder — postgres-exporter not yet in compose; just document the intent
+  # - job_name: "postgres"
+  #   static_configs:
+  #     - targets: ["postgres-exporter:9187"]

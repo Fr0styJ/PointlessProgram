@@ -1,0 +1,929 @@
+# docker-compose.yml — FakeCo "Real Appliances"
+# Spec ref: §22 (network architecture), §3 (service replacement map)
+# SPEC_CLARIFICATIONS #11: Traefik multi-homing includes net_clients (base) + net_mgmt +
+#   net_office + net_mail + net_dmz (every network it routes to or must be reached from)
+#
+# Network isolation rules from §22:
+#   net_clients  — internal: true  (no internet/host access)
+#   net_office   — internal: true
+#   net_mail     — internal: true
+#   net_dmz      — internal: true
+#   net_data     — internal: true
+#   net_llm_bridge — internal: false (only network with real internet — LiteLLM reaches providers)
+#   net_mgmt     — internal: false (host-published for dashboard/monitoring browser access)
+#
+# PHASE BUILD ORDER — services added per phase:
+#   Phase 1:  postgres, docker-socket-proxy
+#   Phase 2:  cadvisor, node-exporter, prometheus
+#   Phase 3:  technitium (DNS), traefik
+#   Phase 4:  docker-mailserver, roundcube
+#   Phase 5:  mattermost, mattermost-db
+#   Phase 6:  zammad, zammad-db, zammad-memcached, zammad-elasticsearch
+#   Phase 7:  wikijs, wikijs-db
+#   Phase 8:  nextcloud, nextcloud-db, wordpress, wordpress-db
+#   Phase 9:  akaunting, akaunting-db
+#   Phase 10: litellm
+#   Phase 11: loki, promtail, grafana
+#   Phase 12: sim-clock (custom)
+#   Phase 13+: custom services added as their phases execute
+
+version: "3.9"
+
+# =============================================================================
+# NETWORKS — §22
+# =============================================================================
+networks:
+  net_clients:
+    # Orchestrator, meeting simulator, human bridge, sim clock, external-world generator,
+    # Traefik, Technitium DNS
+    driver: bridge
+    internal: true
+
+  net_office:
+    # Wiki.js, Zammad, Mattermost, Nextcloud, Akaunting
+    driver: bridge
+    internal: true
+
+  net_mail:
+    # docker-mailserver, Roundcube
+    driver: bridge
+    internal: true
+
+  net_dmz:
+    # WordPress + DB
+    driver: bridge
+    internal: true
+
+  net_data:
+    # Shared PostgreSQL (incl. Akaunting's own DB, snapshot storage)
+    driver: bridge
+    internal: true
+
+  net_llm_bridge:
+    # LiteLLM proxy only — its only job is reaching LLM providers (real internet)
+    driver: bridge
+    internal: false
+
+  net_mgmt:
+    # Control dashboard, docker-socket-proxy, Prometheus, Grafana, Loki
+    # Host-published so browser can reach dashboard/monitoring
+    # Also where Traefik is multi-homed so browser can reach office apps
+    driver: bridge
+    internal: false
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+
+  # Placeholder volumes for later phases — declared now so `docker compose up` doesn't
+  # fail when other services reference them. Each phase populates what it needs.
+  mailserver_data:
+    driver: local
+  mailserver_config:
+    driver: local
+  mailserver_state:
+    driver: local
+  mailserver_logs:
+    driver: local
+  roundcube_db:
+    driver: local
+  mattermost_config:
+    driver: local
+  mattermost_data:
+    driver: local
+  mattermost_logs:
+    driver: local
+  mattermost_plugins:
+    driver: local
+  mattermost_client_plugins:
+    driver: local
+  mattermost_db:
+    driver: local
+  zammad_storage:
+    driver: local
+  zammad_db:
+    driver: local
+  zammad_es:
+    driver: local
+  wikijs_db:
+    driver: local
+  nextcloud_data:
+    driver: local
+  nextcloud_db:
+    driver: local
+  wordpress_db:
+    driver: local
+  akaunting_db:
+    driver: local
+  technitium_data:
+    driver: local
+  traefik_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  loki_data:
+    driver: local
+  litellm_db:
+    driver: local
+  sim_clock_data:
+    driver: local
+
+# =============================================================================
+# SERVICES
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # PHASE 1: PostgreSQL — shared instance, net_data
+  # Spec §3: "PostgreSQL (shared instance, separate schemas)"
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: fakeco-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fakeco}
+      POSTGRES_USER: ${POSTGRES_USER:-fakeco}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - net_data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fakeco} -d ${POSTGRES_DB:-fakeco}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      fakeco.service: "postgres"
+      fakeco.phase: "1"
+      fakeco.managed: "true"
+
+  # ---------------------------------------------------------------------------
+  # PHASE 1: docker-socket-proxy — least-privilege Docker API wrapper
+  # Spec §3: "tecnativa/docker-socket-proxy"
+  # Net: net_mgmt (dashboard talks to it; dashboard is on net_mgmt)
+  # Restricts to START/STOP/RESTART on labeled containers only.
+  # ---------------------------------------------------------------------------
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: fakeco-socket-proxy
+    restart: unless-stopped
+    environment:
+      # Allow only container START/STOP/RESTART operations
+      # All other endpoints are explicitly disabled (default=0)
+      CONTAINERS: 1       # needed to list/inspect containers
+      POST: 1             # needed to issue start/stop/restart commands
+      # Explicitly block dangerous endpoints
+      IMAGES: 0
+      NETWORKS: 0
+      VOLUMES: 0
+      INFO: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EXEC: 0
+      GRPC: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - net_mgmt
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:2375/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      fakeco.service: "docker-socket-proxy"
+      fakeco.phase: "1"
+      fakeco.managed: "true"
+
+  # ---------------------------------------------------------------------------
+  # PHASE 2: cAdvisor — container metrics
+  # Spec §21
+  # ---------------------------------------------------------------------------
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: fakeco-cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - net_mgmt
+    labels:
+      fakeco.service: "cadvisor"
+      fakeco.phase: "2"
+      fakeco.managed: "true"
+    profiles:
+      - phase2
+
+  # ---------------------------------------------------------------------------
+  # PHASE 2: node-exporter — host metrics
+  # Spec §21
+  # ---------------------------------------------------------------------------
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: fakeco-node-exporter
+    restart: unless-stopped
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    networks:
+      - net_mgmt
+    labels:
+      fakeco.service: "node-exporter"
+      fakeco.phase: "2"
+      fakeco.managed: "true"
+    profiles:
+      - phase2
+
+  # ---------------------------------------------------------------------------
+  # PHASE 2: Prometheus — scrapes cAdvisor + node-exporter (+ more in later phases)
+  # Spec §21; config file created in monitoring/
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fakeco-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - net_mgmt
+      # Multi-homed per §21: Prometheus may multi-home onto isolated app networks to scrape
+      # targets without breaking network isolation. Additional networks added per phase.
+    ports:
+      - "9090:9090"
+    labels:
+      fakeco.service: "prometheus"
+      fakeco.phase: "2"
+      fakeco.managed: "true"
+    profiles:
+      - phase2
+
+  # ---------------------------------------------------------------------------
+  # PHASE 3: Technitium DNS Server
+  # Spec §3: resolves *.fakecorp.internal
+  # Net: net_clients (DNS clients), net_mgmt (admin UI accessible via browser)
+  # ---------------------------------------------------------------------------
+  technitium:
+    image: technitium/dns-server:latest
+    container_name: fakeco-dns
+    restart: unless-stopped
+    environment:
+      DNS_SERVER_DOMAIN: ${FAKECORP_DOMAIN:-fakecorp.internal}
+      DNS_SERVER_ADMIN_PASSWORD: ${TECHNITIUM_ADMIN_PASSWORD:?TECHNITIUM_ADMIN_PASSWORD required}
+    volumes:
+      - technitium_data:/etc/dns
+    networks:
+      - net_clients
+      - net_mgmt
+    ports:
+      - "5380:5380"   # Technitium web admin UI
+    labels:
+      fakeco.service: "technitium"
+      fakeco.phase: "3"
+      fakeco.managed: "true"
+    profiles:
+      - phase3
+
+  # ---------------------------------------------------------------------------
+  # PHASE 3: Traefik v3 — reverse proxy / router
+  # Spec §3: real reverse proxy, structured logs, own dashboard
+  # SPEC_CLARIFICATIONS #11: multi-homed on net_clients (base) + net_mgmt + net_office +
+  #   net_mail + net_dmz (every network it routes to or needs to be reached from)
+  # ---------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3
+    container_name: fakeco-traefik
+    restart: unless-stopped
+    command:
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=net_clients"
+      - "--entrypoints.web.address=:80"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--accesslog.format=json"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_data:/etc/traefik
+    networks:
+      - net_clients    # base network (where most routed services live)
+      - net_mgmt       # so browser can reach appliance hostnames + Traefik dashboard
+      - net_office     # routes to Wiki.js, Zammad, Mattermost, Nextcloud, Akaunting
+      - net_mail       # routes to Roundcube
+      - net_dmz        # routes to WordPress
+    ports:
+      - "80:80"        # HTTP ingress for all internal hostnames
+      - "8080:8080"    # Traefik dashboard (net_mgmt only in production — acceptable for dev)
+    labels:
+      fakeco.service: "traefik"
+      fakeco.phase: "3"
+      fakeco.managed: "true"
+    profiles:
+      - phase3
+
+  # ---------------------------------------------------------------------------
+  # PHASE 4: docker-mailserver — real MTA with real mailboxes
+  # Spec §3: SMTP + IMAP; Sieve vacation-responder for PTO
+  # Net: net_mail
+  # Relay: closed — accepts inbound for @fakecorp.internal ONLY
+  # SPEC_CLARIFICATIONS #5: externally-styled senders are local-injection display artifacts;
+  #   server must reject actual outbound relay to real external domains
+  # ---------------------------------------------------------------------------
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: fakeco-mailserver
+    restart: unless-stopped
+    hostname: ${MAILSERVER_HOSTNAME:-mail.fakecorp.internal}
+    domainname: ${MAILSERVER_DOMAIN:-fakecorp.internal}
+    environment:
+      ENABLE_RSPAMD: 1
+      ENABLE_CLAMAV: 0           # disabled to save RAM in dev
+      ENABLE_FAIL2BAN: 0
+      ENABLE_POSTGREY: 0
+      POSTMASTER_ADDRESS: ${POSTMASTER_EMAIL:-postmaster@fakecorp.internal}
+      SMTP_ONLY: 0
+      SSL_TYPE: ""               # no TLS in closed network — plaintext is fine internally
+      # Relay lockdown: only accept mail for our own domain; no open relay
+      PERMIT_DOCKER: network
+      DOVECOT_INET_PROTOCOLS: all
+      ENABLE_MANAGESIEVE: 1      # enables Sieve vacation auto-responders (§15)
+    volumes:
+      - mailserver_data:/var/mail
+      - mailserver_state:/var/mail-state
+      - mailserver_logs:/var/log/mail
+      - mailserver_config:/tmp/docker-mailserver
+    networks:
+      - net_mail
+    cap_add:
+      - NET_ADMIN
+      - SYS_PTRACE
+    labels:
+      fakeco.service: "mailserver"
+      fakeco.phase: "4"
+      fakeco.managed: "true"
+    profiles:
+      - phase4
+
+  # ---------------------------------------------------------------------------
+  # PHASE 4: Roundcube — real webmail client
+  # Spec §3: "where you read/reply as yourself"
+  # ---------------------------------------------------------------------------
+  roundcube:
+    image: roundcube/roundcubemail:latest-apache
+    container_name: fakeco-roundcube
+    restart: unless-stopped
+    environment:
+      ROUNDCUBEMAIL_DEFAULT_HOST: fakeco-mailserver
+      ROUNDCUBEMAIL_DEFAULT_PORT: 143
+      ROUNDCUBEMAIL_SMTP_SERVER: fakeco-mailserver
+      ROUNDCUBEMAIL_SMTP_PORT: 25
+      ROUNDCUBEMAIL_DB_TYPE: pgsql
+      ROUNDCUBEMAIL_DB_HOST: postgres
+      ROUNDCUBEMAIL_DB_NAME: roundcube
+      ROUNDCUBEMAIL_DB_USER: ${POSTGRES_USER:-fakeco}
+      ROUNDCUBEMAIL_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required}
+      ROUNDCUBEMAIL_DES_KEY: ${ROUNDCUBE_DES_KEY:?ROUNDCUBE_DES_KEY required}
+    networks:
+      - net_mail
+      - net_data
+    labels:
+      fakeco.service: "roundcube"
+      fakeco.phase: "4"
+      fakeco.managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.roundcube.rule: "Host(`mail.fakecorp.internal`)"
+      traefik.http.services.roundcube.loadbalancer.server.port: "80"
+    profiles:
+      - phase4
+
+  # ---------------------------------------------------------------------------
+  # PHASE 5: Mattermost — real team chat
+  # Spec §3: REST/websocket API, custom status API (PTO), custom emoji/avatar APIs (branding)
+  # Net: net_office
+  # ---------------------------------------------------------------------------
+  mattermost-db:
+    image: postgres:16-alpine
+    container_name: fakeco-mattermost-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mattermost
+      POSTGRES_USER: mattermost
+      POSTGRES_PASSWORD: ${MATTERMOST_DB_PASSWORD:?MATTERMOST_DB_PASSWORD required}
+    volumes:
+      - mattermost_db:/var/lib/postgresql/data
+    networks:
+      - net_data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mattermost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      fakeco.service: "mattermost-db"
+      fakeco.phase: "5"
+      fakeco.managed: "true"
+    profiles:
+      - phase5
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:latest
+    container_name: fakeco-mattermost
+    restart: unless-stopped
+    depends_on:
+      mattermost-db:
+        condition: service_healthy
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: "postgres://mattermost:${MATTERMOST_DB_PASSWORD}@mattermost-db/mattermost?sslmode=disable&connect_timeout=10"
+      MM_SERVICESETTINGS_SITEURL: ${MATTERMOST_SITE_URL:-http://chat.fakecorp.internal}
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_PLUGINSETTINGS_ENABLEUPLOADS: "true"
+    volumes:
+      - mattermost_config:/mattermost/config
+      - mattermost_data:/mattermost/data
+      - mattermost_logs:/mattermost/logs
+      - mattermost_plugins:/mattermost/plugins
+      - mattermost_client_plugins:/mattermost/client/plugins
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "mattermost"
+      fakeco.phase: "5"
+      fakeco.managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.mattermost.rule: "Host(`chat.fakecorp.internal`)"
+      traefik.http.services.mattermost.loadbalancer.server.port: "8065"
+    profiles:
+      - phase5
+
+  # ---------------------------------------------------------------------------
+  # PHASE 6: Zammad — real helpdesk / ticketing
+  # Spec §3: per-employee API tokens; hosts expense approvals (§10.2) and customer
+  #   support tickets (§11.2)
+  # Net: net_office
+  # Note: Zammad requires several supporting services
+  # ---------------------------------------------------------------------------
+  zammad-db:
+    image: postgres:16-alpine
+    container_name: fakeco-zammad-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: zammad
+      POSTGRES_USER: zammad
+      POSTGRES_PASSWORD: ${ZAMMAD_DB_PASSWORD:?ZAMMAD_DB_PASSWORD required}
+    volumes:
+      - zammad_db:/var/lib/postgresql/data
+    networks:
+      - net_data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zammad"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      fakeco.service: "zammad-db"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
+  zammad-memcached:
+    image: memcached:alpine
+    container_name: fakeco-zammad-memcached
+    restart: unless-stopped
+    command: memcached -m 256m
+    networks:
+      - net_office
+    labels:
+      fakeco.service: "zammad-memcached"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
+  zammad-elasticsearch:
+    image: bitnami/elasticsearch:8
+    container_name: fakeco-zammad-es
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_CLUSTER_NAME: zammad
+      ELASTICSEARCH_NODE_NAME: zammad-es
+      ELASTICSEARCH_HEAP_SIZE: 512m
+    volumes:
+      - zammad_es:/bitnami/elasticsearch/data
+    networks:
+      - net_office
+    labels:
+      fakeco.service: "zammad-elasticsearch"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+    profiles:
+      - phase6
+
+  zammad:
+    image: ghcr.io/zammad/zammad:latest
+    container_name: fakeco-zammad
+    restart: unless-stopped
+    depends_on:
+      zammad-db:
+        condition: service_healthy
+    environment:
+      ZAMMAD_RAILS_TRUSTED_PROXIES: "['127.0.0.1', '::1', 'traefik']"
+      POSTGRESQL_HOST: zammad-db
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_DB: zammad
+      POSTGRESQL_USER: zammad
+      POSTGRESQL_PASS: ${ZAMMAD_DB_PASSWORD}
+      ELASTICSEARCH_HOST: zammad-elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      MEMCACHE_SERVERS: zammad-memcached
+      REDIS_URL: ""
+    volumes:
+      - zammad_storage:/opt/zammad/storage
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "zammad"
+      fakeco.phase: "6"
+      fakeco.managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.zammad.rule: "Host(`tickets.fakecorp.internal`)"
+      traefik.http.services.zammad.loadbalancer.server.port: "3000"
+    profiles:
+      - phase6
+
+  # ---------------------------------------------------------------------------
+  # PHASE 7: Wiki.js — real wiki with GraphQL API
+  # Spec §3: markdown, versioning, GraphQL page create/update
+  # Net: net_office
+  # ---------------------------------------------------------------------------
+  wikijs-db:
+    image: postgres:16-alpine
+    container_name: fakeco-wikijs-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wikijs
+      POSTGRES_USER: wikijs
+      POSTGRES_PASSWORD: ${WIKIJS_DB_PASSWORD:?WIKIJS_DB_PASSWORD required}
+    volumes:
+      - wikijs_db:/var/lib/postgresql/data
+    networks:
+      - net_data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wikijs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      fakeco.service: "wikijs-db"
+      fakeco.phase: "7"
+      fakeco.managed: "true"
+    profiles:
+      - phase7
+
+  wikijs:
+    image: requarks/wiki:2
+    container_name: fakeco-wikijs
+    restart: unless-stopped
+    depends_on:
+      wikijs-db:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgres
+      DB_HOST: wikijs-db
+      DB_PORT: 5432
+      DB_NAME: wikijs
+      DB_USER: wikijs
+      DB_PASS: ${WIKIJS_DB_PASSWORD}
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "wikijs"
+      fakeco.phase: "7"
+      fakeco.managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.wikijs.rule: "Host(`wiki.fakecorp.internal`)"
+      traefik.http.services.wikijs.loadbalancer.server.port: "3000"
+    profiles:
+      - phase7
+
+  # ---------------------------------------------------------------------------
+  # PHASE 8: Nextcloud — real intranet appliance (occasional flavor only)
+  # Spec §3: occasional API/WebDAV hits
+  # Net: net_office
+  # ---------------------------------------------------------------------------
+  nextcloud-db:
+    image: postgres:16-alpine
+    container_name: fakeco-nextcloud-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD:?NEXTCLOUD_DB_PASSWORD required}
+    volumes:
+      - nextcloud_db:/var/lib/postgresql/data
+    networks:
+      - net_data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nextcloud"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      fakeco.service: "nextcloud-db"
+      fakeco.phase: "8"
+      fakeco.managed: "true"
+    profiles:
+      - phase8
+
+  nextcloud:
+    image: nextcloud:stable-apache
+    container_name: fakeco-nextcloud
+    restart: unless-stopped
+    depends_on:
+      nextcloud-db:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_HOST: nextcloud-db
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:-admin}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?NEXTCLOUD_ADMIN_PASSWORD required}
+      NEXTCLOUD_TRUSTED_DOMAINS: "portal.fakecorp.internal"
+    volumes:
+      - nextcloud_data:/var/www/html
+    networks:
+      - net_office
+      - net_data
+    labels:
+      fakeco.service: "nextcloud"
+      fakeco.phase: "8"
+      fakeco.managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.nextcloud.rule: "Host(`portal.fakecorp.internal`)"
+      traefik.http.services.nextcloud.loadbalancer.server.port: "80"
+    profiles:
+      - phase8
+
+  # ---------------------------------------------------------------------------
+  # PHASE 8: WordPress — real CMS (occasional HTTP log realism only)
+  # Spec §3: net_dmz
+  # ---------------------------------------------------------------------------
+  wordpress-db:
+    image: mariadb:11
+    container_name: fakeco-wordpress-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: ${WORDPRESS_DB_PASSWORD:?WORDPRESS_DB_PASSWORD required}
+      MYSQL_ROOT_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+    volumes:
+      - wordpress_db:/var/lib/mysql
+    networks:
+      - net_dmz
+    labels:
+      fakeco.service: "wordpress-db"
+      fakeco.phase: "8"
+      fakeco.managed: "true"
+    profiles:
+      - phase8
+
+  wordpress:
+    image: wordpress:latest
+    container_name: fakeco-wordpress
+    restart: unless-stopped
+    depends_on:
+      - wordpress-db
+    environment:
+      WORDPRESS_DB_HOST: wordpress-db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: ${WORDPRESS_DB_PASSWORD}
+    networks:
+      - net_dmz
+    labels:
+      fakeco.service: "wordpress"
+      fakeco.phase: "8"
+      fakeco.managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.wordpress.rule: "Host(`www.fakecorp.internal`)"
+      traefik.http.services.wordpress.loadbalancer.server.port: "80"
+    profiles:
+      - phase8
+
+  # ---------------------------------------------------------------------------
+  # PHASE 9: Akaunting — real double-entry accounting
+  # Spec §3, §10.1: chart of accounts, transactions, P&L, balance sheet, revenue
+  # SPEC_CLARIFICATIONS #2: payroll posts as one aggregate transaction per cycle;
+  #   employees do NOT get individual vendor/contact records in Akaunting
+  # Net: net_office + net_data
+  # ---------------------------------------------------------------------------
+  akaunting-db:
+    image: mariadb:11
+    container_name: fakeco-akaunting-db
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: akaunting
+      MYSQL_USER: akaunting
+      MYSQL_PASSWORD: ${AKAUNTING_DB_PASSWORD:?AKAUNTING_DB_PASSWORD required}
+      MYSQL_ROOT_PASSWORD: ${AKAUNTING_DB_PASSWORD}
+    volumes:
+      - akaunting_db:/var/lib/mysql
+    networks:
+      - net_dmz    # Akaunting uses net_dmz for its DB to keep it separate from net_data PG
+    labels:
+      fakeco.service: "akaunting-db"
+      fakeco.phase: "9"
+      fakeco.managed: "true"
+    profiles:
+      - phase9
+
+  akaunting:
+    image: akaunting/akaunting:latest
+    container_name: fakeco-akaunting
+    restart: unless-stopped
+    depends_on:
+      - akaunting-db
+    environment:
+      APP_URL: "http://accounting.fakecorp.internal"
+      DB_HOST: akaunting-db
+      DB_DATABASE: akaunting
+      DB_USERNAME: akaunting
+      DB_PASSWORD: ${AKAUNTING_DB_PASSWORD}
+      COMPANY_NAME: ${AKAUNTING_COMPANY_NAME:-FakeCo}
+      ADMIN_EMAIL: ${AKAUNTING_ADMIN_EMAIL:?AKAUNTING_ADMIN_EMAIL required}
+      ADMIN_PASSWORD: ${AKAUNTING_ADMIN_PASSWORD:?AKAUNTING_ADMIN_PASSWORD required}
+    networks:
+      - net_office
+      - net_dmz
+    labels:
+      fakeco.service: "akaunting"
+      fakeco.phase: "9"
+      fakeco.managed: "true"
+      traefik.enable: "true"
+      traefik.http.routers.akaunting.rule: "Host(`accounting.fakecorp.internal`)"
+      traefik.http.services.akaunting.loadbalancer.server.port: "80"
+    profiles:
+      - phase9
+
+  # ---------------------------------------------------------------------------
+  # PHASE 10: LiteLLM Proxy — single LLM entry point
+  # Spec §20: DeepSeek → Anthropic → OpenAI → local fallback chain
+  # Net: net_llm_bridge (ONLY route with real internet access)
+  # All custom services send AI requests through this one endpoint only.
+  # ---------------------------------------------------------------------------
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: fakeco-litellm
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY required}
+      DATABASE_URL: ${LITELLM_DATABASE_URL:-postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    networks:
+      - net_llm_bridge  # internet access for provider calls
+      - net_clients     # custom services on net_clients call this proxy
+      - net_data        # for LiteLLM's own database (usage tracking)
+    labels:
+      fakeco.service: "litellm"
+      fakeco.phase: "10"
+      fakeco.managed: "true"
+    profiles:
+      - phase10
+
+  # ---------------------------------------------------------------------------
+  # PHASE 11: Loki — log aggregation
+  # Spec §21
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:latest
+    container_name: fakeco-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./monitoring/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    networks:
+      - net_mgmt
+    labels:
+      fakeco.service: "loki"
+      fakeco.phase: "11"
+      fakeco.managed: "true"
+    profiles:
+      - phase11
+
+  # ---------------------------------------------------------------------------
+  # PHASE 11: Promtail — log shipper (Traefik, Technitium, all appliances)
+  # Spec §21
+  # ---------------------------------------------------------------------------
+  promtail:
+    image: grafana/promtail:latest
+    container_name: fakeco-promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./monitoring/promtail-config.yaml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/log:/var/log:ro
+    networks:
+      - net_mgmt
+    labels:
+      fakeco.service: "promtail"
+      fakeco.phase: "11"
+      fakeco.managed: "true"
+    profiles:
+      - phase11
+
+  # ---------------------------------------------------------------------------
+  # PHASE 11: Grafana — dashboards (base in Phase 11; KPI/financial panels in Phase 31)
+  # Spec §21
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fakeco-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD required}
+      GF_SERVER_ROOT_URL: "http://grafana.fakecorp.internal"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - net_mgmt
+    ports:
+      - "3000:3000"
+    labels:
+      fakeco.service: "grafana"
+      fakeco.phase: "11"
+      fakeco.managed: "true"
+    profiles:
+      - phase11
+
+  # ---------------------------------------------------------------------------
+  # PHASES 12+: Custom services — each added when their phase executes.
+  # Placeholders listed here as comments to document the final topology:
+  #
+  # sim-clock        (Phase 12) — net_clients, net_data
+  # orchestrator     (Phase 18) — net_clients, net_data, net_office, net_mail
+  # meeting-simulator (Phase 16) — net_clients, net_data, net_office
+  # human-bridge     (Phase 17) — net_clients, net_data, net_mail, net_office
+  # accounting-engine (Phase 15) — net_clients, net_data, net_office
+  # external-world   (Phase 21+22) — net_clients, net_data, net_mail, net_office
+  # kpi-engine       (Phase 23+) — net_clients, net_data, net_office
+  # branding-manager (Phase 30) — net_clients, net_data, net_office
+  # purge-manager    (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
+  # snapshot-manager (Phase 29) — net_clients, net_data, net_office, net_mail, net_dmz
+  # dashboard        (Phase 33+) — net_mgmt, net_clients (calls other services)
+  # ---------------------------------------------------------------------------

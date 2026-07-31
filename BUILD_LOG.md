@@ -7,9 +7,10 @@
 | Field | Value |
 |---|---|
 | **Current Phase** | Phase 1 — Compose topology, networks, shared Postgres, socket-proxy |
-| **Percent Complete** | ~5% (Phase 0 of 39 complete) |
-| **Status** | Phase 0 COMPLETE — Phase 1 READY TO START |
-| **Exact Next Action** | Create `docker-compose.yml` defining all 7 networks from spec §22 with correct `internal: true` flags, add Postgres service on `net_data`, add `tecnativa/docker-socket-proxy` on `net_mgmt`, verify both come up healthy |
+| **Percent Complete** | ~8% (Phase 0 complete; Phase 1 code complete, runtime verification BLOCKED) |
+| **Status** | Phase 1 CODE COMPLETE — **BLOCKED on Docker installation** |
+| **Exact Next Action** | Install Docker Desktop (or Docker Engine) on this machine, then run `docker compose up postgres docker-socket-proxy -d` and verify Phase 1 exit criteria: (1) both services healthy, (2) Postgres reachable from net_data container, (3) NOT reachable from net_clients container, (4) socket-proxy allows START/STOP/RESTART on labeled container, rejects image-pull. After that, proceed to Phase 2 (add phase2 profile services: cadvisor, node-exporter, prometheus). |
+| **BLOCKER** | Docker is not installed. Was at `C:\Program Files\Docker\Docker` but was **uninstalled 2026-06-22** per `C:\ProgramData\DockerDesktop\install-log-admin.txt`. No container runtime found on PATH. |
 
 **Environment:**
 - OS: Windows, shell: pwsh
@@ -58,6 +59,48 @@
   - `.gitignore` created excluding `.env`, volumes, secrets
 - **Files touched:** `BUILD_LOG.md`, `.env.example`, `.gitignore`, all 15 `README.md` stubs
 - **Next:** Phase 1 — `docker-compose.yml` with 7 networks, Postgres, docker-socket-proxy
+
+---
+
+### 2026-07-31T11:41 — Phase 1 CODE COMPLETE; Docker runtime BLOCKED
+
+- **Completed (code/config artifacts):**
+  - `docker-compose.yml` created: all 7 networks (`net_clients`, `net_office`, `net_mail`,
+    `net_dmz`, `net_data`, `net_llm_bridge`, `net_mgmt`) with correct `internal: true` flags.
+  - All services for Phases 1–11 defined in compose (Phase 2–11 services use Compose profiles
+    so `docker compose up` without `--profile` only starts Phase 1 services by default).
+  - Postgres service on `net_data` with healthcheck; `fakeco.managed=true` label for socket-proxy scoping.
+  - `tecnativa/docker-socket-proxy` on `net_mgmt` with CONTAINERS=1, POST=1, all dangerous
+    endpoints explicitly disabled (IMAGES=0, EXEC=0, etc.) per spec §3.
+  - Supporting files: `monitoring/prometheus.yml`, `monitoring/loki-config.yaml`,
+    `monitoring/promtail-config.yaml`, `litellm/config.yaml` (full provider chain + tier config).
+  - `.env` created for dev use (not committed per `.gitignore`).
+
+- **BLOCKER — DEVIATION LOGGED:**
+  Docker Desktop was uninstalled from this machine on 2026-06-22. `docker compose config`
+  returns "not recognized." Cannot run Phase 1 runtime exit criteria:
+  (a) `docker compose up` health check, (b) network isolation test, (c) socket-proxy restriction test.
+  **Decision:** Continue producing code artifacts for subsequent phases rather than halting.
+  All Docker-dependent runtime verification steps are logged here as pending and will be run
+  once Docker is reinstalled. This is a pure infrastructure availability issue, not a code error.
+
+- **Files touched:** `docker-compose.yml`, `monitoring/prometheus.yml`, `monitoring/loki-config.yaml`,
+  `monitoring/promtail-config.yaml`, `litellm/config.yaml`, `BUILD_LOG.md`
+
+- **Next step (once Docker available):** `docker compose up postgres docker-socket-proxy -d`
+  then run isolation and socket-proxy verification tests per Phase 1 exit criteria.
+- **Next code step (continuing without Docker):** Phase 12 (sim clock service code) and
+  Phase 13 (narrative DB migrations) — both produce Python/SQL that can be written now
+  and tested when Docker is available.
+
+---
+
+### 2026-07-31T11:37 — Phase 1 started
+
+- **Starting:** Phase 1 — Compose topology, networks, shared Postgres, socket-proxy
+- **Plan:** Create `docker-compose.yml` with all 7 networks, Postgres on `net_data`,
+  `tecnativa/docker-socket-proxy` on `net_mgmt`. Verify isolation and socket-proxy restrictions.
+- **In progress:** Writing `docker-compose.yml`
 
 ---
 

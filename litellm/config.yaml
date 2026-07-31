@@ -1,0 +1,108 @@
+# LiteLLM Proxy configuration — FakeCo "Real Appliances"
+# Phase 10 — LLM gateway bring-up
+# Spec §20, §20.1; SPEC_CLARIFICATIONS #12 (local model tier unspecified — skip for now)
+#
+# Provider fallback chain (§20): DeepSeek → Anthropic → OpenAI → local (unspecified)
+# Model tiering (§20.1):
+#   cheap  — routine filler, ambient events (§16), BetaCorp flavor news
+#   mid    — weekly digest (§12.3)
+#   heavy  — meetings, meeting-derived content, Principal reactions (§4.3 priority 1)
+#
+# API KEYS: Never stored here — loaded from environment variables only.
+
+model_list:
+  # --- Cheap/routine tier ---
+  - model_name: "cheap"
+    litellm_params:
+      model: "deepseek/deepseek-chat"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+    model_info:
+      mode: chat
+
+  - model_name: "cheap"
+    litellm_params:
+      model: "claude-haiku-20240307"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+    model_info:
+      mode: chat
+
+  - model_name: "cheap"
+    litellm_params:
+      model: "gpt-4o-mini"
+      api_key: "os.environ/OPENAI_API_KEY"
+    model_info:
+      mode: chat
+
+  # --- Mid tier ---
+  - model_name: "mid"
+    litellm_params:
+      model: "deepseek/deepseek-chat"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+    model_info:
+      mode: chat
+
+  - model_name: "mid"
+    litellm_params:
+      model: "claude-3-5-haiku-20241022"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+    model_info:
+      mode: chat
+
+  - model_name: "mid"
+    litellm_params:
+      model: "gpt-4o-mini"
+      api_key: "os.environ/OPENAI_API_KEY"
+    model_info:
+      mode: chat
+
+  # --- Heavy/reasoning tier (meetings, meeting-derived content, Principal reactions) ---
+  - model_name: "heavy"
+    litellm_params:
+      model: "deepseek/deepseek-reasoner"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      # Enable DeepSeek prompt caching (§20.1 tip 1)
+      cache_control: true
+    model_info:
+      mode: chat
+
+  - model_name: "heavy"
+    litellm_params:
+      model: "claude-sonnet-4-5"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+      # Enable Anthropic prompt caching (§20.1 tip 1)
+      cache_control: true
+    model_info:
+      mode: chat
+
+  - model_name: "heavy"
+    litellm_params:
+      model: "gpt-4o"
+      api_key: "os.environ/OPENAI_API_KEY"
+    model_info:
+      mode: chat
+
+router_settings:
+  # Enable fallback routing per tier — tries providers in list order
+  routing_strategy: "latency-based-routing"
+  enable_pre_call_checks: true
+  num_retries: 3
+  retry_after: 5
+
+litellm_settings:
+  # Token-efficiency §20.1 tip 1: enable prompt caching for supported providers
+  cache: true
+  cache_params:
+    type: "local"   # switch to Redis in production if needed
+
+  # Structured error logging (§23)
+  success_callback: []
+  failure_callback: []
+
+  # Drop unsupported params rather than erroring (important for cross-provider fallbacks)
+  drop_params: true
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"
+  database_url: "os.environ/LITELLM_DATABASE_URL"
+  # Store usage data for cost tracking (§19.5, §20)
+  store_model_in_db: true
