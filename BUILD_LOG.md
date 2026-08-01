@@ -26,7 +26,7 @@
 - [x] `.env.example` / `.env` (all `:?required` vars present; `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD` gap fixed 2026-08-01T04:30)
 - [x] `orchestrator/` (Phase 18 core + Phase 27 `pending_actions` retry queue/chaos controls + Phase 28 crisis-event triggers + Phase 33 tick pause/resume — all written and runtime-verified)
 - [x] `meeting-simulator/` (Phase 16 core + Phase 20 relationship-affinity hooks — written and runtime-verified; `pay_negotiation` meeting-type schema exists per §6.4 but is never invoked by anything — that's Phase 24, not started)
-- [x] `human-bridge/` (Phase 17 action-injection API + detection layer, runtime-verified; Phase 35 added Wiki.js company-direction pinned-page sync, also runtime-verified)
+- [x] `human-bridge/` (Phase 17 action-injection/detection + personality-grounded Mattermost/email Principal reaction workers, runtime-verified; Phase 35 Wiki.js company-direction sync; narrative-driven WordPress/Nextcloud deliverables)
 - [x] `sim-clock/` (Phase 12 — code written and runtime-verified)
 - [x] `accounting-engine/` (Phase 15 — written and runtime-verified; Akaunting `payment_method`/`X-Company` bug that blocked every real transaction post was found and fixed 2026-08-01T02:10)
 - [x] `purge-manager/` (Phase 29 — built and runtime-verified via disposable-stack round-trip testing; Phase 36 wired its full-purge flow into the dashboard's "nuclear launch" Settings control)
@@ -34,7 +34,7 @@
 - [x] `external-world/` (Phase 21/22 — `Dockerfile`/`requirements.txt` added, wired into `docker-compose.yml`, `customers` table seeded via `005_customers_seed.sql`, prospect-generation loop runtime-verified end-to-end with real Zammad tickets)
 - [x] `kpi-engine/` (Phase 23 — built and runtime-verified, incl. live rollup against real Zammad/Wiki.js/Mattermost/Akaunting; Phase 35 added the live-switchable auto-apply vs. review-and-approve toggle, migration 011)
 - [x] `branding-manager/` (Phase 30 — built and runtime-verified against an isolated stack; 3 real appliance-API bugs/gaps found and fixed, incl. Zammad avatar-API and Wiki.js avatar-storage workarounds)
-- [x] `narrative-db/` (migrations 001–014 written and runtime-verified; 012 adds narrative deliverables, 013 adds bounded persistent deliverable retry state, and 014 adds reusable personality profiles with stable employee assignments)
+- [x] `narrative-db/` (migrations 001–015 written and runtime-verified; 012–015 cover narrative deliverables, bounded deliverable retries, reusable personality profiles, and bounded Principal-reaction retries)
 - [x] `dashboard/` (Phases 33–37 — React/Vite + FastAPI BFF, all 37's worth of tabs built and runtime-verified: Simulation/LLM Status/Narrative (33), HR/Payroll/Accounting (34), External World/KPI/Company Direction (35), Chaos/Data Management/Branding + Settings nuclear-purge (36), TV wall/Errors panel/deep links/log tail (37))
 - [x] `provisioning/` (Phase 14 CLI — runtime-verified; Phase 34 added an HTTP "serve" mode with `/hire`/`/fire` for the dashboard, reusing the same underlying functions)
 - [x] `litellm/config.yaml` (Phase 10 — written and runtime-verified)
@@ -48,6 +48,38 @@
 ## LOG (newest first)
 
 ---
+
+### 2026-08-01T05:55 — Built and live-verified personality-grounded Mattermost and email reaction workers
+
+Integrated two independently authored channel workers into `human-bridge` to close the direct
+chat/email silence discovered at 05:40. The shared poller consumes oldest Principal-origin
+`pending_reactions` first using the configured `heavy` model tier and the employee's complete
+assigned JSONB personality profile. It pauses before touching rows while LiteLLM is unavailable,
+defers employees on PTO, and makes pending Principal reactions outrank narrative deliverables.
+
+Mattermost replies retrieve the exact source post from `mattermost:<post-id>`, reject self-message
+loops, generate a grounded response, acquire/revoke a short-lived employee token, ensure channel
+membership, and post in the original thread. A persisted reaction marker detects an already-posted
+reply after a retry. Review caught and fixed an integration bug in the agent draft: it originally
+treated the entire prefixed source reference as a Mattermost post ID and requested an invalid URL.
+It also used a nonexistent model alias; this was corrected to the real `heavy` alias.
+
+Email replies fetch the exact source UID from the target employee's IMAP inbox, validate that it
+was sent by the Principal to that employee, exclude attachments/automated messages, generate a
+grounded body, then authenticate as the employee over internal SMTP. Replies carry stable
+Message-ID, `Re:`, In-Reply-To, References, simulation-origin, and loop-prevention headers.
+
+Migration `015_reaction_retry_state.sql` adds persistent attempts, next-retry time, last error,
+and terminal failure state. Genuine failures back off 30/60/120/240/480 seconds and stop after
+five attempts; PTO defers for five minutes without spending an attempt, and provider downtime
+does not mutate the queue. Eleven offline unit tests pass. With LiteLLM still stopped, the rebuilt
+live service returned a clean paused response and left the full existing reaction-state hash
+unchanged. Two additional no-cost live round trips used fake local generators with real appliance
+transport: a Principal Mattermost post received a real employee-threaded reply with the marker and
+DB status `done`, and a Principal SMTP email received a real authenticated employee reply with
+correct threading headers and DB status `done`. All verification posts, emails, events, and
+reaction rows were removed afterward. `fakeco-human-bridge` remained healthy and LiteLLM remained
+stopped throughout. Zammad/Wiki.js response adapters remain unbuilt and are tracked in `bugs.md`.
 
 ### 2026-08-01T05:40 — Added 50 detailed employee profiles and stable randomized assignment; confirmed direct-message replies are still an unbuilt spec gap
 

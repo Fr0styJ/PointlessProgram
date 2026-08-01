@@ -6,6 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY reaction_chat.py .
+COPY reaction_email.py .
 
 EXPOSE 8000
 

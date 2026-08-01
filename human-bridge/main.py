@@ -31,6 +31,8 @@ from typing import Optional
 
 import asyncpg
 import httpx
+from reaction_chat import ChatReactionConfig, process_chat_reaction
+from reaction_email import EmailReactionConfig, EmailReactionWorker
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -80,6 +82,10 @@ DELIVERABLE_POLL_INTERVAL_SECONDS = float(os.environ.get("DELIVERABLE_POLL_INTER
 DELIVERABLE_MAX_ATTEMPTS = int(os.environ.get("DELIVERABLE_MAX_ATTEMPTS", "5"))
 DELIVERABLE_RETRY_BASE_SECONDS = float(os.environ.get("DELIVERABLE_RETRY_BASE_SECONDS", "30"))
 DELIVERABLE_RETRY_MAX_SECONDS = float(os.environ.get("DELIVERABLE_RETRY_MAX_SECONDS", "3600"))
+REACTION_POLL_INTERVAL_SECONDS = float(os.environ.get("REACTION_POLL_INTERVAL_SECONDS", "5"))
+REACTION_MAX_ATTEMPTS = int(os.environ.get("REACTION_MAX_ATTEMPTS", "5"))
+REACTION_RETRY_BASE_SECONDS = float(os.environ.get("REACTION_RETRY_BASE_SECONDS", "30"))
+REACTION_RETRY_MAX_SECONDS = float(os.environ.get("REACTION_RETRY_MAX_SECONDS", "3600"))
 
 # Mailserver bot secret (same as provisioning — derive bot passwords)
 import hashlib
@@ -1102,6 +1108,23 @@ async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
                 await asyncio.sleep(DELIVERABLE_POLL_INTERVAL_SECONDS)
                 continue
             async with pool.acquire() as conn:
+                # Principal-authored reactions are the continuity loop's highest
+                # priority. Do not spend a model call on a deliverable while one
+                # of the supported direct-response channels is waiting.
+                principal_reaction_waiting = await conn.fetchval("""
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pending_reactions pr
+                        JOIN narrative_events ne ON ne.id = pr.triggering_event_id
+                        WHERE pr.status = 'pending'
+                          AND ne.origin = 'human'
+                          AND ne.source_type IN ('chat', 'email')
+                          AND COALESCE(pr.next_retry_at, NOW()) <= NOW()
+                    )
+                """)
+                if principal_reaction_waiting:
+                    await asyncio.sleep(DELIVERABLE_POLL_INTERVAL_SECONDS)
+                    continue
                 # Fetch open deliverable action_items that haven't been fulfilled yet.
                 # The deliverable_url IS NULL guard prevents re-processing items that
                 # were previously fulfilled but for some reason still have status='open'.
@@ -1150,6 +1173,155 @@ async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Principal reaction worker — highest-priority continuity work (spec §4.3)
+# ---------------------------------------------------------------------------
+async def _record_reaction_failure(
+    conn: asyncpg.Connection, reaction_id: int, error: Exception
+) -> dict:
+    row = await conn.fetchrow(
+        "SELECT attempts FROM pending_reactions WHERE id = $1 FOR UPDATE", reaction_id
+    )
+    attempts = int(row["attempts"] if row else 0) + 1
+    terminal = attempts >= REACTION_MAX_ATTEMPTS
+    delay = min(
+        REACTION_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+        REACTION_RETRY_MAX_SECONDS,
+    )
+    error_text = f"{type(error).__name__}: {error}"[:2000]
+    await conn.execute("""
+        UPDATE pending_reactions
+        SET attempts = $2,
+            last_error = $3,
+            next_retry_at = CASE WHEN $4 THEN NULL ELSE NOW() + ($5 * INTERVAL '1 second') END,
+            failed_at = CASE WHEN $4 THEN NOW() ELSE NULL END,
+            status = CASE WHEN $4 THEN 'failed' ELSE status END
+        WHERE id = $1 AND status = 'pending'
+    """, reaction_id, attempts, error_text, terminal, delay)
+    return {"attempts": attempts, "terminal": terminal, "delay": delay}
+
+
+async def _process_pending_reactions_once(pool: asyncpg.Pool) -> dict:
+    """Process pending Principal chat/email reactions once, oldest first.
+
+    A stopped LiteLLM pauses the batch before any row is mutated. Other
+    detection sources (ticket/wiki) remain pending for future channel adapters.
+    """
+    llm_probe = _LLMClient(LITELLM_URL, LITELLM_API_KEY)
+    if not await llm_probe.is_available():
+        return {"status": "paused", "reason": "litellm_unavailable", "processed": 0}
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT pr.id, ne.source_type
+            FROM pending_reactions pr
+            JOIN narrative_events ne ON ne.id = pr.triggering_event_id
+            WHERE pr.status = 'pending'
+              AND ne.origin = 'human'
+              AND ne.source_type IN ('chat', 'email')
+              AND COALESCE(pr.next_retry_at, NOW()) <= NOW()
+            ORDER BY pr.id
+            LIMIT 10
+        """)
+        sim_time = await conn.fetchval("SELECT sim_time FROM sim_clock WHERE id = 1")
+
+    chat_config = ChatReactionConfig(
+        mattermost_url=MATTERMOST_URL,
+        mattermost_admin_token=MATTERMOST_ADMIN_TOKEN,
+        litellm_url=LITELLM_URL,
+        litellm_api_key=LITELLM_API_KEY,
+        model="heavy",
+    )
+    email_worker = EmailReactionWorker(EmailReactionConfig(
+        principal_email=PRINCIPAL_EMAIL,
+        principal_name=PRINCIPAL_NAME,
+        mail_host=MAILSERVER_HOST,
+        imap_port=MAILSERVER_IMAP_PORT,
+        smtp_port=MAILSERVER_PORT,
+        mailserver_bot_secret=MAILSERVER_BOT_SECRET,
+        litellm_url=LITELLM_URL,
+        litellm_api_key=LITELLM_API_KEY,
+        model="heavy",
+    ))
+
+    results: list[dict] = []
+    for row in rows:
+        try:
+            async with pool.acquire() as conn:
+                if row["source_type"] == "chat":
+                    async with conn.transaction():
+                        result = await process_chat_reaction(
+                            conn, row["id"], chat_config, sim_time=sim_time
+                        )
+                else:
+                    result = await email_worker.process_pending_reaction(conn, row)
+                reason = getattr(result, "reason", None)
+                if result.status in {"pending", "deferred", "deferred_pto"}:
+                    if (reason and "litellm" in reason.lower()) or reason == "provider_unavailable":
+                        return {
+                            "status": "paused", "reason": "litellm_unavailable",
+                            "processed": len(results), "results": results,
+                        }
+                    if result.status in {"deferred", "deferred_pto"}:
+                        await conn.execute("""
+                            UPDATE pending_reactions
+                            SET next_retry_at = NOW() + INTERVAL '5 minutes'
+                            WHERE id = $1 AND status = 'pending'
+                        """, row["id"])
+                    else:
+                        async with conn.transaction():
+                            retry = await _record_reaction_failure(
+                                conn, row["id"], RuntimeError(reason or "reaction remained pending")
+                            )
+                        result_status = "failed" if retry["terminal"] else "retry_scheduled"
+                        results.append({
+                            "id": row["id"], "channel": row["source_type"], "status": result_status
+                        })
+                        continue
+                elif result.status in {"done", "sent", "already_done"}:
+                    await conn.execute("""
+                        UPDATE pending_reactions
+                        SET attempts = 0, next_retry_at = NULL, last_error = NULL, failed_at = NULL
+                        WHERE id = $1
+                    """, row["id"])
+            results.append({
+                "id": row["id"], "channel": row["source_type"], "status": result.status
+            })
+        except Exception as exc:
+            # Leave pending. Chat has an appliance-side marker and email has a
+            # stable Message-ID so a later pass can reconcile/retry safely.
+            log.error(
+                "human-bridge: %s reaction %d failed and remains pending: %s",
+                row["source_type"], row["id"], exc,
+            )
+            async with pool.acquire() as failure_conn:
+                async with failure_conn.transaction():
+                    retry = await _record_reaction_failure(failure_conn, row["id"], exc)
+            results.append({
+                "id": row["id"], "channel": row["source_type"],
+                "status": "failed" if retry["terminal"] else "retry_scheduled",
+            })
+    return {"status": "ok", "processed": len(results), "results": results}
+
+
+async def _principal_reaction_loop(pool: asyncpg.Pool) -> None:
+    await asyncio.sleep(5.0)
+    last_pause_log = 0.0
+    while True:
+        try:
+            result = await _process_pending_reactions_once(pool)
+            if result["status"] == "paused":
+                now = asyncio.get_running_loop().time()
+                if now - last_pause_log >= 60.0:
+                    log.info("human-bridge: LiteLLM unavailable; Principal reactions paused")
+                    last_pause_log = now
+            elif result["processed"]:
+                log.info("human-bridge: processed Principal reactions: %s", result["results"])
+        except Exception as exc:
+            log.error("human-bridge: Principal reaction loop failed: %s", exc)
+        await asyncio.sleep(REACTION_POLL_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 @asynccontextmanager
@@ -1160,16 +1332,22 @@ async def lifespan(app: FastAPI):
     # Deliverable fulfillment: polls open action_items with deliverable_type set
     # and creates real WordPress posts / Nextcloud files via LLM-generated content.
     deliverable_task = asyncio.create_task(_deliverable_fulfillment_loop(_pool))
+    reaction_task = asyncio.create_task(_principal_reaction_loop(_pool))
     log.info("human-bridge: ready")
     yield
     detection_task.cancel()
     deliverable_task.cancel()
+    reaction_task.cancel()
     try:
         await detection_task
     except (asyncio.CancelledError, Exception):
         pass
     try:
         await deliverable_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await reaction_task
     except (asyncio.CancelledError, Exception):
         pass
     await _pool.close()
@@ -1269,6 +1447,12 @@ async def detection_poll_now(pool: PoolDep):
         except Exception as exc:
             results[poller.__name__] = f"error: {exc}"
     return results
+
+
+@app.post("/action/reactions/poll-now")
+async def action_poll_reactions_now(pool: PoolDep):
+    """Run one chat/email Principal-reaction pass immediately."""
+    return await _process_pending_reactions_once(pool)
 
 
 @app.get("/state/employees")
