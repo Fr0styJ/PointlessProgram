@@ -96,10 +96,44 @@ class AkauntingClient:
         # bypassing Traefik. Found live: every real call from this client was silently 500ing
         # with "Untrusted Host" outside of manual tests that happened to pass an explicit
         # Host header via curl -H — this was never actually exercised as this client sends it.
-        self._client = httpx.AsyncClient(timeout=30.0, headers={"Host": "accounting.fakecorp.internal"})
+        #
+        # `X-Company` (not `company`) is also required on every call — App\Traits\Companies
+        # reads that exact header. Without it, requests fall back to getFirstCompanyOfUser(),
+        # which resolves too late for App\Utilities\ModuleActivator (built during framework
+        # boot, before routing/auth), so POST /api/transactions gets 0 payment-method module
+        # listeners bound and 422s with "The payment method is invalid" — even though the
+        # payment method itself is seeded correctly — until something else happens to prime
+        # the module-enabled cache for company 1 within its 6h TTL.
+        self._client = httpx.AsyncClient(
+            timeout=30.0,
+            headers={"Host": "accounting.fakecorp.internal", "X-Company": str(company_id)},
+        )
+        self._payment_method: Optional[str] = None
 
     async def close(self):
         await self._client.aclose()
+
+    async def _get_payment_method(self) -> str:
+        """Resolve the offline payment-method code to use. An env var override takes
+        precedence; otherwise ask Akaunting's own seeded settings rather than guessing a
+        hardcoded key that can drift out of sync."""
+        if self._payment_method is not None:
+            return self._payment_method
+        env_override = os.environ.get("AKAUNTING_PAYMENT_METHOD", "")
+        if env_override:
+            self._payment_method = env_override
+            return self._payment_method
+        r = await self._client.get(
+            f"{self.base}/settings/offline-payments.methods",
+            auth=self.auth,
+        )
+        r.raise_for_status()
+        import json as _json
+        methods = _json.loads(r.json()["data"]["value"])
+        if not methods:
+            raise RuntimeError("Akaunting has no offline payment methods seeded")
+        self._payment_method = methods[0]["code"]
+        return self._payment_method
 
     async def post_transaction(
         self,
@@ -117,8 +151,9 @@ class AkauntingClient:
         # validation (neither was being sent before, so every post 422'd) — `number` needs to
         # be unique per transaction, so derive it from the idempotency key when the caller has
         # one (every financial mutation in this service is meant to be idempotency-keyed per
-        # spec §23), falling back to a timestamp otherwise. `payment_method` is fixed to the
-        # seeded offline "Cash" method since this sim only ever uses one bank account.
+        # spec §23), falling back to a timestamp otherwise. `payment_method` is resolved from
+        # Akaunting's own seeded settings (see `_get_payment_method`) rather than hardcoded,
+        # since the seeded method code isn't guaranteed stable across re-provisions.
         payload = {
             "company_id": self.company_id,
             "type": transaction_type,  # "income" or "expense"
@@ -128,7 +163,7 @@ class AkauntingClient:
             "currency_rate": 1,
             "paid_at": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "description": description,
-            "payment_method": "offline-payments.cash.1",
+            "payment_method": await self._get_payment_method(),
             "number": idempotency_key or f"TXN-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
         }
         if contact_id:
