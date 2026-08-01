@@ -229,6 +229,22 @@ h1 {
   color: #ffb3ac;
 }
 
+/* Phase 35: External World / KPI badges (customer relationship_status, review tiers) */
+.badge-status-prospect {
+  background: #2f4a6f;
+  color: #cfe0ff;
+}
+
+.badge-status-at-risk {
+  background: #6f5c2f;
+  color: #ffe9c2;
+}
+
+.badge-status-churned {
+  background: #4a2f2f;
+  color: #ffb3ac;
+}
+
 .danger-btn {
   padding: 8px 18px;
   border-radius: 6px;

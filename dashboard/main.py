@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 import asyncpg
+import aiomysql
 import httpx
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -65,6 +66,18 @@ ACCOUNTING_ENGINE_URL = os.environ.get("ACCOUNTING_ENGINE_URL", "http://accounti
 AKAUNTING_COMPANY_ID = os.environ.get("AKAUNTING_COMPANY_ID", "1")
 AKAUNTING_PUBLIC_URL = os.environ.get("AKAUNTING_PUBLIC_URL", "http://accounting.fakecorp.internal")
 
+# Phase 35: External World / KPI / Company Direction tabs.
+EXTERNAL_WORLD_URL = os.environ.get("EXTERNAL_WORLD_URL", "http://external-world:8000")
+KPI_ENGINE_URL = os.environ.get("KPI_ENGINE_URL", "http://kpi-engine:8000")
+HUMAN_BRIDGE_URL = os.environ.get("HUMAN_BRIDGE_URL", "http://human-bridge:8000")
+
+# Revenue-by-customer chart reads Akaunting's MariaDB directly, same
+# credentials/host purge-manager and snapshot-manager already use.
+AKAUNTING_DB_HOST = os.environ.get("AKAUNTING_DB_HOST", "akaunting-db")
+AKAUNTING_DB_NAME = os.environ.get("AKAUNTING_DB_NAME", "akaunting")
+AKAUNTING_DB_USER = os.environ.get("AKAUNTING_DB_USER", "akaunting")
+AKAUNTING_DB_PASSWORD = os.environ.get("AKAUNTING_DB_PASSWORD", "")
+
 DASHBOARD_AUTH_USER = os.environ.get("DASHBOARD_AUTH_USER")
 DASHBOARD_AUTH_PASSWORD = os.environ.get("DASHBOARD_AUTH_PASSWORD")
 
@@ -103,6 +116,7 @@ def require_basic_auth(credentials: HTTPBasicCredentials = Depends(_security)) -
 # ---------------------------------------------------------------------------
 _pool: Optional[asyncpg.Pool] = None
 _http: Optional[httpx.AsyncClient] = None
+_mysql_pool: Optional[aiomysql.Pool] = None
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -113,9 +127,21 @@ async def get_pool() -> asyncpg.Pool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _http
+    global _pool, _http, _mysql_pool
     _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
     _http = httpx.AsyncClient(timeout=15.0)
+    try:
+        _mysql_pool = await aiomysql.create_pool(
+            host=AKAUNTING_DB_HOST, port=3306, user=AKAUNTING_DB_USER,
+            password=AKAUNTING_DB_PASSWORD, db=AKAUNTING_DB_NAME,
+            minsize=1, maxsize=3, autocommit=True,
+        )
+    except Exception as exc:
+        # Same degrade-gracefully posture as every other optional integration
+        # here — the External World tab's revenue-by-customer chart will show
+        # an error banner rather than crash the whole BFF at boot.
+        log.warning("Could not connect to Akaunting MariaDB at boot: %s", exc)
+        _mysql_pool = None
     if not DASHBOARD_AUTH_USER or not DASHBOARD_AUTH_PASSWORD:
         log.warning(
             "DASHBOARD_AUTH_USER / DASHBOARD_AUTH_PASSWORD not set — dashboard will "
@@ -125,6 +151,9 @@ async def lifespan(app: FastAPI):
     yield
     await _http.aclose()
     await _pool.close()
+    if _mysql_pool is not None:
+        _mysql_pool.close()
+        await _mysql_pool.wait_closed()
     log.info("dashboard: shutdown complete")
 
 
@@ -611,6 +640,303 @@ async def accounting_reject(body: ApprovalBody, _user: str = Depends(require_bas
         return r.json()
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"accounting-engine unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 35: External World tab
+#
+# BetaCorp news + customer pipeline read narrative-db's system_audit_log /
+# customers tables directly (same "no owning service for reads" pattern as
+# Phase 33/34's other direct-SQL endpoints). Revenue-by-customer joins that
+# Postgres customers row to Akaunting's ak_transactions via
+# customers.akaunting_transaction_id (set once by accounting-engine's
+# post_revenue() when a deal closes) — reads Akaunting's MariaDB directly,
+# same data source as Phase 31's customer-pipeline-revenue.json Grafana panel.
+# ---------------------------------------------------------------------------
+BETACORP_ACTIONS = ("betacorp_offer_sent", "employee_resigned_betacorp", "pay_gap_flag_raised")
+JOB_OFFER_RESIGNATION_ACTIONS = ("betacorp_offer_sent", "employee_resigned_betacorp")
+
+
+@app.get("/api/external-world/news")
+async def external_world_news(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    """
+    BetaCorp news feed: every BetaCorp-related system_audit_log entry, tagged
+    with a `category` so the frontend can show the full feed AND filter down
+    to just the job-offer/resignation subset without a second round-trip.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, actor, action, detail, created_at
+            FROM system_audit_log
+            WHERE action = ANY($1::text[])
+            ORDER BY created_at DESC
+            LIMIT 200
+        """, list(BETACORP_ACTIONS))
+
+    def to_dict(r):
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat()
+        d["detail"] = json.loads(d["detail"]) if isinstance(d["detail"], str) else dict(d["detail"])
+        d["category"] = "job_offer_resignation" if d["action"] in JOB_OFFER_RESIGNATION_ACTIONS else "pay_gap_flag"
+        return d
+
+    return {"news": [to_dict(r) for r in rows]}
+
+
+@app.get("/api/external-world/customers")
+async def external_world_customers(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    """Customer pipeline / at-risk list — sortable client-side by status/risk."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT c.id, c.company_name, c.contact_name, c.contact_email, c.relationship_status,
+                   c.deal_size, c.akaunting_transaction_id, c.support_sla_hours, c.created_at,
+                   sr.name AS sales_rep, sp.name AS support_rep
+            FROM customers c
+            LEFT JOIN employees sr ON sr.id = c.assigned_sales_rep_id
+            LEFT JOIN employees sp ON sp.id = c.assigned_support_rep_id
+            ORDER BY c.relationship_status, c.created_at DESC
+        """)
+
+    def to_dict(r):
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat()
+        if d["deal_size"] is not None:
+            d["deal_size"] = float(d["deal_size"])
+        return d
+
+    return {"customers": [to_dict(r) for r in rows]}
+
+
+@app.get("/api/external-world/revenue-by-customer")
+async def external_world_revenue_by_customer(
+    _user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)
+):
+    """
+    One bar per customer: joins narrative-db's customers table to Akaunting's
+    ak_transactions via customers.akaunting_transaction_id — the same revenue
+    data Phase 31's customer-pipeline-revenue.json panel reads (that panel
+    only shows an aggregate total; this is its per-customer breakdown using
+    the identical MySQLAkaunting data source and 'income'/deleted_at=NULL
+    filter, not a re-derivation of different numbers).
+    """
+    async with pool.acquire() as conn:
+        customers = await conn.fetch("""
+            SELECT id, company_name, relationship_status, akaunting_transaction_id
+            FROM customers
+            WHERE akaunting_transaction_id IS NOT NULL
+        """)
+
+    if not customers:
+        return {"revenue_by_customer": [], "error": None}
+    if _mysql_pool is None:
+        return {"revenue_by_customer": [], "error": "Akaunting MariaDB connection not available"}
+
+    tx_ids = [c["akaunting_transaction_id"] for c in customers]
+    result = []
+    try:
+        async with _mysql_pool.acquire() as mysql_conn:
+            async with mysql_conn.cursor(aiomysql.DictCursor) as cur:
+                placeholders = ",".join(["%s"] * len(tx_ids))
+                await cur.execute(
+                    f"SELECT id, amount FROM ak_transactions "
+                    f"WHERE id IN ({placeholders}) AND type = 'income' AND deleted_at IS NULL",
+                    tx_ids,
+                )
+                rows = await cur.fetchall()
+        amounts_by_tx_id = {str(r["id"]): float(r["amount"]) for r in rows}
+        for c in customers:
+            amount = amounts_by_tx_id.get(str(c["akaunting_transaction_id"]))
+            if amount is not None:
+                result.append({
+                    "customer_id": c["id"],
+                    "company_name": c["company_name"],
+                    "relationship_status": c["relationship_status"],
+                    "revenue": amount,
+                })
+        result.sort(key=lambda r: r["revenue"], reverse=True)
+        return {"revenue_by_customer": result, "error": None}
+    except Exception as exc:
+        return {"revenue_by_customer": [], "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Phase 35: KPI/Performance tab
+#
+# Scoreboards read kpi_snapshots directly (same no-owning-service-for-reads
+# pattern as every other tab). Review-mode toggle proxies kpi-engine's new
+# Phase 35 /config/review-mode endpoints (backed by the kpi_engine_config
+# table added in migration 011) rather than duplicating that logic here.
+# ---------------------------------------------------------------------------
+KPI_SCOREBOARD_LOOKBACK_DAYS = int(os.environ.get("KPI_SCOREBOARD_LOOKBACK_DAYS", "30"))
+
+
+@app.get("/api/kpi/department-scoreboard")
+async def kpi_department_scoreboard(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT entity_id AS department, metric, SUM(value) AS total, AVG(value) AS avg_value
+            FROM kpi_snapshots
+            WHERE entity_type = 'department'
+              AND snapshot_date >= NOW() - INTERVAL '{KPI_SCOREBOARD_LOOKBACK_DAYS} days'
+            GROUP BY entity_id, metric
+            ORDER BY entity_id, metric
+        """)
+    return {
+        "lookback_days": KPI_SCOREBOARD_LOOKBACK_DAYS,
+        "rows": [
+            {"department": r["department"], "metric": r["metric"],
+             "total": float(r["total"]), "avg": float(r["avg_value"])}
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/kpi/employee-scoreboard")
+async def kpi_employee_scoreboard(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(f"""
+            SELECT e.id AS employee_id, e.name, e.department, k.metric,
+                   SUM(k.value) AS total, AVG(k.value) AS avg_value
+            FROM kpi_snapshots k
+            JOIN employees e ON e.id::text = k.entity_id
+            WHERE k.entity_type = 'employee'
+              AND k.snapshot_date >= NOW() - INTERVAL '{KPI_SCOREBOARD_LOOKBACK_DAYS} days'
+            GROUP BY e.id, e.name, e.department, k.metric
+            ORDER BY e.department, e.name, k.metric
+        """)
+    return {
+        "lookback_days": KPI_SCOREBOARD_LOOKBACK_DAYS,
+        "rows": [
+            {"employee_id": r["employee_id"], "name": r["name"], "department": r["department"],
+             "metric": r["metric"], "total": float(r["total"]), "avg": float(r["avg_value"])}
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/kpi/review-log")
+async def kpi_review_log(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    """
+    Past raises applied via Phase 23's formula. Tier isn't a separate audit-log
+    column — kpi-engine's reason string already embeds it
+    ("performance_review: top_quartile in Engineering (rank 1/5)") — parse it
+    out here so the UI can show a clean tier badge without re-deriving the
+    formula.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, actor, action, detail, created_at
+            FROM system_audit_log
+            WHERE action IN ('review_raise_applied', 'review_raise_queued')
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)
+
+    def to_dict(r):
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat()
+        detail = json.loads(d["detail"]) if isinstance(d["detail"], str) else dict(d["detail"])
+        d["detail"] = detail
+        reason = detail.get("reason", "")
+        tier = "unknown"
+        for candidate in ("top_quartile", "second_quartile", "rest"):
+            if candidate in reason:
+                tier = candidate
+                break
+        d["tier"] = tier
+        return d
+
+    return {"reviews": [to_dict(r) for r in rows]}
+
+
+@app.get("/api/kpi/review-mode")
+async def kpi_review_mode(_user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.get(f"{KPI_ENGINE_URL}/config/review-mode", timeout=10.0)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"kpi-engine unreachable: {exc}")
+
+
+class ReviewModeBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/kpi/review-mode")
+async def kpi_set_review_mode(body: ReviewModeBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(
+            f"{KPI_ENGINE_URL}/config/review-mode",
+            json={"enabled": body.enabled, "actor": "principal"},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"kpi-engine unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 35: Company Direction tab
+#
+# company_directives is already versioned/append-only (Phase 13's migration
+# 002 gave it version/is_current/created_at/created_by columns from day one) —
+# no new migration needed here, confirmed by reading that migration and
+# human-bridge's existing /action/update-directive writer before building this.
+# Save proxies to human-bridge, which now also performs the Wiki.js
+# pinned-page sync (added in this same phase — see human-bridge/main.py).
+# ---------------------------------------------------------------------------
+@app.get("/api/company-direction/current")
+async def company_direction_current(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT id, content, version, created_at, created_by
+            FROM company_directives WHERE is_current = TRUE
+            ORDER BY version DESC LIMIT 1
+        """)
+    if row is None:
+        return {"current": None}
+    d = dict(row)
+    d["created_at"] = d["created_at"].isoformat()
+    return {"current": d}
+
+
+@app.get("/api/company-direction/history")
+async def company_direction_history(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, content, version, is_current, created_at, created_by
+            FROM company_directives
+            ORDER BY version DESC
+            LIMIT 100
+        """)
+
+    def to_dict(r):
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat()
+        return d
+
+    return {"history": [to_dict(r) for r in rows]}
+
+
+class SaveDirectiveBody(BaseModel):
+    content: str
+
+
+@app.post("/api/company-direction/save")
+async def company_direction_save(body: SaveDirectiveBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(
+            f"{HUMAN_BRIDGE_URL}/action/update-directive",
+            json={"content": body.content, "created_by": "principal"},
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"human-bridge unreachable: {exc}")
 
 
 # ---------------------------------------------------------------------------

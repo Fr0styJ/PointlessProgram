@@ -74,6 +74,118 @@ review of the diff and a fresh live re-verification.
 
 ---
 
+### 2026-08-01T01:20 — Phase 35 built and runtime-verified: External World / KPI / Company Direction dashboard tabs
+
+Built per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 35 feature list, adding three more tabs to the
+existing `dashboard/` shell (Phases 33/34) — no new service directory, confirmed the plan's own
+"likely no new service needed" expectation was correct.
+
+**External World tab** (`dashboard/main.py` `/api/external-world/*`):
+- BetaCorp news feed + job-offer/resignation log: both read `system_audit_log` filtered to
+  `betacorp_offer_sent`/`employee_resigned_betacorp`/`pay_gap_flag_raised`, tagged with a
+  `category` field so one query serves both list views without a second round-trip.
+- Customer pipeline / at-risk table: direct read of `customers` joined to `employees` for
+  sales/support rep names, sortable client-side by status or deal size.
+- Revenue-by-customer chart (recharts `BarChart`, new npm dependency added to
+  `dashboard/frontend/package.json`): joins `customers.akaunting_transaction_id` (set once by
+  `accounting-engine.post_revenue()`) to Akaunting's `ak_transactions` table, reading Akaunting's
+  MariaDB directly via a new `aiomysql` pool — same `income`/`deleted_at IS NULL` filter and
+  `akaunting-db` credentials Phase 31's `customer-pipeline-revenue.json` Grafana panel already
+  uses, per the plan's explicit "reuse that query, don't re-derive" instruction. Required adding
+  `net_dmz` to `dashboard`'s networks in `docker-compose.yml` (it previously only had
+  `net_mgmt`/`net_clients`/`net_data`) plus `AKAUNTING_DB_HOST/NAME/USER/PASSWORD` env vars.
+  Verified against the live customer seed data (all 6 seeded customers are still `prospect` with
+  no closed deals) — endpoint correctly returns `{"revenue_by_customer": [], "error": null}` with
+  zero rows rather than erroring, and the MySQL connection itself was confirmed working via the
+  `department`-scoped `kpi_snapshots.revenue_posted` row showing `0.00`, consistent with no
+  Akaunting income transactions existing yet in this environment.
+
+**KPI/Performance tab** (`dashboard/main.py` `/api/kpi/*`, `kpi-engine/main.py`):
+- Department/employee scoreboards: direct `kpi_snapshots` reads (30-day lookback, `SUM`/`AVG` per
+  metric), matching every other tab's "no owning service for reads" convention.
+- Performance-review log: reads `system_audit_log` for `review_raise_applied`/`review_raise_queued`
+  rows; tier (top/second_quartile/rest) isn't its own column, so it's parsed out of kpi-engine's
+  existing `reason` string (`"performance_review: top_quartile in Engineering (rank 1/5)"`) rather
+  than re-deriving the formula.
+- **Automatic vs. review-and-approve toggle, made live-switchable**: confirmed
+  `KPI_REVIEW_APPROVAL_MODE` was genuinely env-var-only (Phase 23, `PLAN_REMAINING_PHASES.md` line
+  150-152's flagged gap). Added `narrative-db/migrations/011_kpi_engine_config.sql` (single-row
+  `kpi_engine_config` table — confirmed 010 was the last-applied migration before choosing 011) and
+  new `kpi-engine` endpoints `GET/POST /config/review-mode`, backed by
+  `get_review_approval_mode()`/`set_review_approval_mode()`. `apply_review_raises()` now reads the
+  live DB value every run instead of the old module-level constant. Dashboard proxies both
+  endpoints. **Verified end-to-end, not just cosmetically**: toggled to `true` via the dashboard
+  API, confirmed the Postgres row changed (`kpi_engine_config.review_approval_mode = t`), then
+  called kpi-engine's own `/reviews/run` directly inside its container — response showed
+  `"approval_mode":true` and every top/second-quartile raise landed in `queued` (i.e. into
+  `pending_approvals`) instead of `applied`, proving the toggle actually changes kpi-engine's
+  runtime behavior with zero restart. Toggled back to `false` afterward to restore the environment's
+  prior default state.
+
+**Company Direction tab** (`dashboard/main.py` `/api/company-direction/*`, `human-bridge/main.py`):
+- **Versioning decision**: read migration 002 (`narrative_core.sql`) in full before building —
+  `company_directives` was already versioned/append-only from Phase 13 day one (`version`,
+  `is_current`, `created_at`, `created_by` columns), and `human-bridge`'s existing
+  `/action/update-directive` endpoint already inserts a new row and flips the old one's
+  `is_current` to false correctly. **No new migration needed for this table** — the plan's
+  contingency ("if it's currently a single mutable row, add a history table") didn't apply.
+  History view is simply `ORDER BY version DESC` against the existing table.
+- **Wiki.js pinned-page sync — was a real TODO, not actually built anywhere.** Grepped the whole
+  repo for any existing company_directives→Wiki.js sync per the task's instruction to reuse one if
+  it existed: found none — `human-bridge`'s own docstring said `"(TODO: Phase 30 branding sync)"`
+  and Phase 30 (branding-manager) never touched it either. Implemented a real create-or-update sync
+  in `human-bridge/main.py` (`_sync_directive_to_wikijs`, called from `/action/update-directive`
+  after the Postgres write commits): lists Wiki.js pages, finds path `company-direction` if it
+  exists (`pages.update`) or creates it (`pages.create`). **Bug found and fixed during
+  verification**: `pages.create`'s GraphQL schema requires `isPrivate: Boolean!` — omitting it
+  fails validation with `"Field \"create\" argument \"isPrivate\" ... is required"` (a new instance
+  of the same "Wiki.js mutations need nearly their full field set" gotcha `important.md` #3 already
+  documents for `pages.update`, now confirmed true for `pages.create` too). Fixed by adding
+  `isPrivate: False` to both the create and update variable sets.
+  Wiki.js sync failures don't roll back the directive save (Postgres write already committed by
+  that point) — surfaced as a non-fatal `wiki_sync_error` field in the save response instead, shown
+  as a toast in the UI.
+- **Verified end-to-end**: saved three successive directive versions via the dashboard API
+  (versions 2, 3, 4 — version 1 was Phase 13's seed row). First save exercised the `pages.create`
+  path (found and fixed the `isPrivate` bug here), second exercised `pages.update` on the same page
+  id. Queried Wiki.js directly (`pages.single(id: 49)`) after each save and confirmed its `content`
+  field exactly matched the just-saved directive text both times. History endpoint correctly showed
+  all 4 versions with the right `is_current` flag on the latest.
+
+**docker-compose.yml changes**: added `net_dmz` to `dashboard`'s networks; added
+`EXTERNAL_WORLD_URL`, `KPI_ENGINE_URL`, `HUMAN_BRIDGE_URL`, `AKAUNTING_DB_HOST/NAME/USER/PASSWORD`
+env vars to `dashboard`. No new service — confirmed the plan's "likely no new service needed" note.
+
+**A real, unrelated build-environment bug found and fixed while verifying**: the
+`narrative-db-migrate` init container's checksum-gated migration runner
+(`narrative-db/migrate.py`, `file_checksum()`) hashes raw file bytes, and this session's git
+worktree checkout had inconsistent line endings vs. the main checkout for several already-applied
+migration files (`001`-`005` were LF in the main checkout but had been checked out as CRLF in this
+worktree; `006`-`010` were already CRLF in both). This tripped a false "CHECKSUM MISMATCH for
+already-applied migration" abort purely from a local checkout artifact, not a real content change.
+Fixed by re-copying the exact bytes of `001`-`010` from the main checkout into the worktree before
+building the migration image (confirmed via `git diff` that this produced zero real content
+changes) — flagging here since a future worktree-based session could hit the identical false
+abort and might otherwise be tempted to "fix" it by touching an already-applied migration file,
+which `migrate.py` explicitly forbids.
+
+**Known pre-existing, unrelated issue** (not fixed here, not this phase's job): a separate
+in-flight worktree is fixing a bug in `accounting-engine/main.py`'s Akaunting `payment_method`
+handling — this phase's revenue-by-customer chart would be affected once real revenue transactions
+exist and get posted through that path, but no such transactions exist yet in this environment (all
+seeded customers are still `prospect`), so this phase's own testing never actually hit that bug.
+
+**Files touched**: `dashboard/main.py`, `dashboard/requirements.txt`,
+`dashboard/frontend/src/{App.tsx,api.ts,styles.css}`, `dashboard/frontend/package.json`,
+`kpi-engine/main.py`, `human-bridge/main.py`, `narrative-db/migrations/011_kpi_engine_config.sql`
+(new), `docker-compose.yml`.
+
+**Next**: Phase 36 — Chaos, Data Management, Branding tabs (per the plan, the best-supported
+remaining phase — Phases 27/28/29/30 were all built with their dashboard tab as a thin wiring
+exercise already in mind).
+
+---
+
 ### 2026-08-01T01:15 — Phase 34 built and runtime-verified: HR / Payroll / Accounting dashboard tabs
 
 Built per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 34 feature list, adding three tabs to the

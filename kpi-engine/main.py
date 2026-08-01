@@ -79,7 +79,11 @@ KPI_REVIEW_LOOKBACK_DAYS = int(os.environ.get("KPI_REVIEW_LOOKBACK_DAYS", "30"))
 KPI_REVIEW_UNDERPERFORM_PERCENTILE = Decimal(os.environ.get("KPI_REVIEW_UNDERPERFORM_PERCENTILE", "0.10"))
 # "review & approve" toggle — off (auto-apply) by default per spec §12.2 ("runs fully
 # automatically by default; dashboard toggle available for review & approve mode").
-KPI_REVIEW_APPROVAL_MODE = os.environ.get("KPI_REVIEW_APPROVAL_MODE", "off").lower() in ("on", "true", "1")
+# This env var is now only the SEED default for kpi_engine_config's single row
+# (Phase 35 migration 011) — the live value is read from that table so the
+# dashboard's toggle can flip it without a container restart. See
+# get_review_approval_mode() / set_review_approval_mode() below.
+KPI_REVIEW_APPROVAL_MODE_ENV_DEFAULT = os.environ.get("KPI_REVIEW_APPROVAL_MODE", "off").lower() in ("on", "true", "1")
 
 # Composite score weights — plain-code, deterministic, no LLM (spec §12.1/12.2).
 KPI_WEIGHT_TICKETS_RESOLVED = Decimal(os.environ.get("KPI_WEIGHT_TICKETS_RESOLVED", "1.0"))
@@ -305,6 +309,36 @@ async def audit_log(conn: asyncpg.Connection, actor: str, action: str, detail: d
         "INSERT INTO system_audit_log (actor, action, detail) VALUES ($1, $2, $3)",
         actor, action, json.dumps(detail, default=str)
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 35: live review-mode config (kpi_engine_config, migration 011)
+# ---------------------------------------------------------------------------
+async def get_review_approval_mode(pool: asyncpg.Pool) -> bool:
+    """
+    Reads the live review-mode flag from kpi_engine_config. Falls back to the
+    env-var default if the row somehow doesn't exist yet (e.g. migration ran
+    but this is the very first call in a race) rather than erroring.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT review_approval_mode FROM kpi_engine_config WHERE id = 1")
+        if row is None:
+            return KPI_REVIEW_APPROVAL_MODE_ENV_DEFAULT
+        return bool(row["review_approval_mode"])
+
+
+async def set_review_approval_mode(pool: asyncpg.Pool, enabled: bool, actor: str = "principal") -> bool:
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO kpi_engine_config (id, review_approval_mode, updated_at, updated_by)
+            VALUES (1, $1, NOW(), $2)
+            ON CONFLICT (id) DO UPDATE
+                SET review_approval_mode = EXCLUDED.review_approval_mode,
+                    updated_at = NOW(),
+                    updated_by = EXCLUDED.updated_by
+        """, enabled, actor)
+        await audit_log(conn, actor, "kpi_review_mode_changed", {"review_approval_mode": enabled})
+    return enabled
 
 
 async def write_snapshot(
@@ -600,6 +634,7 @@ async def apply_review_raises(pool: asyncpg.Pool, http: httpx.AsyncClient, as_of
     applied = []
     queued = []
     skipped = []
+    approval_mode = await get_review_approval_mode(pool)
 
     async with pool.acquire() as conn:
         for c in candidates:
@@ -609,7 +644,7 @@ async def apply_review_raises(pool: asyncpg.Pool, http: httpx.AsyncClient, as_of
             new_pay = round(Decimal(str(c["pay_rate"])) * (Decimal("1") + Decimal(str(c["raise_pct"]))), 2)
             reason = f"performance_review: {c['tier']} in {c['department']} (rank {c['dept_rank']}/{c['dept_size']})"
 
-            if KPI_REVIEW_APPROVAL_MODE:
+            if approval_mode:
                 idem = f"review-raise:{c['employee_id']}:{(as_of or datetime.now(timezone.utc)).date().isoformat()}"
                 existing = await conn.fetchrow(
                     "SELECT id FROM pending_approvals WHERE idempotency_key = $1", idem
@@ -654,7 +689,7 @@ async def apply_review_raises(pool: asyncpg.Pool, http: httpx.AsyncClient, as_of
 
     return {
         "status": "complete",
-        "approval_mode": KPI_REVIEW_APPROVAL_MODE,
+        "approval_mode": approval_mode,
         "applied": applied,
         "queued": queued,
         "skipped": skipped,
@@ -730,6 +765,27 @@ async def rollup_run_endpoint(req: RollupRequest, pool: PoolDep):
         await wiki.close()
         await mattermost.close()
         await akaunting.close()
+
+
+class ReviewModeRequest(BaseModel):
+    enabled: bool
+    actor: str = "principal"
+
+
+@app.get("/config/review-mode")
+async def get_review_mode_endpoint(pool: PoolDep):
+    """Phase 35: dashboard KPI tab reads this to render the automatic vs
+    review-and-approve toggle's current state."""
+    return {"approval_mode": await get_review_approval_mode(pool)}
+
+
+@app.post("/config/review-mode")
+async def set_review_mode_endpoint(req: ReviewModeRequest, pool: PoolDep):
+    """Phase 35: dashboard KPI tab's toggle writes here — live-switches the
+    flag apply_review_raises() reads on its next run, no container restart
+    needed (replaces the old KPI_REVIEW_APPROVAL_MODE env-var-only behavior)."""
+    new_value = await set_review_approval_mode(pool, req.enabled, req.actor)
+    return {"approval_mode": new_value}
 
 
 @app.get("/reviews/due")

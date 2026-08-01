@@ -1,15 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
 import ForceGraph2D from "react-force-graph-2d";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import {
   api,
   AccountingSummary,
+  CompanyDirectiveCurrent,
+  CompanyDirectiveHistory,
   EmployeeRosterRow,
+  ExternalWorldCustomers,
+  ExternalWorldNews,
   HrRelationships,
+  KpiDepartmentScoreboard,
+  KpiEmployeeScoreboard,
+  KpiReviewLog,
   LlmSpend,
   LlmStatus,
   NarrativeSummary,
   PayrollEmployeeRow,
   PayrollHistory,
+  RevenueByCustomer,
   SimulationStatus,
 } from "./api";
 
@@ -23,9 +32,11 @@ const NAV_ITEMS = [
   { key: "hr", label: "HR / Org Chart" },
   { key: "payroll", label: "Payroll" },
   { key: "accounting", label: "Accounting" },
+  { key: "external-world", label: "External World" },
+  { key: "kpi", label: "KPI / Performance" },
+  { key: "company-direction", label: "Company Direction" },
   { key: "settings", label: "Settings" },
-  // Future phases plug in here: External World, KPI/Performance, Company
-  // Direction, Chaos, Data Management, Branding, TV...
+  // Future phases plug in here: Chaos, Data Management, Branding, TV...
 ] as const;
 
 type TabKey = (typeof NAV_ITEMS)[number]["key"];
@@ -56,6 +67,9 @@ export default function App() {
         {tab === "hr" && <HrTab />}
         {tab === "payroll" && <PayrollTab />}
         {tab === "accounting" && <AccountingTab />}
+        {tab === "external-world" && <ExternalWorldTab />}
+        {tab === "kpi" && <KpiTab />}
+        {tab === "company-direction" && <CompanyDirectionTab />}
         {tab === "settings" && <SettingsTab />}
       </main>
     </div>
@@ -937,6 +951,441 @@ function AccountingTab() {
           </div>
         </>
       )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 35: External World tab
+// ---------------------------------------------------------------------------
+function ExternalWorldTab() {
+  const [news, setNews] = useState<ExternalWorldNews | null>(null);
+  const [customers, setCustomers] = useState<ExternalWorldCustomers | null>(null);
+  const [revenue, setRevenue] = useState<RevenueByCustomer | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [customerSort, setCustomerSort] = useState<"relationship_status" | "deal_size">("relationship_status");
+
+  useEffect(() => {
+    const load = () => {
+      api.externalWorldNews().then(setNews).catch((e) => setErr(String(e)));
+      api.externalWorldCustomers().then(setCustomers).catch((e) => setErr(String(e)));
+      api.externalWorldRevenueByCustomer().then(setRevenue).catch((e) => setErr(String(e)));
+    };
+    load();
+    const id = setInterval(load, 20000);
+    return () => clearInterval(id);
+  }, []);
+
+  const sortedCustomers = useMemo(() => {
+    if (!customers) return [];
+    const rows = [...customers.customers];
+    if (customerSort === "deal_size") {
+      rows.sort((a, b) => (b.deal_size ?? 0) - (a.deal_size ?? 0));
+    } else {
+      rows.sort((a, b) => a.relationship_status.localeCompare(b.relationship_status));
+    }
+    return rows;
+  }, [customers, customerSort]);
+
+  const jobOfferNews = news?.news.filter((n) => n.category === "job_offer_resignation") ?? [];
+
+  return (
+    <section>
+      <h1>External World</h1>
+      {err && <ErrorBanner message={err} />}
+
+      <div className="card">
+        <h2>BetaCorp News Feed ({news?.news.length ?? 0})</h2>
+        {news && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Event</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {news.news.map((n) => (
+                <tr key={n.id} className={n.category === "job_offer_resignation" ? "row-crisis" : ""}>
+                  <td>{new Date(n.created_at).toLocaleString()}</td>
+                  <td>{n.action}</td>
+                  <td>
+                    {n.detail.name ? `${n.detail.name}: ` : ""}
+                    {n.detail.gap_pct !== undefined ? `${n.detail.gap_pct}% below benchmark` : ""}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Job Offers / Resignations ({jobOfferNews.length})</h2>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Event</th>
+              <th>Employee</th>
+            </tr>
+          </thead>
+          <tbody>
+            {jobOfferNews.map((n) => (
+              <tr key={n.id}>
+                <td>{new Date(n.created_at).toLocaleString()}</td>
+                <td>{n.action === "betacorp_offer_sent" ? "Job offer sent" : "Resigned"}</td>
+                <td>{n.detail.name ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <div className="card-header-row">
+          <h2>Customer Pipeline / At-Risk ({sortedCustomers.length})</h2>
+          <select
+            className="form-input form-input-small"
+            value={customerSort}
+            onChange={(e) => setCustomerSort(e.target.value as any)}
+          >
+            <option value="relationship_status">Sort: Status</option>
+            <option value="deal_size">Sort: Deal size</option>
+          </select>
+        </div>
+        {customers && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Company</th>
+                <th>Status</th>
+                <th>Deal size</th>
+                <th>Sales rep</th>
+                <th>Support rep</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedCustomers.map((c) => (
+                <tr key={c.id} className={c.relationship_status === "at_risk" || c.relationship_status === "churned" ? "row-crisis" : ""}>
+                  <td>{c.company_name}</td>
+                  <td>
+                    <span className={`badge badge-status-${c.relationship_status.replace(/_/g, "-")}`}>
+                      {c.relationship_status}
+                    </span>
+                  </td>
+                  <td>{c.deal_size !== null ? `$${c.deal_size.toFixed(2)}` : "—"}</td>
+                  <td>{c.sales_rep ?? "—"}</td>
+                  <td>{c.support_rep ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Revenue by Customer</h2>
+        {revenue?.error && <ErrorBanner message={revenue.error} />}
+        {revenue && revenue.revenue_by_customer.length > 0 && (
+          <div style={{ width: "100%", height: 320 }}>
+            <ResponsiveContainer>
+              <BarChart data={revenue.revenue_by_customer}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#2a2e37" />
+                <XAxis dataKey="company_name" tick={{ fill: "#b7bdc9", fontSize: 11 }} interval={0} angle={-20} textAnchor="end" height={70} />
+                <YAxis tick={{ fill: "#b7bdc9", fontSize: 11 }} />
+                <Tooltip contentStyle={{ background: "#171a21", border: "1px solid #2a2e37" }} />
+                <Bar dataKey="revenue" fill="#2f6fed" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+        {revenue && revenue.revenue_by_customer.length === 0 && !revenue.error && (
+          <p className="hint">No customers with posted revenue yet.</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 35: KPI / Performance tab
+// ---------------------------------------------------------------------------
+function KpiTab() {
+  const [deptScoreboard, setDeptScoreboard] = useState<KpiDepartmentScoreboard | null>(null);
+  const [empScoreboard, setEmpScoreboard] = useState<KpiEmployeeScoreboard | null>(null);
+  const [reviewLog, setReviewLog] = useState<KpiReviewLog | null>(null);
+  const [approvalMode, setApprovalMode] = useState<boolean | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [toggling, setToggling] = useState(false);
+  const [empSortMetric, setEmpSortMetric] = useState<string>("");
+
+  const load = () => {
+    api.kpiDepartmentScoreboard().then(setDeptScoreboard).catch((e) => setErr(String(e)));
+    api.kpiEmployeeScoreboard().then((d) => {
+      setEmpScoreboard(d);
+      // Default to whatever metric actually has data — a hardcoded default
+      // (e.g. "tickets_resolved") can legitimately have zero rows in a given
+      // lookback window while the dropdown still visually shows its first
+      // option, which reads as a bug even though it's a filter mismatch.
+      setEmpSortMetric((current) => {
+        const metrics = Array.from(new Set(d.rows.map((r) => r.metric))).sort();
+        return current && metrics.includes(current) ? current : metrics[0] ?? "";
+      });
+    }).catch((e) => setErr(String(e)));
+    api.kpiReviewLog().then(setReviewLog).catch((e) => setErr(String(e)));
+    api.kpiReviewMode().then((r) => setApprovalMode(r.approval_mode)).catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const toggleMode = async () => {
+    if (approvalMode === null) return;
+    setToggling(true);
+    try {
+      const r = await api.kpiSetReviewMode(!approvalMode);
+      setApprovalMode(r.approval_mode);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setToggling(false);
+    }
+  };
+
+  const empRows = useMemo(() => {
+    if (!empScoreboard) return [];
+    return empScoreboard.rows
+      .filter((r) => r.metric === empSortMetric)
+      .sort((a, b) => b.total - a.total);
+  }, [empScoreboard, empSortMetric]);
+
+  const availableMetrics = useMemo(() => {
+    if (!empScoreboard) return [];
+    return Array.from(new Set(empScoreboard.rows.map((r) => r.metric))).sort();
+  }, [empScoreboard]);
+
+  return (
+    <section>
+      <h1>KPI / Performance</h1>
+      {err && <ErrorBanner message={err} />}
+
+      <div className="card">
+        <h2>Automatic vs. Review &amp; Approve Mode</h2>
+        <p className="hint">
+          When on, performance-review raises are queued into the expense-approval queue instead of
+          applying immediately. Writes to kpi-engine's kpi_engine_config table — takes effect
+          immediately, no container restart needed.
+        </p>
+        {approvalMode !== null && (
+          <div className="stat-row">
+            <div className="stat">
+              <div className="stat-label">Current mode</div>
+              <div className="stat-value">{approvalMode ? "Review & Approve" : "Automatic"}</div>
+            </div>
+            <button className="action-btn" disabled={toggling} onClick={toggleMode}>
+              {toggling ? "Switching..." : `Switch to ${approvalMode ? "Automatic" : "Review & Approve"}`}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Department Scoreboard ({deptScoreboard?.lookback_days ?? 30}-day lookback)</h2>
+        {deptScoreboard && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Department</th>
+                <th>Metric</th>
+                <th>Total</th>
+                <th>Avg (daily)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {deptScoreboard.rows.map((r, i) => (
+                <tr key={i}>
+                  <td>{r.department}</td>
+                  <td>{r.metric}</td>
+                  <td>{r.total.toFixed(2)}</td>
+                  <td>{r.avg.toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-header-row">
+          <h2>Employee Scoreboard</h2>
+          <select
+            className="form-input form-input-small"
+            value={empSortMetric}
+            onChange={(e) => setEmpSortMetric(e.target.value)}
+          >
+            {availableMetrics.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Department</th>
+              <th>Metric</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {empRows.map((r) => (
+              <tr key={r.employee_id}>
+                <td>{r.name}</td>
+                <td>{r.department}</td>
+                <td>{r.metric}</td>
+                <td>{r.total.toFixed(2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <h2>Performance-Review Log ({reviewLog?.reviews.length ?? 0})</h2>
+        {reviewLog && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Tier</th>
+                <th>Action</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {reviewLog.reviews.map((r) => (
+                <tr key={r.id}>
+                  <td>{new Date(r.created_at).toLocaleString()}</td>
+                  <td>
+                    <span className={`badge badge-status-${r.tier === "top_quartile" ? "active" : r.tier === "second_quartile" ? "on-pto" : "vacant"}`}>
+                      {r.tier}
+                    </span>
+                  </td>
+                  <td>{r.action}</td>
+                  <td>
+                    {r.detail.new_pay !== undefined ? `$${r.detail.new_pay}` : ""}
+                    {r.detail.reason ? ` (${r.detail.reason})` : ""}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 35: Company Direction tab
+// ---------------------------------------------------------------------------
+function CompanyDirectionTab() {
+  const [current, setCurrent] = useState<CompanyDirectiveCurrent | null>(null);
+  const [history, setHistory] = useState<CompanyDirectiveHistory | null>(null);
+  const [text, setText] = useState("");
+  const [err, setErr] = useState<string | null>(null);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+
+  const load = () => {
+    api.companyDirectionCurrent().then((d) => {
+      setCurrent(d);
+      if (d.current) setText(d.current.content);
+    }).catch((e) => setErr(String(e)));
+    api.companyDirectionHistory().then(setHistory).catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const save = async () => {
+    setBusy(true);
+    setSaveMsg(null);
+    try {
+      const r: any = await api.companyDirectionSave(text);
+      if (r.wiki_sync_error) {
+        setSaveMsg(`Saved as version ${r.version}, but Wiki.js sync failed: ${r.wiki_sync_error}`);
+      } else {
+        setSaveMsg(`Saved as version ${r.version} — Wiki.js pinned page synced.`);
+      }
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <h1>Company Direction</h1>
+      {err && <ErrorBanner message={err} />}
+      {saveMsg && <div className="toast">{saveMsg}</div>}
+
+      <div className="card">
+        <h2>Current Directive {current?.current ? `(version ${current.current.version})` : ""}</h2>
+        <textarea
+          className="form-input"
+          style={{ minHeight: 160, resize: "vertical" }}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+        />
+        <button className="action-btn" disabled={busy || !text.trim()} onClick={save}>
+          {busy ? "Saving..." : "Save"}
+        </button>
+        <p className="hint">
+          Saving writes a new version to company_directives (previous version marked not-current —
+          nothing is overwritten) and syncs the "Company Direction" pinned Wiki.js page.
+        </p>
+      </div>
+
+      <div className="card">
+        <div className="card-header-row">
+          <h2>History ({history?.history.length ?? 0} versions)</h2>
+          <button className="action-btn" onClick={() => setShowHistory((s) => !s)}>
+            {showHistory ? "Hide" : "Show"}
+          </button>
+        </div>
+        {showHistory && history && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Version</th>
+                <th>When</th>
+                <th>By</th>
+                <th>Content</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.history.map((h) => (
+                <tr key={h.id} className={h.is_current ? "row-pto" : ""}>
+                  <td>{h.version}{h.is_current ? " (current)" : ""}</td>
+                  <td>{new Date(h.created_at).toLocaleString()}</td>
+                  <td>{h.created_by}</td>
+                  <td>{h.content.slice(0, 160)}{h.content.length > 160 ? "…" : ""}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </section>
   );
 }

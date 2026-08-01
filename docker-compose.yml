@@ -1710,12 +1710,29 @@ services:
       ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
       AKAUNTING_COMPANY_ID: "${AKAUNTING_COMPANY_ID:-1}"
       AKAUNTING_PUBLIC_URL: "${AKAUNTING_PUBLIC_URL:-http://accounting.fakecorp.internal}"
+      # Phase 35: External World / KPI / Company Direction tabs.
+      # external-world and kpi-engine are both already on net_clients (shared
+      # with this container) — no new network needed for those two proxies.
+      EXTERNAL_WORLD_URL: "http://external-world:8000"
+      KPI_ENGINE_URL: "http://kpi-engine:8000"
+      # human-bridge (also net_clients) owns the company_directives write path
+      # + its Wiki.js pinned-page sync — proxy there rather than duplicating.
+      HUMAN_BRIDGE_URL: "http://human-bridge:8000"
+      # Revenue-by-customer chart reads Akaunting's MariaDB directly (same
+      # data/credentials Phase 31's Grafana MySQLAkaunting datasource and
+      # purge-manager/snapshot-manager already use) — needs net_dmz, which this
+      # container didn't previously have.
+      AKAUNTING_DB_HOST: "akaunting-db"
+      AKAUNTING_DB_NAME: "akaunting"
+      AKAUNTING_DB_USER: "akaunting"
+      AKAUNTING_DB_PASSWORD: "${AKAUNTING_DB_PASSWORD}"
     volumes:
       - ./litellm/config.yaml:/litellm-config/config.yaml:ro
     networks:
       - net_mgmt
       - net_clients
       - net_data
+      - net_dmz
     ports:
       - "8090:8000"   # host-published on net_mgmt, per this file's own network comment block
     healthcheck:

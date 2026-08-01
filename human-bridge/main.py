@@ -834,11 +834,85 @@ async def action_approve_expense(req: ApproveExpenseRequest, pool: PoolDep):
     return result
 
 
+COMPANY_DIRECTIVE_WIKI_PATH = os.environ.get("COMPANY_DIRECTIVE_WIKI_PATH", "company-direction")
+
+
+async def _sync_directive_to_wikijs(content: str, version: int) -> dict:
+    """
+    Phase 35: pinned Wiki.js page sync for company_directives, previously a TODO
+    left by this same endpoint (see the old docstring). Real create-or-update:
+    list pages to find an existing page at COMPANY_DIRECTIVE_WIKI_PATH, then
+    `pages.update` if found, `pages.create` otherwise. `pages.update` needs
+    nearly the full field set even when only content/description changes
+    (important.md gotcha #3) — send them all every time.
+    """
+    headers = {"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}", "Content-Type": "application/json"}
+    title = "Company Direction"
+    description = f"Current company directive (version {version}) — synced from the dashboard."
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        # `pages.list` takes no reliable path-filter arg across Wiki.js versions
+        # (unlike `pages.single(id)`) — fetch the full list and filter client-side,
+        # same approach kpi-engine's WikiJSClient uses (small page count, cheap).
+        list_resp = await http.post(f"{WIKIJS_URL}/graphql", headers=headers, json={
+            "query": "{ pages { list { id path } } }"
+        })
+        list_resp.raise_for_status()
+        pages = ((list_resp.json().get("data") or {}).get("pages") or {}).get("list") or []
+        existing = next((p for p in pages if p["path"] == COMPANY_DIRECTIVE_WIKI_PATH), None)
+
+        if existing:
+            r = await http.post(f"{WIKIJS_URL}/graphql", headers=headers, json={
+                "query": """
+                    mutation($id: Int!, $content: String!, $description: String!, $editor: String!,
+                             $isPrivate: Boolean!, $isPublished: Boolean!, $locale: String!,
+                             $path: String!, $tags: [String]!, $title: String!) {
+                        pages {
+                            update(id: $id, content: $content, description: $description, editor: $editor,
+                                   isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale,
+                                   path: $path, tags: $tags, title: $title) {
+                                responseResult { succeeded errorCode message }
+                            }
+                        }
+                    }
+                """,
+                "variables": {
+                    "id": existing["id"], "content": content, "description": description,
+                    "editor": "markdown", "isPrivate": False, "isPublished": True,
+                    "locale": "en", "path": COMPANY_DIRECTIVE_WIKI_PATH, "tags": ["company-direction", "pinned"],
+                    "title": title,
+                },
+            })
+        else:
+            r = await http.post(f"{WIKIJS_URL}/graphql", headers=headers, json={
+                "query": """
+                    mutation($content: String!, $description: String!, $editor: String!, $isPrivate: Boolean!,
+                             $isPublished: Boolean!, $locale: String!, $path: String!, $tags: [String]!, $title: String!) {
+                        pages {
+                            create(content: $content, description: $description, editor: $editor,
+                                   isPrivate: $isPrivate, isPublished: $isPublished, locale: $locale,
+                                   path: $path, tags: $tags, title: $title) {
+                                responseResult { succeeded errorCode message }
+                                page { id path }
+                            }
+                        }
+                    }
+                """,
+                "variables": {
+                    "content": content, "description": description, "editor": "markdown",
+                    "isPrivate": False, "isPublished": True, "locale": "en", "path": COMPANY_DIRECTIVE_WIKI_PATH,
+                    "tags": ["company-direction", "pinned"], "title": title,
+                },
+            })
+        r.raise_for_status()
+        return r.json()
+
+
 @app.post("/action/update-directive")
 async def action_update_directive(req: UpdateDirectiveRequest, pool: PoolDep):
     """
     Update the company directive. Previous version marked is_current=FALSE.
-    Spec §8: directive synced to pinned Wiki.js page (TODO: Phase 30 branding sync).
+    Spec §8: directive synced to a pinned Wiki.js page — Phase 35 implements the
+    sync for real (previously a TODO left here since Phase 17/30).
     """
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -856,7 +930,23 @@ async def action_update_directive(req: UpdateDirectiveRequest, pool: PoolDep):
                 "directive_id": directive_id, "version": new_version,
                 "content_preview": req.content[:200],
             })
-    return {"status": "updated", "version": new_version, "directive_id": directive_id}
+
+    wiki_sync_error = None
+    try:
+        await _sync_directive_to_wikijs(req.content, new_version)
+    except Exception as exc:
+        # Wiki.js sync failure should not roll back the directive update itself
+        # (the Postgres row is the source of truth) — surface the error to the
+        # caller instead so the dashboard can show it, but don't fail the save.
+        wiki_sync_error = str(exc)
+        log.error("Wiki.js sync failed for directive v%d: %s", new_version, exc)
+
+    return {
+        "status": "updated",
+        "version": new_version,
+        "directive_id": directive_id,
+        "wiki_sync_error": wiki_sync_error,
+    }
 
 
 @app.post("/action/trigger-meeting")

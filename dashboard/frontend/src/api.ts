@@ -213,6 +213,115 @@ export interface AccountingSummary {
   audit_log: PayrollHistoryEntry[];
 }
 
+// ---------------------------------------------------------------------------
+// Phase 35: External World / KPI / Company Direction types
+// ---------------------------------------------------------------------------
+export interface ExternalWorldNewsEntry {
+  id: number;
+  actor: string;
+  action: string;
+  detail: Record<string, any>;
+  created_at: string;
+  category: "job_offer_resignation" | "pay_gap_flag";
+}
+
+export interface ExternalWorldNews {
+  news: ExternalWorldNewsEntry[];
+}
+
+export interface CustomerRow {
+  id: number;
+  company_name: string;
+  contact_name: string;
+  contact_email: string;
+  relationship_status: string;
+  deal_size: number | null;
+  akaunting_transaction_id: string | null;
+  support_sla_hours: number;
+  created_at: string;
+  sales_rep: string | null;
+  support_rep: string | null;
+}
+
+export interface ExternalWorldCustomers {
+  customers: CustomerRow[];
+}
+
+export interface RevenueByCustomerRow {
+  customer_id: number;
+  company_name: string;
+  relationship_status: string;
+  revenue: number;
+}
+
+export interface RevenueByCustomer {
+  revenue_by_customer: RevenueByCustomerRow[];
+  error: string | null;
+}
+
+export interface KpiScoreRow {
+  metric: string;
+  total: number;
+  avg: number;
+}
+
+export interface KpiDepartmentRow extends KpiScoreRow {
+  department: string;
+}
+
+export interface KpiEmployeeRow extends KpiScoreRow {
+  employee_id: number;
+  name: string;
+  department: string;
+}
+
+export interface KpiDepartmentScoreboard {
+  lookback_days: number;
+  rows: KpiDepartmentRow[];
+}
+
+export interface KpiEmployeeScoreboard {
+  lookback_days: number;
+  rows: KpiEmployeeRow[];
+}
+
+export interface KpiReviewLogEntry {
+  id: number;
+  actor: string;
+  action: string;
+  detail: Record<string, any>;
+  created_at: string;
+  tier: string;
+}
+
+export interface KpiReviewLog {
+  reviews: KpiReviewLogEntry[];
+}
+
+export interface KpiReviewMode {
+  approval_mode: boolean;
+}
+
+export interface CompanyDirective {
+  id: number;
+  content: string;
+  version: number;
+  created_at: string;
+  created_by: string;
+}
+
+export interface CompanyDirectiveCurrent {
+  current: CompanyDirective | null;
+}
+
+export interface CompanyDirectiveHistoryEntry extends CompanyDirective {
+  is_current: boolean;
+}
+
+export interface CompanyDirectiveHistory {
+  history: CompanyDirectiveHistoryEntry[];
+}
+
 export const api = {
   simulationStatus: () => apiFetch<SimulationStatus>("/api/simulation/status"),
   tickPause: () => apiFetch("/api/simulation/tick/pause", { method: "POST" }),
@@ -254,5 +363,31 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ approval_id, actor: "principal" }),
+    }),
+
+  // Phase 35
+  externalWorldNews: () => apiFetch<ExternalWorldNews>("/api/external-world/news"),
+  externalWorldCustomers: () => apiFetch<ExternalWorldCustomers>("/api/external-world/customers"),
+  externalWorldRevenueByCustomer: () =>
+    apiFetch<RevenueByCustomer>("/api/external-world/revenue-by-customer"),
+
+  kpiDepartmentScoreboard: () => apiFetch<KpiDepartmentScoreboard>("/api/kpi/department-scoreboard"),
+  kpiEmployeeScoreboard: () => apiFetch<KpiEmployeeScoreboard>("/api/kpi/employee-scoreboard"),
+  kpiReviewLog: () => apiFetch<KpiReviewLog>("/api/kpi/review-log"),
+  kpiReviewMode: () => apiFetch<KpiReviewMode>("/api/kpi/review-mode"),
+  kpiSetReviewMode: (enabled: boolean) =>
+    apiFetch<KpiReviewMode>("/api/kpi/review-mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    }),
+
+  companyDirectionCurrent: () => apiFetch<CompanyDirectiveCurrent>("/api/company-direction/current"),
+  companyDirectionHistory: () => apiFetch<CompanyDirectiveHistory>("/api/company-direction/history"),
+  companyDirectionSave: (content: string) =>
+    apiFetch("/api/company-direction/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content }),
     }),
 };
