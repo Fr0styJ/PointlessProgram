@@ -47,6 +47,23 @@
 
 ---
 
+### 2026-08-01T04:00 — Merge note: Deep Links panel confirmed correct, but exposed a pre-existing `.env` completeness gap (Zammad/WordPress admin credentials never captured) — flagged for Phase 38
+
+While verifying Phase 37's merge into master, confirmed via a live `GET /api/deep-links` call that
+Mattermost, Wiki.js, Nextcloud, Akaunting, and Grafana all show correct real credentials straight
+from `.env` (several literally are the word `placeholder` — that's genuinely this environment's
+live password, not a bug). **Zammad and WordPress show blank username/password** — not a Phase 37
+code bug: `docker-compose.yml` already references `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD` and
+`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD` (with `:-` empty-string defaults), but `.env`
+itself never actually populated them — these two appliances' admin accounts were evidently set up
+through their own first-boot flows without the chosen credentials ever being written back into
+`.env`. Only `ZAMMAD_ADMIN_TOKEN` (an API token, not a login password) exists for Zammad; nothing
+at all exists for WordPress. This is the same class of gap already flagged as a Phase 38
+`.env.example` accuracy-audit task — recorded here so it's concretely actionable (exact two
+appliances, exact missing var names) rather than a vague "audit everything" note.
+
+---
+
 ### 2026-08-01T03:45 — Phase 37: TV wall, Errors panel, deep links, log tail — runtime-verified against the live stack
 
 Per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 37 section, including the 2026-08-01 sign-off
