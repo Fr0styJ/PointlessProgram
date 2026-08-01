@@ -125,13 +125,15 @@ rebuilt+recreated `dashboard`, `orchestrator`, `purge-manager`, `snapshot-manage
   same way (not separately fire-tested to avoid unnecessary churn once stop/start were proven).
   Trigger Event: fired a real `viral_complaint` scenario — created crisis thread #57, a real
   `crisis_response` meeting (2 real attendees, 2 action items), and a real pending expense-approval
-  request (id 15) through the normal accounting-engine approval path. **Found (pre-existing, not
-  introduced by this phase): `CHAOS_ALLOWED_CONTAINERS` in `orchestrator/main.py` still lists
-  `fakeco-zammad`, but the real running container is `fakeco-zammad-nginx` (Zammad decomposed into
-  multiple containers back in its own phase) — the status/stop/start/restart calls for "zammad"
-  silently no-op / report "not found" rather than acting on any real container. Pre-existing gap
-  from Phase 27, surfaced by this phase's live status-grid test; not fixed here since it's outside
-  Phase 36's scope and risks touching Phase 27's own container-naming assumptions.**
+  request (id 15) through the normal accounting-engine approval path. **Found and fixed during
+  merge (2026-08-01T03:40, pre-existing, not introduced by this phase)**: `CHAOS_ALLOWED_CONTAINERS`
+  in `orchestrator/main.py` still listed `fakeco-zammad`, but the real running container is
+  `fakeco-zammad-nginx` (Zammad decomposed into multiple containers back in its own phase) — the
+  status/stop/start/restart calls for "zammad" were silently no-op-ing / reporting "not found"
+  rather than acting on any real container. Pre-existing gap from Phase 27, surfaced by this
+  phase's live status-grid test; corrected to `fakeco-zammad-nginx` when merging Phase 36 into
+  master (this file was originally flagged, not fixed, by Phase 36's own agent since it wasn't
+  that phase's scope — fixed here as part of the merge instead).
 - Data Management: scoped-purge gate verified to reject a wrong confirm phrase (400, no purge
   ran). Snapshot Save tested for real — produced a real multi-GB snapshot with all 9 artifacts
   `ok: true` (narrative/mattermost/zammad/wikijs/nextcloud/wordpress/akaunting DB dumps +

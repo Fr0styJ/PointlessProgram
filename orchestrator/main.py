@@ -75,7 +75,7 @@ PENDING_ACTIONS_MAX_ATTEMPTS = int(os.environ.get("PENDING_ACTIONS_MAX_ATTEMPTS"
 # reasonably target are listed here.
 CHAOS_ALLOWED_CONTAINERS = {
     "fakeco-mattermost",
-    "fakeco-zammad",
+    "fakeco-zammad-nginx",
     "fakeco-wikijs",
     "fakeco-akaunting",
     "fakeco-nextcloud",
