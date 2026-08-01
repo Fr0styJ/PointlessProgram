@@ -52,6 +52,7 @@ node_modules/
 .next/
 dist/
 .cache/
+dashboard/static/
 
 # Logs (local dev runs)
 *.log
