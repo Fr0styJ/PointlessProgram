@@ -515,8 +515,10 @@ async def _poll_mattermost_once(pool: asyncpg.Pool) -> None:
             conversation_channels = []
 
         async with pool.acquire() as conn:
+            # Keep the complete employee record: _record_human_event() also
+            # needs department when it resolves or creates a narrative thread.
             employee_rows = await conn.fetch(
-                "SELECT id, name, email, mattermost_id FROM employees WHERE status = 'active'"
+                "SELECT * FROM employees WHERE status = 'active'"
             )
             employees_by_id = {emp["id"]: emp for emp in employee_rows}
             employees_by_mattermost_id = {

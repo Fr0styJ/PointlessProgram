@@ -13,6 +13,12 @@ pauses without consuming queued reactions until the user explicitly restarts it.
 
 ### Recently fixed
 
+- Mattermost now recognizes the actual dashboard-provided human login, discovers teamless direct
+  and group channels, routes one-to-one DMs without requiring a mention, and backfills recent
+  messages exactly once. The two existing Bob DMs are queued pending while LiteLLM is stopped.
+- Wiki.js localization is now repository-backed and offline: 798 generated/curated English
+  fallbacks survive fresh installs and resets, preserve valid DB translations, and invalidate both
+  stale i18next and application-bundle browser caches on rollout.
 - Principal Mattermost messages now receive in-character threaded employee replies.
 - Principal emails now receive in-character employee replies with correct mail threading headers.
 - Principal Zammad articles now receive employee-authored ticket replies.

@@ -49,6 +49,36 @@
 
 ---
 
+### 2026-08-01T06:55 — Fixed Mattermost DM detection and made Wiki.js localization fully offline/persistent
+
+Mattermost reactions previously watched the cross-appliance `PRINCIPAL_EMAIL` account and only
+enumerated team channels. The dashboard gives the human operator the Mattermost admin login, and
+Mattermost's account-wide REST listings omit teamless direct/group channels, so the user's two DMs
+to Bob were never detected. Human Bridge now resolves an appliance-specific
+`MATTERMOST_HUMAN_EMAIL` (defaulting to `MATTERMOST_ADMIN_EMAIL`), reads internal Mattermost
+channel membership data for D/G discovery, auto-targets the other employee in a one-to-one DM,
+and preserves explicit mention routing for group/team channels. First-run history is bounded to
+seven days/50 posts per channel; durable per-channel cursors plus stable post source references
+provide exact-once behavior. Live rollout exposed and fixed an integration bug where the reduced
+employee query omitted `department`, required by narrative-thread creation. Both existing Bob DMs
+then created exactly one pending reaction each; a second poll created no duplicates. LiteLLM
+remained stopped, so no response generation or paid inference occurred.
+
+The prior Wiki.js label repair was only a live database mutation and covered a small hand-curated
+set. The Compose service now builds a digest-pinned repository image which scans 745 installed
+Wiki.js asset/server files at build time, extracts 794 translation keys, and creates 798 deterministic
+offline English fallbacks across seven namespaces. Valid database translations retain precedence.
+The build fails closed if the pinned source layout/key count changes. Browser verification found two
+additional cache layers: i18next's 24-hour localStorage namespace and Wiki.js's hard-coded upstream
+`app.js` cache token. Both are versioned by the image patch. Final live browser verification rendered
+`Create Home Page` and `Go to Administration` with zero dotted raw keys on the tested screen.
+
+Verification: 29 Human Bridge reaction tests, two Python locale tests, JavaScript extractor tests,
+Compose validation, successful offline locale image build, live exact-once DB checks, GraphQL
+translation checks, and rendered browser UI. `fakeco-litellm` remained `exited` throughout.
+
+---
+
 ### 2026-08-01T06:10 — Added Zammad and Wiki.js Principal-reaction adapters; fixed Wiki automation revision-loop risk
 
 Two parallel agents reused the established chat/email reaction conventions to add
