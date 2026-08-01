@@ -8,7 +8,7 @@
 |---|—--|
 | **Current Phase** | Phases 1–23 and 27–37 are ALL built and runtime-verified against a live `docker compose` stack (39+ containers). Phase 24 (pay negotiation / performance-review-driven pay cuts) genuinely not started. Phase 32 (simulation speed slider, full integration) explicitly DEFERRED by user sign-off — see `Future_Plans.md`. Phase 38 (hardening) is the only remaining phase, not started. |
 | **Percent Complete** | ~92%. Every functional phase in the original plan (1-23, 27-31, 33-37) is built AND live-verified with real appliance calls, not just written. What's left: Phase 24 (a real but scoped feature gap), Phase 32 (deliberately deferred, not blocking), and Phase 38 (hardening/polish — the last checkbox before calling the build "done"). |
-| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). Bug status as of 2026-08-01T04:30 (3 of 5 originally-flagged Phase 38 bugs now fixed via 3 parallel bugfix agents, see LOG entries below for full detail): (1) ~~`.env` never captured `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD`~~ — **FIXED** 2026-08-01T04:30 (Zammad admin password reset via `rails runner`, WordPress admin account created via its install wizard, both verified live via the Deep Links panel); (2) uncaught ASGI/Starlette-level 500s emitting unparseable plaintext logs, invisible to the dashboard's Errors panel — **FIXED** 2026-08-01T04:15 (global `@app.exception_handler(Exception)` added to all 12 custom FastAPI services, logging via the existing JSON format so `level="ERROR"` is now extractable by promtail; verified a real unhandled exception now appears in Loki with a proper level label, while legitimate 4xx `HTTPException`s remain unaffected); (3) a pre-existing Roundcube provisioning gap (`roundcube` DB was never initialized, appliance times out) — still **UNFIXED**, deliberately held out of this bugfix batch as a larger provisioning task, tracked separately for Phase 38; (4) meeting-simulator's intermittent LLM-output-truncation issue on longer transcripts — **FIXED** 2026-08-01T04:12 (genuine retry-on-parse-failure with higher `max_tokens` and a conciseness follow-up prompt, confirmed live via a real failure→retry→success cycle in logs); (5) purge-manager's/snapshot-manager's pg_restore-error heuristic (blunt substring match on `"ERROR"`) — **FIXED** 2026-08-01T04:14 (replaced with an authoritative exit-code check plus `--single-transaction`, confirmed live against both a real success case and a real induced failure case). |
+| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). **All 5 originally-flagged Phase 38 bugs are now fixed** (as of 2026-08-01T04:53, via 5 parallel bugfix agents across two batches, see LOG entries below for full detail): (1) Zammad/WordPress `.env` credential gap — FIXED 04:30; (2) unhandled-exception logging invisible to Errors panel — FIXED 04:15; (3) Roundcube DB never initialized (gateway timeout) — FIXED 04:53 (DB created, real schema loaded directly from the container's own bundled SQL file); (4) meeting-simulator LLM-truncation flakiness — FIXED 04:12; (5) purge-manager/snapshot-manager pg_restore heuristic — FIXED 04:14. Three MORE real bugs were found and fixed via live manual testing of the dashboard's Deep Links panel after these 5: (6) Mattermost admin password was never actually captured correctly — FIXED (reset via `mmctl`); (7) Zammad "logs in then nothing happens" — FIXED 04:52 (its `fqdn` Setting was still the install default `zammad.example.com`, so ActionCable rejected the real browser's websocket `Origin` header after an otherwise-successful login — fixed via `rails runner`); (8) Wiki.js showing raw i18n keys (`actions.exit`, `comments.title`, etc.) instead of real labels — FIXED 04:35 (its cloud translation backend `graph.requarks.io` is long-discontinued and unreachable regardless of this stack's intentional no-internet-access policy; real English strings were hand-curated from the frontend's own key usage and loaded directly into Postgres); (9) Akaunting showing no data for the Principal's account — FIXED 04:35 (root cause: a composite unique index on `(email, deleted_at)` doesn't enforce uniqueness in MySQL/MariaDB when `deleted_at IS NULL` on both rows, so two duplicate `admin@fakecorp.internal` user rows existed; deduplicated, confirmed the real login flow resolves consistently and shows real transaction data). **A tenth item — real narrative-driven content creation for WordPress (posts) and Nextcloud (files/deliverables) — is a genuine feature gap, not a bug, and is being built separately** (dispatched to an independent Claude session as of 2026-08-01, not yet merged as of this entry). |
 | **Exact Next Action** | Phase 38 (hardening) — the last remaining phase. Scope: graceful error states across the dashboard (Phase 33's dashboard-wide Basic Auth is already done, this is about UX-level error handling, not auth), closing the Zammad/WordPress `.env`/`.env.example` credential-completeness gap above, first-boot/bootstrap polish (e.g. automating the currently-manual Mattermost/Wiki.js/Zammad admin-token bootstrap steps), and writing the top-level `README.md` including a dashboard walkthrough (no top-level README exists yet). Phase 24 and Phase 32 are separately-trackable outstanding items — neither blocks starting or finishing Phase 38. |
 | **BLOCKER** | None. Docker Desktop running. All appliance credentials/tokens are in `.env` (gitignored) — a fresh clone needs a real `.env` populated before `docker compose up` will do anything useful. |
 
@@ -103,6 +103,75 @@ same cookie-jar+CSRF Python technique end-to-end and signin still returns `201` 
 the app shell render — confidence is high (the allowed-origin log line now matches the real routed
 hostname exactly, which is the documented ActionCable rejection mechanism) but this is config/log
 verification, not a rendered-browser confirmation.
+
+---
+
+### 2026-08-01T04:35 — Fixed: Wiki.js raw i18n keys in UI + Akaunting duplicate admin user cleanup (Deep Links panel bugs)
+
+**Bug 1 — Wiki.js showing raw i18n keys (`actions.exit`, `comments.title`, `search.title`,
+`dashboard.title`) instead of translated labels.** Confirmed root cause from the prior diagnostic
+pass: Wiki.js 2.5.314 fetches ALL of its UI translation strings at startup from a cloud GraphQL
+backend (`WIKI.config.graphEndpoint` = `https://graph.requarks.io`, called from
+`server/jobs/sync-graph-locales.js` / `fetch-graph-locale.js`), and never ships them in the repo —
+confirmed via `server/locales/README.md` upstream (`requarks/wiki` on GitHub): "Localization files
+are not stored into files! Contact us on Gitter to request access." That cloud endpoint is Requarks'
+long-discontinued community translation service; it is not fetchable at all (checked via my own
+external tool access, not routed through any container) and this container correctly has no
+internet access anyway. With `fakeco-wikijs-db`'s `locales.strings` column empty (`{}`), i18next has
+no resource bundle for the `en` locale and the frontend falls back to raw keys.
+
+Fix: extracted the real literal key names Wiki.js's own frontend bundle references (grepped
+`/wiki/assets/js/{app,admin,comments}.js` inside the running container for patterns like
+`actions.*`, `comments.*`, `search.*`, `dashboard.*`) and hand-curated correct real English label
+values for all of them (the four reported keys plus every sibling key found in the bundle: 40+
+keys across `actions`, `comments`, `search`, `dashboard`). Wrote this as the nested-by-namespace
+JSON shape `server/core/localization.js` expects (`{"common": {"actions": {...}, "comments": {...},
+...}}`) and updated it directly into Postgres: `UPDATE locales SET strings = '<json>'::jsonb WHERE
+code='en';` against `fakeco-wikijs-db`. Restarted `fakeco-wikijs`. Verified live via a direct
+GraphQL query (`{ localization { translations(locale:"en", namespace:"common") { key value } } }`)
+against the running container — confirmed `actions.exit`→"Exit", `comments.title`→"Comments",
+`search.title`→"Search", `dashboard.title`→"Dashboard" all resolve correctly now, sourced from
+`WIKI.lang.getByNamespace()` reading the resource bundle loaded from our DB row at boot
+(`server/core/localization.js:loadLocale`).
+
+Left as documented, non-blocking noise: `sync-graph-locales`'s periodic resync job will keep logging
+`Syncing locales with Graph endpoint: [ FAILED ] / fetch failed` forever since `graph.requarks.io`
+is unreachable (by design, no outbound access) — no config toggle to disable this specific job was
+found in `config.yml` or the admin settings table without patching server code, and since the job
+only *patches* the DB row on success (never on failure), our manually-injected strings are safe from
+being overwritten by the doomed retries. Confirmed via a real restart that the failure is harmless.
+
+**Bug 2 — Akaunting: nothing visible for `admin@fakecorp.internal`.** Investigated the two duplicate
+`ak_users` rows (id=1, id=2) further: both had `enabled=1`, both password hashes matched the current
+`.env` `AKAUNTING_ADMIN_PASSWORD` (verified via `php artisan tinker` + `Hash::check` inside
+`fakeco-akaunting`), both linked to `company_id=1`/`role_id=1`, and each had its own duplicate
+`ak_dashboards` row (id 1 and id 2) with its own full set of 7 seeded widgets — so the "duplicate"
+wasn't a scoping/permissions bug, just genuine duplicate provisioning. Root cause of the duplication:
+`ak_users` has a composite unique index `ak_users_email_deleted_at_unique` on `(email,
+deleted_at)`, but MySQL/MariaDB unique indexes treat `NULL <> NULL`, so with `deleted_at` `NULL` on
+both rows the index never actually enforced uniqueness for two active (non-deleted) accounts with
+the same email — a real schema-level footgun, not user error. Something in provisioning ran the
+admin-user creation step twice.
+
+Did a full real login-flow verification against Akaunting's actual login route (`curl` with a real
+cookie jar + CSRF token fetched from `/auth/login`, POSTing the real `.env` credentials to
+`/auth/login`, run from inside `fakeco-akaunting` itself, not a new outbound path) — this resolved
+consistently to user id=1 (`Auth::attempt` with no `ORDER BY` returns the lowest id first) and a
+follow-up authenticated request to `{company_id}/common/dashboards` returned real dashboard/widget
+data, and the rendered dashboard HTML showed real dollar figures (e.g. `$48,567.69`) sourced from the
+11 real `ak_transactions` rows — so login and data visibility were already functioning correctly by
+the time of this pass (a password fix from an earlier/parallel pass, evidenced by user 1's
+`updated_at`/`last_logged_in_at` already being set, appears to have resolved the originally-reported
+symptom). Fixed the residual data-hygiene bug regardless: deleted the duplicate `ak_users` id=2 row
+and its orphaned `ak_dashboards` id=2 + 7 `ak_widgets` rows + `ak_user_companies`/`ak_user_roles`
+links, keeping id=1 (the one with real login history). Re-ran the full login → dashboard-fetch
+verification after the cleanup — still resolves cleanly to the single remaining user id=1 with the
+same real transaction-backed dashboard data.
+
+**Files touched:** none in the tracked repo (both fixes were live-database/live-container changes
+against `fakeco-wikijs-db` and `fakeco-akaunting-db`; no `.env` values were changed for these two
+bugs). This BUILD_LOG.md entry was authored in an isolated git worktree per the run's isolation
+requirement.
 
 ---
 
