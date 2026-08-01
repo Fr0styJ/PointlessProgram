@@ -29,6 +29,7 @@ import logging
 import os
 import random
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from typing import Optional
 
 import asyncpg
@@ -996,6 +997,229 @@ async def chaos_restart(name: str):
         log.error("chaos restart %s failed: %s", container, exc)
         return JSONResponse(status_code=502, content={"error": str(exc), "container": container})
     return {"status": "restarted", **result}
+
+
+# ---------------------------------------------------------------------------
+# Phase 28: Chaos — crisis events
+#
+# "Trigger Event" backend (dashboard UI is Phase 36's job, same split as
+# Phase 27's chaos-appliance controls). Canned scenarios are a small static
+# Python dict baked into this image (per PLAN_PHASES_27_28_31_32.md's
+# recommendation: these presets are fixed and rarely change, so baking them
+# in avoids a new bind-mount/compose change for zero real benefit; "extensible
+# via config" is satisfied by editing this dict directly, plus the fully
+# free-text `custom` path for genuine runtime customization). No new
+# microservice — hosted as new orchestrator endpoints, matching Phase 27.
+#
+# "surprise_audit" MUST invoke the real Books Auditor and narrate its actual
+# return value — never a fabricated result (spec §13.2 / PHASES.md:601-616).
+# Any scenario cost is routed through accounting-engine's existing
+# /expense/submit approval flow — the SAME path any other expense uses, not a
+# crisis-only bypass.
+# ---------------------------------------------------------------------------
+CRISIS_SCENARIOS: dict[str, dict] = {
+    "data_breach": {
+        "label": "Data Breach",
+        "summary_template": (
+            "A potential customer data breach has been reported. Engineering, Support, "
+            "and HR are convening an emergency crisis_response meeting to assess exposure, "
+            "notify affected parties if needed, and coordinate remediation."
+        ),
+        "departments": ["Engineering", "Support", "HR"],
+        "cost_estimate": Decimal("15000.00"),
+        "cost_description": "Emergency forensics + legal counsel retainer for data breach response",
+        "invokes_audit": False,
+    },
+    "surprise_audit": {
+        "label": "Surprise Audit",
+        "summary_template": "The Principal has called a surprise books audit.",
+        "departments": ["Finance"],
+        "cost_estimate": None,
+        "cost_description": None,
+        "invokes_audit": True,
+    },
+    "viral_complaint": {
+        "label": "Viral Public Complaint",
+        "summary_template": (
+            "A customer complaint about FakeCo has gone viral on a public review site. "
+            "Support and Marketing are convening a crisis_response meeting to assess "
+            "reputational impact and coordinate a public response."
+        ),
+        "departments": ["Support", "Marketing"],
+        "cost_estimate": Decimal("2500.00"),
+        "cost_description": "PR / rapid-response retainer for viral public complaint",
+        "invokes_audit": False,
+    },
+}
+# narrative_threads.priority value for any crisis thread (010_phase28_crisis.sql
+# added the column; routine threads default to 0). Not a formal enum — just a
+# clearly-higher number so a "top narrative backlog by priority" query (Phase
+# 31+) surfaces crises first.
+CRISIS_THREAD_PRIORITY = 100
+
+
+class TriggerEventRequest(BaseModel):
+    scenario: str  # data_breach | surprise_audit | viral_complaint | custom
+    custom_text: Optional[str] = None
+
+
+async def _resolve_crisis_attendees(conn: asyncpg.Connection, departments: Optional[list]) -> list[int]:
+    """Resolve a scenario's forced attendee list to real, currently-active employee ids —
+    department leads for the named departments, or ALL active leads if no departments are
+    specified (the `custom` free-text path's sensible default, per the plan doc's
+    "all department leads" recommendation). Falls back to any active lead at all if the
+    named departments currently have none (e.g. understaffed sim), so the meeting is never
+    handed an empty forced list."""
+    if departments:
+        rows = await conn.fetch("""
+            SELECT id FROM employees
+            WHERE role_tier = 'lead' AND status = 'active' AND department = ANY($1::text[])
+        """, departments)
+    else:
+        rows = await conn.fetch("SELECT id FROM employees WHERE role_tier = 'lead' AND status = 'active'")
+    ids = [r["id"] for r in rows]
+    if not ids:
+        rows = await conn.fetch("SELECT id FROM employees WHERE role_tier = 'lead' AND status = 'active'")
+        ids = [r["id"] for r in rows]
+    return ids
+
+
+@app.post("/chaos/trigger-event")
+async def chaos_trigger_event(req: TriggerEventRequest, pool: PoolDep):
+    """
+    Opens a high-priority `crisis` narrative_thread, schedules a crisis_response meeting
+    with a forced attendee list (meeting-simulator's select_attendees() extension point),
+    seeds action_items from that meeting's real structured outcome (same
+    outcome-to-action-item pipeline every other meeting type already uses — no new code
+    path), and — if the scenario carries a real cost — routes a normal expense request
+    through accounting-engine's existing approval flow tagged with the crisis thread ref.
+    """
+    scenario = req.scenario
+    if scenario == "custom":
+        if not req.custom_text:
+            return JSONResponse(status_code=400, content={"error": "custom scenario requires custom_text"})
+        config = {
+            "label": "Custom Crisis",
+            "summary_template": req.custom_text,
+            "departments": None,  # no department implied -> forced attendees = all active leads
+            "cost_estimate": None,
+            "cost_description": None,
+            "invokes_audit": False,
+        }
+    elif scenario in CRISIS_SCENARIOS:
+        config = CRISIS_SCENARIOS[scenario]
+    else:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "unknown scenario", "scenario": scenario,
+                     "allowed": sorted(list(CRISIS_SCENARIOS.keys()) + ["custom"])},
+        )
+
+    sim_time = await get_sim_time()
+    summary = config["summary_template"]
+    audit_result = None
+
+    if config.get("invokes_audit"):
+        # Never fabricate the audit result — call the REAL Books Auditor endpoint and
+        # narrate its actual corrections/amounts.
+        audit_url = f"{ACCOUNTING_ENGINE_URL}/audit/run"
+        try:
+            r = await _http.post(audit_url, timeout=60.0)
+            r.raise_for_status()
+            audit_result = r.json()
+            n = audit_result.get("corrections_made", 0)
+            if n:
+                summary = (
+                    f"Surprise books audit complete: {n} correction(s) made — "
+                    f"{json.dumps(audit_result.get('corrections', []))[:800]}"
+                )
+            else:
+                summary = "Surprise books audit complete: no discrepancies found, books are clean."
+        except Exception as exc:
+            async with pool.acquire() as conn:
+                await handle_outbound_failure(
+                    conn, exc, "chaos_trigger_event", "accounting-engine", "POST", audit_url, None,
+                    "Surprise audit call failed",
+                )
+            summary = ("Surprise books audit was triggered but accounting-engine was "
+                       "unreachable at the time; the audit call has been queued for retry.")
+
+    async with pool.acquire() as conn:
+        forced_departments = config.get("departments")
+        attendee_ids = await _resolve_crisis_attendees(conn, forced_departments)
+
+        topic = f"[CRISIS] {config['label']}"
+        thread_id = await conn.fetchval("""
+            INSERT INTO narrative_threads (topic, department, status, summary, priority)
+            VALUES ($1, $2, 'open', $3, $4)
+            RETURNING id
+        """, topic, (forced_departments[0] if forced_departments else None), summary, CRISIS_THREAD_PRIORITY)
+
+        await conn.execute("""
+            INSERT INTO narrative_events
+                (thread_id, employee_id, origin, source_type, source_ref, short_summary, created_at)
+            VALUES ($1, NULL, 'system', 'crisis', $2, $3, $4)
+        """, thread_id, f"chaos_trigger_event:{scenario}:{thread_id}", summary[:500], sim_time)
+
+    # Schedule the crisis_response meeting with the resolved forced attendee list —
+    # this is the extension point added to meeting-simulator's select_attendees().
+    meeting_result = None
+    meeting_url = f"{MEETING_SIM_URL}/meeting/run"
+    meeting_body = {
+        "meeting_type": "crisis_response",
+        "thread_id": thread_id,
+        "extra_context": summary,
+        "forced_attendee_ids": attendee_ids,
+    }
+    try:
+        r = await _http.post(meeting_url, json=meeting_body, timeout=120.0)
+        r.raise_for_status()
+        meeting_result = r.json()
+    except Exception as exc:
+        async with pool.acquire() as conn:
+            await handle_outbound_failure(
+                conn, exc, "chaos_trigger_event", "meeting-simulator", "POST", meeting_url, meeting_body,
+                f"Crisis meeting for thread {thread_id} failed",
+            )
+
+    # If the scenario carries a real cost, route it through the SAME normal
+    # expense-approval flow as any other expense (never a crisis-only bypass path).
+    expense_result = None
+    cost_estimate = config.get("cost_estimate")
+    if cost_estimate:
+        requester_id = attendee_ids[0] if attendee_ids else None
+        if requester_id is not None:
+            expense_url = f"{ACCOUNTING_ENGINE_URL}/expense/submit"
+            expense_body = {
+                "requester_employee_id": requester_id,
+                "amount": float(cost_estimate),
+                "description": f"{config['cost_description']} (crisis thread #{thread_id})",
+                "idempotency_key": f"crisis-expense:{thread_id}",
+            }
+            try:
+                r = await _http.post(expense_url, json=expense_body, timeout=30.0)
+                r.raise_for_status()
+                expense_result = r.json()
+            except Exception as exc:
+                async with pool.acquire() as conn:
+                    await handle_outbound_failure(
+                        conn, exc, "chaos_trigger_event", "accounting-engine", "POST", expense_url, expense_body,
+                        f"Crisis expense for thread {thread_id} failed",
+                    )
+
+    async with pool.acquire() as conn:
+        await record_run(conn, f"chaos_trigger_event:{scenario}:{thread_id}", sim_time,
+                          {"thread_id": thread_id, "scenario": scenario})
+
+    return {
+        "status": "triggered",
+        "scenario": scenario,
+        "thread_id": thread_id,
+        "forced_attendee_ids": attendee_ids,
+        "audit_result": audit_result,
+        "meeting_result": meeting_result,
+        "expense_result": expense_result,
+    }
 
 
 @app.get("/chaos/pending-actions")

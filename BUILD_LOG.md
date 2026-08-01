@@ -47,6 +47,66 @@
 
 ---
 
+### 2026-08-01T00:20 — Phase 28 built and runtime-verified: chaos crisis events (trigger-event API, forced meeting-attendee override, narrative_threads priority column), verified live against the primary stack
+
+Built per `PLAN_PHASES_27_28_31_32.md` ("Phase 28 — Chaos: crisis events"), signed off
+2026-07-31. No new microservice — hosted as new `orchestrator` endpoints, calling the
+already-existing `accounting-engine` (`/audit/run`, `/expense/submit`) and
+`meeting-simulator` services, per the plan's recommendation. Sequenced after Phase 27
+(already merged) since both touch `orchestrator/main.py`'s tick-loop/outage machinery.
+
+- **Migration** `narrative-db/migrations/010_phase28_crisis.sql`: adds
+  `narrative_threads.priority` (smallint, default 0, backfilled) — confirmed no such column
+  existed through migration 009 — and additively widens `narrative_events.source_type` to
+  add `'crisis'` (same pattern as 009's `'outage'`/`'system'` additions; `origin='system'`
+  already works since 009 widened that constraint too).
+- **User's QOL sign-off decisions, implemented as designed:**
+  1. `narrative_threads.priority` added; crisis threads get `priority = 100` so they sort
+     above routine threads (`idx_narrative_threads_priority` added for this).
+  2. `meeting-simulator/main.py`'s `select_attendees()` `crisis_response` branch now
+     accepts an optional `forced_attendee_ids` list, falling back to its own internal
+     "all active leads" derivation if the forced list resolves to nobody currently active.
+     This is what makes the free-text `custom` crisis scenario work at all, since it has no
+     employees "named in the thread" at trigger time.
+- **`orchestrator/main.py`**: `POST /chaos/trigger-event {"scenario": ..., "custom_text":
+  ...}` — 3 canned scenarios (`data_breach`, `surprise_audit`, `viral_complaint`) baked into
+  the image plus a `custom` free-text path. Handler opens a `crisis`-flagged
+  `narrative_thread`, resolves a forced attendee list (department leads for the scenario, or
+  all active leads for `custom`), calls `meeting-simulator` for a `crisis_response` meeting
+  with that forced list, and — for `surprise_audit` — calls accounting-engine's real
+  `/audit/run` endpoint and narrates its **actual** return value (never fabricated). Any
+  scenario `cost_estimate` is submitted through accounting-engine's existing
+  `/expense/submit` endpoint (same normal approval path every other expense uses, tagged
+  with the crisis thread ID) — not a special-cased bypass.
+- **Live verification** (against the running primary stack; additive/non-destructive, safe
+  to test directly):
+  1. `surprise_audit` scenario: called `/chaos/trigger-event`, independently called
+     accounting-engine's `/audit/run` directly — both returned the identical real result
+     (`corrections_made: 0, corrections: []`), confirming no fabrication.
+  2. `custom` scenario (`"a rogue vending machine is charging double"`): first attempt hit a
+     pre-existing meeting-simulator LLM-output-truncation issue (the model's JSON response
+     got cut off mid-sentence, failing to parse — **not a Phase 28 regression**, a
+     pre-existing intermittent LLM-length issue in meeting-simulator's outcome parsing,
+     worth a follow-up but out of this phase's scope). A second `viral_complaint` scenario
+     run parsed cleanly: crisis thread created, `crisis_response` meeting scheduled with the
+     correct forced attendees (`James Obi`, `Tara Oduya` — Support/Marketing leads), **4 real
+     action_items seeded** from the meeting's structured outcome, and the scenario's $2,500
+     cost landed in `pending_approvals` (status `pending`, tagged `crisis-expense:55`) —
+     confirmed via direct `psql` query — through the exact same table/endpoint any other
+     expense uses (accounting-engine's existing pattern of creating a tracking Zammad ticket
+     per expense request, e.g. `expense_request_ref = 'zammad:11'`, is pre-existing behavior,
+     not new).
+  3. Unknown scenario name (`nonexistent_scenario`): 400 rejected with the allowed-list in
+     the response body, before any downstream call was attempted.
+  4. `docker inspect --format '{{.RestartCount}}'` stayed at `0` for both `orchestrator` and
+     `meeting-simulator` across the entire test sequence — no crash-loop.
+
+No real Phase-28-introduced bugs found. One pre-existing meeting-simulator flakiness noted
+above (LLM output truncation under longer transcripts) — not fixed here, flagged for a
+future look since it's orthogonal to this phase's scope.
+
+---
+
 ### 2026-07-31T20:20 — Phase 27 built and runtime-verified: chaos/service-availability controls, real `pending_actions` retry queue (Phase 18's stated-but-never-built dependency), verified live against the primary 39+-container stack
 
 Built per `PLAN_PHASES_27_28_31_32.md` ("Phase 27 — Chaos: service availability controls"),

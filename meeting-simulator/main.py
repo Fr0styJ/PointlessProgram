@@ -215,6 +215,7 @@ async def select_attendees(
     department: Optional[str] = None,
     target_employee_id: Optional[int] = None,
     max_cross_dept: int = 5,
+    forced_attendee_ids: Optional[list[int]] = None,
 ) -> list[dict]:
     """
     Deterministically selects meeting attendees.
@@ -223,7 +224,15 @@ async def select_attendees(
     cross_functional: department leads + one IC from each department (up to max_cross_dept)
     pay_negotiation:  target employee + their department lead + HR lead
     performance_review: target employee + their department lead
-    crisis_response:  all active leads + any employees named in the crisis thread
+    crisis_response:  all active leads + any employees named in the crisis thread —
+                       OR, if `forced_attendee_ids` is supplied (Phase 28: chaos crisis
+                       events), those employees are used instead. This is needed because
+                       a free-text custom crisis scenario has no employees "named in the
+                       thread" yet at trigger time — the trigger caller (orchestrator's
+                       /chaos/trigger-event) resolves a sensible forced list itself
+                       (e.g. relevant department leads) and passes it in. Only the
+                       crisis_response branch honors this override; other meeting types
+                       are unaffected.
     """
     if meeting_type == "standup":
         employees = await conn.fetch(
@@ -288,9 +297,22 @@ async def select_attendees(
         """, target["department"], target_employee_id)
         employees = [e for e in [lead, target] if e is not None]
     elif meeting_type == "crisis_response":
-        employees = await conn.fetch(
-            "SELECT id, name, role_tier FROM employees WHERE role_tier = 'lead' AND status = 'active'"
-        )
+        if forced_attendee_ids:
+            employees = await conn.fetch(
+                "SELECT id, name, role_tier, department FROM employees WHERE id = ANY($1::int[]) AND status = 'active'",
+                forced_attendee_ids
+            )
+            if not employees:
+                # Forced list resolved to nobody currently active (e.g. stale ids) —
+                # fall back to the branch's own internal derivation rather than
+                # producing a meeting with zero attendees.
+                employees = await conn.fetch(
+                    "SELECT id, name, role_tier, department FROM employees WHERE role_tier = 'lead' AND status = 'active'"
+                )
+        else:
+            employees = await conn.fetch(
+                "SELECT id, name, role_tier, department FROM employees WHERE role_tier = 'lead' AND status = 'active'"
+            )
     else:
         raise ValueError(f"Unknown meeting_type: {meeting_type}")
 
@@ -493,6 +515,7 @@ async def run_meeting(
     target_employee_id: Optional[int] = None,
     thread_id: Optional[int] = None,
     extra_context: str = "",
+    forced_attendee_ids: Optional[list[int]] = None,
 ) -> dict:
     """
     Runs a complete meeting:
@@ -509,7 +532,10 @@ async def run_meeting(
         sim_time = await get_sim_time(http)
 
     async with pool.acquire() as conn:
-        attendees = await select_attendees(conn, meeting_type, department, target_employee_id)
+        attendees = await select_attendees(
+            conn, meeting_type, department, target_employee_id,
+            forced_attendee_ids=forced_attendee_ids,
+        )
         if not attendees:
             raise ValueError(f"No attendees could be selected for {meeting_type} ({department})")
 
@@ -759,6 +785,9 @@ class RunMeetingRequest(BaseModel):
     target_employee_id: Optional[int] = None
     thread_id: Optional[int] = None
     extra_context: str = ""
+    forced_attendee_ids: Optional[list[int]] = None  # Phase 28: chaos crisis events —
+    # externally-supplied attendee override, honored only by the crisis_response branch
+    # of select_attendees()
 
 
 class MeetingResult(BaseModel):
@@ -792,6 +821,7 @@ async def trigger_meeting(req: RunMeetingRequest, pool: PoolDep):
         target_employee_id=req.target_employee_id,
         thread_id=req.thread_id,
         extra_context=req.extra_context,
+        forced_attendee_ids=req.forced_attendee_ids,
     )
     return MeetingResult(**result)
 
