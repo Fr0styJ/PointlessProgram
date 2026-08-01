@@ -1659,8 +1659,61 @@ services:
       - phase29
 
   # ---------------------------------------------------------------------------
-  # PHASES 33+: Custom services — added as their phases execute.
-  # Placeholders listed here for topology documentation:
-  #
-  # dashboard          (Phase 33+) — net_mgmt, net_clients (calls other services)
+  # PHASE 33: dashboard — React/Vite SPA served by a thin FastAPI BFF.
+  # PLAN_PHASES_33_38_DASHBOARD.md (signed off 2026-08-01): whole dashboard
+  # (API + static SPA) gated behind HTTP Basic Auth from this phase onward.
+  # Multi-homed: net_mgmt (host-published, browser-reachable, per the network
+  # comment block near the top of this file) + net_clients (calls sim-clock
+  # and orchestrator's own APIs) + net_data (direct Postgres reads for
+  # narrative_threads/action_items/etc — no dedicated owning microservice for
+  # those tables, same pattern orchestrator itself already uses — and for
+  # LiteLLM_SpendLogs, reusing Phase 31's llm-spend.json query verbatim).
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: fakeco-dashboard
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      narrative-db-migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
+      SIM_CLOCK_URL: "http://sim-clock:8000"
+      ORCHESTRATOR_URL: "http://orchestrator:8000"
+      LITELLM_CONFIG_PATH: "/litellm-config/config.yaml"
+      DASHBOARD_AUTH_USER: "${DASHBOARD_AUTH_USER:?DASHBOARD_AUTH_USER required}"
+      DASHBOARD_AUTH_PASSWORD: "${DASHBOARD_AUTH_PASSWORD:?DASHBOARD_AUTH_PASSWORD required}"
+    volumes:
+      - ./litellm/config.yaml:/litellm-config/config.yaml:ro
+    networks:
+      - net_mgmt
+      - net_clients
+      - net_data
+    ports:
+      - "8090:8000"   # host-published on net_mgmt, per this file's own network comment block
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    labels:
+      fakeco.service: "dashboard"
+      fakeco.phase: "33"
+      fakeco.managed: "true"
+    profiles:
+      - phase13
+      - phase33
+
+  # ---------------------------------------------------------------------------
+  # PHASES 34+: Custom services — added as their phases execute.
+  # Placeholders listed here for topology documentation: dashboard tabs for
+  # HR/Payroll/Accounting (34), External World/KPI/Company Direction (35),
+  # Chaos/Data Management/Branding (36), TV wall/Errors/log tail (37) all plug
+  # into the Phase 33 dashboard shell above — no new service directories,
+  # just new routes/components inside dashboard/ and new BFF endpoints.
   # ---------------------------------------------------------------------------

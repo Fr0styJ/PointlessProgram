@@ -111,6 +111,17 @@ DEPARTMENTS = [
 _pool: asyncpg.Pool | None = None
 _http: httpx.AsyncClient | None = None
 
+# ---------------------------------------------------------------------------
+# Phase 33: tick-loop pause/resume — dashboard Simulation tab's "start/stop"
+# control, scoped specifically to orchestrator's own tick loop (per the
+# 2026-08-01 sign-off: NOT stopping containers or the whole compose stack).
+# In-memory flag is fine here — this is a manual operator convenience toggle,
+# not simulation state that needs to survive an orchestrator restart.
+# ---------------------------------------------------------------------------
+_tick_paused: bool = False
+_tick_paused_since: Optional[datetime] = None
+_last_tick_at: Optional[datetime] = None
+
 
 async def get_pool() -> asyncpg.Pool:
     if _pool is None:
@@ -808,9 +819,19 @@ async def maybe_run_kpi_rollup(conn: asyncpg.Connection, sim_time: datetime) -> 
 # ---------------------------------------------------------------------------
 async def tick_loop(pool: asyncpg.Pool) -> None:
     """Main orchestrator tick. Runs every TICK_INTERVAL_SECONDS wall-clock seconds."""
+    global _last_tick_at
     log.info("Orchestrator: tick loop started (interval=%.0fs)", TICK_INTERVAL_SECONDS)
     while True:
         try:
+            # Phase 33: tick-loop pause gate. When paused via POST /tick/pause,
+            # skip the whole body of scheduled-job checks entirely (same
+            # no-op-the-tick shape as the Phase 29 maintenance-mode gate below) —
+            # this loop keeps running (so /tick/status can report liveness) but
+            # does no work while paused.
+            if _tick_paused:
+                await asyncio.sleep(TICK_INTERVAL_SECONDS)
+                continue
+
             # Phase 29: maintenance-mode gate. snapshot-manager/purge-manager set this flag
             # before any destructive/consistency-sensitive operation and clear it after —
             # a mid-purge/restore tick must no-op entirely, not partially run jobs against
@@ -842,6 +863,8 @@ async def tick_loop(pool: asyncpg.Pool) -> None:
                 # Phase 27: retry any queued pending_actions whose wall-clock
                 # next_retry_at is due — independent of the jobs above.
                 await process_pending_actions(conn, sim_time)
+
+            _last_tick_at = datetime.now(timezone.utc)
 
         except Exception as exc:
             log.error("Orchestrator tick error: %s", exc)
@@ -899,6 +922,42 @@ async def status(pool: PoolDep):
             ORDER BY created_at DESC LIMIT 20
         """)
     return [dict(r) for r in recent]
+
+
+@app.get("/tick/status")
+async def tick_status():
+    """Phase 33: dashboard Simulation tab reads this to show whether the tick
+    loop is currently paused/running, plus a liveness timestamp."""
+    return {
+        "paused": _tick_paused,
+        "paused_since": _tick_paused_since.isoformat() if _tick_paused_since else None,
+        "last_tick_at": _last_tick_at.isoformat() if _last_tick_at else None,
+        "tick_interval_seconds": TICK_INTERVAL_SECONDS,
+    }
+
+
+@app.post("/tick/pause")
+async def tick_pause():
+    """Phase 33: dashboard Simulation tab's start/stop control — pauses
+    orchestrator's own tick loop (scheduled jobs no longer fire) without
+    stopping the orchestrator process/container or any other service."""
+    global _tick_paused, _tick_paused_since
+    if not _tick_paused:
+        _tick_paused = True
+        _tick_paused_since = datetime.now(timezone.utc)
+        log.info("Orchestrator: tick loop PAUSED via dashboard control")
+    return {"status": "paused", "paused_since": _tick_paused_since.isoformat()}
+
+
+@app.post("/tick/resume")
+async def tick_resume():
+    """Phase 33: resumes the tick loop after a pause."""
+    global _tick_paused, _tick_paused_since
+    was_paused_since = _tick_paused_since
+    _tick_paused = False
+    _tick_paused_since = None
+    log.info("Orchestrator: tick loop RESUMED via dashboard control")
+    return {"status": "resumed", "was_paused_since": was_paused_since.isoformat() if was_paused_since else None}
 
 
 @app.post("/trigger/{job_name}")

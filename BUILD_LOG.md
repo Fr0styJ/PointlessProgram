@@ -47,6 +47,91 @@
 
 ---
 
+### 2026-08-01T01:00 — Phase 33 built and runtime-verified: Control Dashboard shell + Simulation / LLM Status / Narrative tabs
+
+Built per `PLAN_PHASES_33_38_DASHBOARD.md` (signed off 2026-08-01) and its recorded user
+sign-off decisions. New `dashboard/` service: React + Vite (TypeScript) SPA served as static
+files by a thin FastAPI backend-for-frontend, matching every other custom service's
+`Dockerfile`/`requirements.txt`/`main.py`/`/health` pattern (`python -c
+"import urllib.request..."` healthcheck — no curl, per `important.md` #1).
+
+- **Auth (2026-08-01 sign-off, applied from this phase onward, not deferred)**: HTTP Basic
+  Auth in front of the ENTIRE dashboard — both `/api/*` and the static SPA itself — via a
+  FastAPI dependency (`require_basic_auth` in `dashboard/main.py`) checking
+  `DASHBOARD_AUTH_USER`/`DASHBOARD_AUTH_PASSWORD` with `secrets.compare_digest`. No default
+  password is baked in; the service returns 503 ("refuses to serve") if either env var is
+  unset, rather than silently allowing unauthenticated access. Added both vars to
+  `.env.example` (Phase 33+ section) using the repo's existing `:?required` compose
+  convention.
+- **Shell**: top nav (Simulation, LLM Status, Narrative, Settings) as a plain extensible array
+  in `dashboard/frontend/src/App.tsx` — Phases 34-37 add nav entries here, no router library
+  needed at this project's scale.
+- **Simulation tab**: sim-time + speed display read live from sim-clock's existing
+  `GET /clock`. Speed slider + preset buttons (0.1/0.25/0.5/1/2/5/10x) built but rendered
+  disabled with a "Coming Soon" badge (Phase 32 dependency, deferred, per sign-off #5).
+  "Worker scale" intentionally omitted entirely per sign-off #4 (confirmed genuinely
+  undefined). Start/stop scoped to orchestrator's own tick loop per sign-off #5's scoping
+  recommendation — new `orchestrator` endpoints `POST /tick/pause`, `POST /tick/resume`,
+  `GET /tick/status` (module-level `_tick_paused` flag checked at the top of `tick_loop()`;
+  intentionally in-memory, not persisted — this is a manual operator toggle, not simulation
+  state).
+- **LLM Status tab**: provider/fallback chain parsed from the mounted `litellm/config.yaml`
+  (read-only volume mount at `/litellm-config/config.yaml`); usage/cost + speed-adjusted burn
+  rate reuse Phase 31's `monitoring/grafana/dashboards/llm-spend.json` SQL verbatim against
+  `LiteLLM_SpendLogs` (same shared Postgres instance, direct read — no owning microservice
+  exists for that table, consistent with Grafana's own datasource pattern).
+- **Narrative tab**: `narrative_threads` (sorted priority DESC then updated_at DESC — surfaces
+  Phase 28 crisis threads first), `action_items`, `pending_reactions`, `pending_approvals`,
+  `meetings` (all 5 types), and a bonus `pending_actions` (Phase 27) retry-queue-depth widget.
+  Direct Postgres reads (`net_data`), same pattern orchestrator itself already uses for these
+  tables (no dedicated narrative-owning service to proxy through).
+- **Settings tab**: nav slot + placeholder page only, per sign-off #2 — the full-purge
+  "nuclear launch" control is explicitly Phase 36/38's job, not built here.
+- **`docker-compose.yml`**: new `dashboard` service, multi-homed `net_mgmt` (host-published,
+  port `8090:8000`) + `net_clients` (calls sim-clock/orchestrator) + `net_data` (direct
+  Postgres reads), gated behind new `phase33` profile (+ `phase13` for the
+  `narrative-db-migrate` dependency, matching every other phase's profile-gating
+  convention). Replaced the old "PHASES 33+" topology-placeholder comment with the real
+  service block.
+
+**Verification (live, against the primary running stack, not a disposable environment —
+building an additive UI service was judged safe per the plan)**:
+- Built and started `fakeco-dashboard` + rebuilt `fakeco-orchestrator` — both came up
+  `healthy`.
+- `curl` with no credentials → `401` on both `/` and `/api/simulation/status`; wrong password
+  → `401`; correct credentials → `200` with real data. `/health` (used only by Docker's own
+  healthcheck, never browser-reachable) intentionally NOT behind auth, matching every other
+  service's pattern.
+- Simulation tab: `GET /api/simulation/status` returned live `sim_time`/`speed_multiplier`
+  from sim-clock and live tick state from orchestrator.
+- Pause/resume real-tick-loop test: called `POST /tick/pause`, confirmed via
+  `docker logs fakeco-orchestrator` that NO new `"Orchestrator tick at sim_time="` line
+  appeared for 80+ wall-clock seconds (one full tick interval) while paused; called
+  `POST /tick/resume`, confirmed a new tick log line appeared on the next interval.
+- LLM Status tab: `/api/llm/spend` returned `total_spend=0.11374644679999987`,
+  `total_tokens=415106` — cross-checked with a direct
+  `SELECT SUM(spend), SUM(total_tokens) FROM "LiteLLM_SpendLogs"` against the live DB:
+  **exact match**.
+- Narrative tab: `/api/narrative/summary` returned 54 open threads including 3
+  crisis-priority threads (`[CRISIS] Surprise Audit`, `[CRISIS] Viral Public Complaint`,
+  `[CRISIS] Custom Crisis`, all `priority=100`) sorted first, from Phase 28's earlier testing
+  — confirmed both via the API and by loading the actual rendered UI in a browser (screenshot
+  confirmed the sim-time card, the disabled/greyed Speed Slider with "Coming Soon" badge, and
+  the Narrative tab's red-highlighted CRISIS rows).
+- No new bugs found in existing services during this pass; the one real gotcha hit while
+  testing was a browser-security limitation (not an app bug): `fetch()` cannot be called on a
+  URL containing embedded Basic Auth credentials (`user:pass@host`) — worked around by loading
+  the page once with embedded credentials to seed the browser's per-origin auth cache, then
+  reloading without them, matching how a real user's browser would behave after answering the
+  native Basic Auth prompt once.
+
+Real gaps intentionally NOT built this phase (per the plan's own scoping, not oversights):
+provider manual-override control, Phase 24/32-dependent controls (payroll cuts, live speed
+change), and Phases 34-37's own tabs (HR/Payroll/Accounting, External World/KPI/Company
+Direction, Chaos/Data Management/Branding, TV wall/Errors/log tail).
+
+---
+
 ### 2026-08-01T00:20 — Phase 28 built and runtime-verified: chaos crisis events (trigger-event API, forced meeting-attendee override, narrative_threads priority column), verified live against the primary stack
 
 Built per `PLAN_PHASES_27_28_31_32.md` ("Phase 28 — Chaos: crisis events"), signed off

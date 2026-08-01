@@ -1,0 +1,198 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #0f1115;
+  color: #e6e6e6;
+}
+
+.shell {
+  min-height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 12px 20px;
+  background: #171a21;
+  border-bottom: 1px solid #2a2e37;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+
+.tabs {
+  display: flex;
+  gap: 4px;
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  color: #b7bdc9;
+  padding: 8px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.tab:hover {
+  background: #232733;
+}
+
+.tab-active {
+  background: #2f6fed;
+  color: white;
+}
+
+.content {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+h1 {
+  margin-top: 0;
+}
+
+.card {
+  background: #171a21;
+  border: 1px solid #2a2e37;
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+
+.stat-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+  margin: 12px 0;
+}
+
+.stat {
+  min-width: 160px;
+}
+
+.stat-label {
+  font-size: 0.8rem;
+  color: #8a90a0;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.stat-value {
+  font-size: 1.3rem;
+  font-weight: 600;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  overflow-x: auto;
+  display: block;
+}
+
+.table thead {
+  display: table;
+  width: 100%;
+  table-layout: fixed;
+}
+
+.table tbody {
+  display: table;
+  width: 100%;
+  table-layout: fixed;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #2a2e37;
+  font-size: 0.9rem;
+}
+
+.row-crisis {
+  background: rgba(220, 50, 50, 0.12);
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
+.badge-soon {
+  background: #4a4f5c;
+  color: #e6e6e6;
+}
+
+.badge-crisis {
+  background: #c0392b;
+  color: white;
+}
+
+.hint {
+  color: #8a90a0;
+  font-size: 0.85rem;
+}
+
+.disabled-control {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+.preset-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.preset-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid #2a2e37;
+  background: #232733;
+  color: #b7bdc9;
+}
+
+.action-btn {
+  margin-top: 8px;
+  padding: 8px 18px;
+  border-radius: 6px;
+  border: none;
+  background: #2f6fed;
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.action-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.error-banner {
+  background: rgba(220, 50, 50, 0.15);
+  border: 1px solid #c0392b;
+  color: #ff9d95;
+  padding: 8px 14px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
