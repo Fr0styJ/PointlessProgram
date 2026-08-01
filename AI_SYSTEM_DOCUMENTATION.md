@@ -16,6 +16,23 @@
 [UI]=React/FastAPI control dashboard
 [OB]=Prometheus/Loki/Grafana observability
 [PR]=Principal human operator
+[MM]=Mattermost chat appliance/API
+[ZA]=Zammad ticket appliance/API
+[WK]=Wiki.js knowledge appliance/GraphQL API
+[AK]=Akaunting accounting appliance/API
+[NC]=Nextcloud file/collaboration appliance
+[FA]=FastAPI application framework
+[GQ]=GraphQL query/mutation protocol
+[PM]=purge-manager scoped/full deletion service
+[AE]=accounting-engine financial workflow service
+[PV]=provisioning roster lifecycle service
+[ID]=idempotency/idempotent execution guarantee
+[HC]=container/service healthcheck
+[PG]=PostgreSQL database/driver ecosystem
+[MY]=MariaDB/MySQL database ecosystem
+[AS]=asyncpg asynchronous PostgreSQL client
+[HX]=httpx asynchronous HTTP client
+[SE]=Server-Sent Events stream
 
 ## File: /.env.example
 **Deps:** [CP],[AP],[SV],[LLM],[UI],[PR]
@@ -204,7 +221,7 @@
 ^R1: README began as phase scaffold; actual migration directory is authoritative.
 
 ## File: /narrative-db/migrate.py
-**Deps:** [DB],[MG],asyncpg
+**Deps:** [DB],[MG],[AS]
 **State:** stateful one-shot migrator
 
 `database_url() -> DATABASE_URL || POSTGRES_* composition`
@@ -265,7 +282,7 @@
 
 ## File: /narrative-db/migrations/005_customers_seed.sql
 **Deps:** [DB],[MG]
-**State:** idempotent placeholder data
+**State:** [ID] placeholder data
 
 `seed -> 6 prospects with fake external identities/value; ON CONFLICT(email) DO NOTHING`
 
@@ -299,7 +316,7 @@
 `narrative_events.source_type + outage;origin + system`
 
 **RATIONALE**
-^R1: Unique idempotency covers all outbound action classes; wall-clock retry scheduling avoids sim-speed retry storms.
+^R1: Unique [ID] covers all outbound action classes; wall-clock retry scheduling avoids sim-speed retry storms.
 
 ## File: /narrative-db/migrations/010_phase28_crisis.sql
 **Deps:** [DB],[MG]
@@ -352,7 +369,7 @@
 `pending_reactions + attempts default0,next_retry_at,last_error,failed_at; status pending|done|failed; retry partial index`
 
 **RATIONALE**
-^R1: Delivery marked done only after appliance success; retries bounded/idempotent; PTO/provider pause does not burn attempts.
+^R1: Delivery marked done only after appliance success; retries bounded/[ID]; PTO/provider pause does not burn attempts.
 
 ## File: /narrative-db/requirements.txt
 **Deps:** [DB]
@@ -367,7 +384,7 @@
 `python:3.12-slim + curl + pip requirements + main.py -> uvicorn :8000`
 
 **RATIONALE**
-^R1: curl added after Compose healthcheck blocked dependents on slim image; current cross-service convention often uses urllib instead, but this image retains curl compatibility.
+^R1: curl added after Compose [HC] blocked dependents on slim image; current cross-service convention often uses urllib instead, but this image retains curl compatibility.
 
 ## File: /sim-clock/README.md
 **Deps:** [SC],[DB]
@@ -376,7 +393,7 @@
 `formula -> sim_time += wall_elapsed*speed_multiplier; API set_speed 0.1..10; all time-aware decisions read [SC]; business-hours policy belongs consumers`
 
 ## File: /sim-clock/main.py
-**Deps:** [SC],[DB],FastAPI,asyncpg
+**Deps:** [SC],[DB],[FA],[AS]
 **State:** singleton persistent clock+background ticker
 
 `get_pool() -> asyncpg.Pool || RuntimeError`
@@ -415,7 +432,7 @@
 ^R1: [OR] PTO Sieve path requires `docker exec fakeco-mailserver doveadm sieve`; docker-mailserver setup CLI lacks Sieve mutation; Debian package must be `docker-cli`, not heavyweight/incorrect `docker.io`. Direct socket mount remains broader than Phase-27 socket-proxy lockdown; inherited Phase-19 compromise.
 
 ## File: /orchestrator/README.md
-**Deps:** [SC], [DB], [EM], [HB], accounting-engine, meeting-simulator, external-world, kpi-engine
+**Deps:** [SC], [DB], [EM], [HB], [AE], meeting-simulator, external-world, kpi-engine
 **State:** descriptive; partially stale
 
 `declared([OR]) -> priority continuity + roster/[SC]/PTO/relationships + reachability + pending_actions + deterministic jobs`
@@ -426,7 +443,7 @@
 ^R1: README/spec claim exceeds implementation. BUILD_LOG records Phase-18 gap: [HB] consumes reactions separately; [OR] sequentially schedules jobs. Phase-27 later added `pending_actions`; old `important.md` statements declaring it absent are stale.
 
 ## File: /orchestrator/main.py
-**Deps:** FastAPI, asyncpg, httpx, Docker Engine API, docker CLI, [DB], [SC], meeting-simulator, accounting-engine, kpi-engine, external-world, Mattermost, docker-mailserver
+**Deps:** [FA], [AS], [HX], Docker Engine API, docker CLI, [DB], [SC], meeting-simulator, [AE], kpi-engine, external-world, [MM], docker-mailserver
 **State:** stateful singleton loop + [DB]-persisted audit/retry/PTO state + process-local pause state
 
 `cfg -> DATABASE_URL|POSTGRES_{USER,PASSWORD,HOST,PORT,DB}; SIM_CLOCK_URL; MEETING_SIM_URL; ACCOUNTING_ENGINE_URL; KPI_ENGINE_URL; EXTERNAL_WORLD_URL; DOCKER_SOCKET_PROXY_URL; PENDING_ACTIONS_RETRY_SECONDS=60; PENDING_ACTIONS_MAX_ATTEMPTS=20; ORCHESTRATOR_TICK_INTERVAL=60; STANDUP_SIM_HOUR=9; CROSS_DEPT_INTERVAL_DAYS=14; PERF_REVIEW_INTERVAL_DAYS=30; PAYROLL_INTERVAL_DAYS=14; STALE_THREAD_DAYS=2; APPROVAL_REMINDER_DAYS=1; PTO_DAILY_PROBABILITY=.01; PTO_MIN_GAP_DAYS=45; PTO_DURATION_MIN_DAYS=3; PTO_DURATION_MAX_DAYS=7; MAILSERVER_CONTAINER=fakeco-mailserver; MAILSERVER_DOMAIN=fakecorp.internal; MATTERMOST_URL; MATTERMOST_ADMIN_TOKEN`
@@ -478,11 +495,11 @@
 `GET /chaos/pending-actions -> latest 50 retry rows`
 
 **RATIONALE**
-^R1: Core infra excluded to bound blast radius; application allowlist + socket-proxy `CONTAINERS=1,POST=1,EXEC=0` defense-in-depth. Zammad nginx name corrects stale prior `fakeco-zammad` bug.
+^R1: Core infra excluded to bound blast radius; application allowlist + socket-proxy `CONTAINERS=1,POST=1,EXEC=0` defense-in-depth. [ZA] nginx name corrects stale prior `fakeco-zammad` bug.
 ^R2: Wall-time fallback preserves scheduler liveness during [SC] outage but weakens deterministic sim semantics; logged warning.
 ^R3: Reachable 4xx/5xx indicates logic/data defect, not outage; queueing it would create useless retries.
 ^R4: Appliance outage physical duration uses wall clock; narrative records fresh success [SC]. Idempotency applies ALL action types per user decision. Retry transport supports only GET/POST stored payloads.
-^R5: docker-mailserver has no setup Sieve command; `doveadm sieve put/activate/deactivate/delete` required. `deactivate` accepts no script argument; passing one silently no-ops—verified bugfix. Mattermost ephemeral-token revocation uses `POST /users/tokens/revoke`, not nonexistent DELETE route. End effects keyed through audit state for repeat safety.
+^R5: docker-mailserver has no setup Sieve command; `doveadm sieve put/activate/deactivate/delete` required. `deactivate` accepts no script argument; passing one silently no-ops—verified bugfix. [MM] ephemeral-token revocation uses `POST /users/tokens/revoke`, not nonexistent DELETE route. End effects keyed through audit state for repeat safety.
 ^R6: `system_maintenance_mode` protects purge/restore from concurrent mutation. Loop remains fixed sequence, not original strict per-employee continuity priority queue; README/spec conflict retained as open gap.
 ^R7: Uvicorn/Starlette bare exceptions otherwise emit plaintext, invisible to Loki `level=ERROR`; duplicate plaintext server traceback remains expected middleware behavior.
 ^R8: Crisis costs reuse normal approval path; surprise audit narrates actual accounting response, never invented values. Current code chooses first forced attendee as expense requester, conflicting SPEC_CLARIFICATIONS #7 requiring [PR] employee/account ID—verified design conflict.
@@ -505,7 +522,7 @@
 **RATIONALE**
 
 ## File: /meeting-simulator/README.md
-**Deps:** [LLM], [DB], Mattermost, Wiki.js, [EM]
+**Deps:** [LLM], [DB], [MM], [WK], [EM]
 **State:** descriptive; materially stale
 
 `declared_types -> standup|cross_functional|pay_negotiation|performance_review|crisis_response`
@@ -518,7 +535,7 @@
 ^R1: README says HR-private exclusion; `run_meeting()` unconditionally publishes all types. Future implementation must suppress external minutes for HR-sensitive types.
 
 ## File: /meeting-simulator/main.py
-**Deps:** FastAPI, asyncpg, httpx, [DB], [SC], [LLM], Mattermost API v4, Wiki.js GraphQL
+**Deps:** [FA], [AS], [HX], [DB], [SC], [LLM], [MM] API v4, [WK] [GQ]
 **State:** stateful clients/pool; transactional meeting persistence
 
 `cfg -> DATABASE_URL|POSTGRES_*; LITELLM_URL=http://litellm:4000; LITELLM_MASTER_KEY; MATTERMOST_URL; MATTERMOST_BOT_TOKEN; MATTERMOST_TEAM_ID; SIM_CLOCK_URL; ACCOUNTING_ENGINE_URL; WIKIJS_URL; WIKIJS_ADMIN_TOKEN`
@@ -552,7 +569,7 @@
 `GET /meetings/pending-performance-reviews -> active [EM], hired<wall NOW-90d, dept size>=2 ^R7`
 
 **RATIONALE**
-^R1: Wiki.js `pages.create` requires undocumented non-null `isPrivate`; omission produced GraphQL failure. API/token calls internal only.
+^R1: [WK] `pages.create` requires undocumented non-null `isPrivate`; omission produced [GQ] failure. API/token calls internal only.
 ^R2: PTO filter enforces no proactive attendance. Forced crisis list still revalidated against active/PTO state.
 ^R3: Phase-20 relationship weighting reuses the existing meeting [LLM] call by adding stances; zero extra spend. Known historical bug: leads+ICs flat truncation can drop every IC when department leads fill cap; confirm current cap logic before modifying.
 ^R4: Company direction inserted into every prompt; compact thread summary/recent context avoids full-history token growth. Persona/background data grounds each voice.
@@ -577,7 +594,7 @@
 **RATIONALE**
 
 ## File: /external-world/README.md
-**Deps:** [DB], [LLM], mailserver, Zammad, accounting-engine, [EM]
+**Deps:** [DB], [LLM], mailserver, [ZA], [AE], [EM]
 **State:** descriptive; mixed implemented/planned claims
 
 `BetaCorp -> deterministic pay-gap risk + local cosmetic-external mail + resignation + [PR] flag`
@@ -586,10 +603,10 @@
 `flavor_news claim -> absent@main.py ^R1`
 
 **RATIONALE**
-^R1: No Wiki.js/Mattermost rival-flavor generator exists in assigned source; README describes intended scope beyond current endpoints.
+^R1: No [WK]/[MM] rival-flavor generator exists in assigned source; README describes intended scope beyond current endpoints.
 
 ## File: /external-world/main.py
-**Deps:** FastAPI, asyncpg, httpx, smtplib, [DB], [SC], [LLM], docker-mailserver SMTP, Zammad, accounting-engine
+**Deps:** [FA], [AS], [HX], smtplib, [DB], [SC], [LLM], docker-mailserver SMTP, [ZA], [AE]
 **State:** autonomous wall-loop + deterministic per-[SC] decision state
 
 `cfg -> DATABASE_URL|POSTGRES_*; LITELLM_URL; LITELLM_MASTER_KEY; MAILSERVER_HOST; MAILSERVER_SMTP_PORT=587; MAILSERVER_DOMAIN; ACCOUNTING_ENGINE_URL; ZAMMAD_URL=http://zammad-nginx:8080; ZAMMAD_ADMIN_TOKEN; SIM_CLOCK_URL; BETACORP_DOMAIN=betacorp.com; BETACORP_RECRUITER_NAME=Alex Rivera; BETACORP_RECRUITER_EMAIL; JOB_OFFER_BASE_PROBABILITY=.3; JOB_OFFER_MAX_GAP_PCT=.25; RESIGNATION_GAP_PCT=.20; RESIGNATION_GRACE_SIM_DAYS=14; SUPPORT_SLA_CHURN_HOURS=48; MAILSERVER_BOT_SECRET; EXTERNAL_WORLD_TICK_INTERVAL=300`
@@ -616,7 +633,7 @@
 
 **RATIONALE**
 ^R1: Closed mail network cannot receive real internet senders; authenticated internal relay writes external-looking headers only. Port 25 auth failed historically; submission port 587 required. Appliances except [LLM] remain no-egress.
-^R2: Zammad ticket POST requires `customer_id` (`guess:<email>` accepted), valid group resolution, and article type; earlier omissions prevented prospect traffic. Search-by-note/company is heuristic coupling, not customer foreign key.
+^R2: [ZA] ticket POST requires `customer_id` (`guess:<email>` accepted), valid group resolution, and article type; earlier omissions prevented prospect traffic. Search-by-note/company is heuristic coupling, not customer foreign key.
 
 ## File: /external-world/requirements.txt
 **Deps:** PyPI
@@ -635,7 +652,7 @@
 **RATIONALE**
 
 ## File: /kpi-engine/README.md
-**Deps:** Zammad, Wiki.js, Mattermost, Akaunting, accounting-engine, [DB]
+**Deps:** [ZA], [WK], [MM], [AK], [AE], [DB]
 **State:** descriptive; Phase25/weekly-digest stale claim
 
 `implemented -> deterministic daily KPI rollup + deterministic review ranking/raises + live approval-mode toggle`
@@ -646,7 +663,7 @@
 ^R1: No weekly-digest function/endpoint exists in `main.py`; dashboard TV explicitly skipped digest because Phase25 absent.
 
 ## File: /kpi-engine/main.py
-**Deps:** FastAPI, asyncpg, httpx, [DB], Zammad REST, Wiki.js GraphQL, Mattermost REST, Akaunting REST, accounting-engine
+**Deps:** [FA], [AS], [HX], [DB], [ZA] REST, [WK] [GQ], [MM] REST, [AK] REST, [AE]
 **State:** request-driven deterministic aggregator; [DB]-persisted snapshots/config/audit
 
 `cfg -> DATABASE_URL|POSTGRES_*; ZAMMAD_URL; ZAMMAD_ADMIN_TOKEN; WIKIJS_URL; WIKIJS_ADMIN_TOKEN; MATTERMOST_URL; MATTERMOST_ADMIN_TOKEN; AKAUNTING_URL; AKAUNTING_ADMIN_EMAIL; AKAUNTING_ADMIN_PASSWORD; AKAUNTING_COMPANY_ID=1; ACCOUNTING_ENGINE_URL; KPI_REVIEW_TOP_RAISE_PCT=.05; KPI_REVIEW_SECOND_RAISE_PCT=.02; KPI_REVIEW_MIN_TENURE_DAYS=90; KPI_REVIEW_MIN_DEPT_SIZE=2; KPI_REVIEW_LOOKBACK_DAYS=30; KPI_REVIEW_UNDERPERFORM_PERCENTILE=.10; KPI_REVIEW_APPROVAL_MODE default env; KPI_WEIGHT_TICKETS_RESOLVED=1; KPI_WEIGHT_WIKI_PAGES=1; KPI_WEIGHT_CHAT_MESSAGES=.1; KPI_WEIGHT_RESOLUTION_HOURS=-.05`
@@ -682,8 +699,8 @@
 `POST /reviews/run({as_of?}) -> applied|queued|skipped|candidates`
 
 **RATIONALE**
-^R1: Wiki.js `PageListItem` lacks `authorId`/`creatorId`; direct list query returned GraphQL 400. N+1 `pages.single` workaround preserves attribution correctness.
-^R2: Akaunting Laravel rejects service-DNS Host as untrusted and requires company context. Both `Host` and `X-Company` are mandatory; missing headers caused historical 500/invisible transactions.
+^R1: [WK] `PageListItem` lacks `authorId`/`creatorId`; direct list query returned [GQ] 400. N+1 `pages.single` workaround preserves attribution correctness.
+^R2: [AK] Laravel rejects service-DNS Host as untrusted and requires company context. Both `Host` and `X-Company` are mandatory; missing headers caused historical 500/invisible transactions.
 ^R3: Dollar/KPI/review tiers remain code-derived; no [LLM] judgment. Negative resolution-hours weight rewards faster resolution. Wall-time SQL tenure/lookback may diverge from accelerated [SC]. Underperformance only flags; automatic cuts forbidden; Phase24 meeting path remains unbuilt.
 
 ## File: /kpi-engine/requirements.txt
@@ -749,13 +766,13 @@
 ^R1: preserve stale-doc warning; source+BUILD_LOG supersede placeholder-era README.
 
 ## File: /human-bridge/requirements.txt
-**Deps:** fastapi>=0.115.0,uvicorn[standard]>=0.30.0,asyncpg>=0.29.0,httpx>=0.27.0,pydantic>=2.0.0
+**Deps:** fastapi>=0.115.0,uvicorn[standard]>=0.30.0,[AS]>=0.29.0,[HX]>=0.27.0,pydantic>=2.0.0
 **State:** runtime-deps
 
 `stdlib -> SMTP+IMAP+MIME+hashing`; `external -> [SV]+[DB]+HTTP`
 
 ## File: /human-bridge/main.py
-**Deps:** [HB],[DB],[EM],[SC],[LLM],[AP],asyncpg,httpx,FastAPI,SMTP,IMAP,reaction_* adapters
+**Deps:** [HB],[DB],[EM],[SC],[LLM],[AP],[AS],[HX],[FA],SMTP,IMAP,reaction_* adapters
 **State:** stateful; pool+cached principal IDs+3 background loops
 
 `ENV -> DATABASE_URL|POSTGRES_{USER,PASSWORD,HOST,PORT,DB}; MAILSERVER_HOST; MAILSERVER_{SMTP,IMAP}_PORT; MAILSERVER_BOT_SECRET; MATTERMOST_URL|MATTERMOST_ADMIN_TOKEN|MATTERMOST_TEAM_ID; ZAMMAD_URL|ZAMMAD_ADMIN_TOKEN; WIKIJS_URL|WIKIJS_ADMIN_TOKEN; ACCOUNTING_ENGINE_URL; MEETING_SIM_URL; PRINCIPAL_{EMAIL,NAME}; WORDPRESS_URL|WORDPRESS_ADMIN_USER|WORDPRESS_ADMIN_APP_PASSWORD; NEXTCLOUD_URL|NEXTCLOUD_ADMIN_USER|NEXTCLOUD_ADMIN_PASSWORD; LITELLM_URL|LITELLM_MASTER_KEY; DETECTION_POLL_INTERVAL_SECONDS=8; DELIVERABLE_POLL_INTERVAL_SECONDS=30; DELIVERABLE_MAX_ATTEMPTS=5; DELIVERABLE_RETRY_BASE_SECONDS=30; DELIVERABLE_RETRY_MAX_SECONDS=3600; REACTION_POLL_INTERVAL_SECONDS=5; REACTION_MAX_ATTEMPTS=5; REACTION_RETRY_BASE_SECONDS=30; REACTION_RETRY_MAX_SECONDS=3600; COMPANY_DIRECTIVE_WIKI_PATH=company-direction`
@@ -812,22 +829,22 @@
 **RATIONALE**
 ^R1: deterministic bot secrets remain unstored/re-derivable; simulation-only credential model.
 ^R2: docker-mailserver AUTH works on submission 587, not inbound 25; TLS optional only inside isolated [NW].
-^R3: Mattermost team membership != channel membership; `/posts` otherwise 403. Old DELETE token route 404 leaked PATs; real revoke endpoint POST body token_id.
+^R3: [MM] team membership != channel membership; `/posts` otherwise 403. Old DELETE token route 404 leaked PATs; real revoke endpoint POST body token_id.
 ^R4: no prior Wiki employee-target convention; `emp-<employee_id>` introduced as explicit deterministic routing tag.
 ^R5: Wiki list items omit needed author fields; detail query required. `authorId` identifies creator, not revision author; ignore cursor suppresses bridge’s own update loop.
-^R6: polling chosen because Mattermost outgoing webhooks require trigger words and Zammad/Wiki webhook setup lacked simpler complete capture; durable cursors trade immediacy for robust uniform integration.
+^R6: polling chosen because [MM] outgoing webhooks require trigger words and [ZA]/Wiki webhook setup lacked simpler complete capture; durable cursors trade immediacy for robust uniform integration.
 ^R7: WebDAV PUT does not create parent collections; recursive MKCOL fixed repeatable 404 delivery failures; 405 means collection already exists.
 ^R8: Gemini-generated empty bodies exposed nominal-success corruption; semantic field validation+one corrective retry blocks empty artifacts.
 ^R9: narrative invariant: no random/periodic content; only explicit action_items.deliverable_type. Provider downtime pauses without spending attempts; five bounded failures prevent infinite spend/poll churn.
 ^R10: reaction priority precedes deliverables; transport marker+DB state recover publish-success/DB-failure races; `done` only after appliance delivery.
-^R11: uvicorn plaintext ASGI tracebacks lack Loki `level`; duplicate structured ERROR enables [UI] Errors panel; explicit HTTPException remains normal FastAPI handling.
-^R12: Wiki.js update demands near-full immutable field set; create additionally requires undocumented `isPrivate:Boolean!`.
+^R11: uvicorn plaintext ASGI tracebacks lack Loki `level`; duplicate structured ERROR enables [UI] Errors panel; explicit HTTPException remains normal [FA] handling.
+^R12: [WK] update demands near-full immutable field set; create additionally requires undocumented `isPrivate:Boolean!`.
 ^R13: [DB] directive remains source-of-truth; Wiki outage reported but cannot roll back saved business direction.
-^R14: Zammad ticket creation hard-requires customer_id; `guess:<email>` resolves/creates customer.
+^R14: [ZA] ticket creation hard-requires customer_id; `guess:<email>` resolves/creates customer.
 ^R15: docstring claims create/update but implementation only create; verified conflict/open gap.
 
 ## File: /human-bridge/reaction_chat.py
-**Deps:** [HB],[DB],[EM],[LLM],Mattermost,httpx
+**Deps:** [HB],[DB],[EM],[LLM],[MM],[HX]
 **State:** one-reaction transactional adapter
 
 `ChatReactionConfig(mm_url,admin_token,llm_url,key,model=heavy,timeout=20)`
@@ -844,7 +861,7 @@
 ^R2: caller transaction required for advisory-lock lifetime; provider/PTO/unavailable stay pending; only successful post or discovered existing post marks done.
 
 ## File: /human-bridge/reaction_email.py
-**Deps:** [HB],[DB],[EM],[LLM],IMAP,SMTP,MIME,httpx
+**Deps:** [HB],[DB],[EM],[LLM],IMAP,SMTP,MIME,[HX]
 **State:** one-reaction transactional adapter
 
 `EmailReactionConfig(principal_email,name,mail_host,imap=143,smtp=587,secret,llm_url,key,model=heavy,max_tokens=1200)`
@@ -865,7 +882,7 @@
 ^R2: row lock serializes workers; stable Message-ID supports retry recognition; provider outage leaves queue untouched; delivery precedes done.
 
 ## File: /human-bridge/reaction_wikijs.py
-**Deps:** [HB],[DB],[EM],[LLM],Wiki.js GraphQL,httpx
+**Deps:** [HB],[DB],[EM],[LLM],[WK] [GQ],[HX]
 **State:** one-reaction transactional adapter
 
 `WikiReactionConfig(url,token,principal_wiki_user_id,llm_url,key,model=heavy,max_tokens,timeout)`
@@ -881,7 +898,7 @@
 ^R1: no verified comment mutation surface; page follow-up chosen. Exact revision avoids answering stale edits. Hidden marker repairs publish-success/DB-failure. Post-publish ignore cursor required because creator attribution cannot identify bridge revision.
 
 ## File: /human-bridge/reaction_zammad.py
-**Deps:** [HB],[DB],[EM],[LLM],Zammad REST,httpx
+**Deps:** [HB],[DB],[EM],[LLM],[ZA] REST,[HX]
 **State:** one-reaction transactional adapter
 
 `ZammadReactionConfig(url,admin_token,principal_email,llm_url,key,model=heavy,max_tokens=900,timeout=30)`
@@ -895,7 +912,7 @@
 `process_zammad_reaction(...)->Result => advisory lock; status/type/active/agent/PTO; [PR] article+ticket owner+self guards; marker repair; [LLM]; post; strict conditional done update ^R2`
 
 **RATIONALE**
-^R1: Zammad has no admin-on-behalf token/article API; temporary password is only available real-employee authorship path. Bot accounts have no stable human login dependency.
+^R1: [ZA] has no admin-on-behalf token/article API; temporary password is only available real-employee authorship path. Bot accounts have no stable human login dependency.
 ^R2: ticket owner defines target; metadata+HTML dual marker handles versions stripping preferences and post/DB race.
 
 ## File: /human-bridge/tests/test_reaction_chat.py
@@ -930,7 +947,7 @@
 `HEALTHCHECK -> python urllib http://localhost:8000/health ^R1`
 
 **RATIONALE**
-^R1: slim image lacks curl; Python healthcheck fixed permanent-unhealthy regression. Docker CLI required mailserver setup exec; privileged surface should remain constrained by topology.
+^R1: slim image lacks curl; Python [HC] fixed permanent-unhealthy regression. Docker CLI required mailserver setup exec; privileged surface should remain constrained by topology.
 
 ## File: /provisioning/README.md
 **Deps:** [EM],[AP],[DB]
@@ -940,11 +957,11 @@
 `conflict -> now HTTP serve mode+personality sync/assignment+relationship seeding+reaction reassignment`
 
 ## File: /provisioning/requirements.txt
-**Deps:** asyncpg>=0.29.0,httpx>=0.27.0,fastapi>=0.115.0,uvicorn[standard]>=0.30.0,pydantic>=2.0.0
+**Deps:** [AS]>=0.29.0,[HX]>=0.27.0,fastapi>=0.115.0,uvicorn[standard]>=0.30.0,pydantic>=2.0.0
 **State:** runtime-deps
 
 ## File: /provisioning/main.py
-**Deps:** [EM],[DB],[AP],Mattermost,Zammad,Wiki.js,docker-mailserver,Docker CLI,FastAPI
+**Deps:** [EM],[DB],[AP],[MM],[ZA],[WK],docker-mailserver,Docker CLI,[FA]
 **State:** stateful HTTP service + CLI
 
 `ENV -> DATABASE_URL|POSTGRES_*; MAILSERVER_DOMAIN; MAILSERVER_CONTAINER; MAILSERVER_BOT_SECRET; MATTERMOST_URL|ADMIN_TOKEN|TEAM_ID; ZAMMAD_URL|ADMIN_TOKEN; WIKIJS_URL|ADMIN_TOKEN; PRINCIPAL_EMAIL|NAME|MATTERMOST_PASSWORD; PERSONALITY_LIBRARY_PATH; DOCKER_HOST`
@@ -971,9 +988,9 @@
 **RATIONALE**
 ^R1: concise legacy `employees.personality` prevents meeting prompts absorbing full biography; full profile preserved JSONB for reactions.
 ^R2: least-used random selection produces diversity for current/future roster while never changing established identity across restarts.
-^R3: Wiki.js `UserMinimal.isActive` can be null despite non-null schema; omit field. local create rejects blank password despite nullable schema; deterministic password. Successful create may return user:null; refetch by email.
+^R3: [WK] `UserMinimal.isActive` can be null despite non-null schema; omit field. local create rejects blank password despite nullable schema; deterministic password. Successful create may return user:null; refetch by email.
 ^R4: deactivation preserves mailbox/history; deterministic bot password avoids secret rows. Docker exec is legacy exception to socket-proxy EXEC=0 architecture.
-^R5: idempotent lookups prevent duplicate [AP] accounts; partial per-appliance failures allow rerun repair rather than cross-system rollback impossible across independent appliances.
+^R5: [ID] lookups prevent duplicate [AP] accounts; partial per-appliance failures allow rerun repair rather than cross-system rollback impossible across independent appliances.
 
 ## File: /personality-library/batch-01.json
 **Deps:** [EM],schema_version=1
@@ -1055,7 +1072,7 @@
 ^R1: simple generated assets are distinct valid appliance-upload fixtures; Pillow absent from runtime image intentionally.
 
 ## File: /branding-manager/main.py
-**Deps:** [EM],[DB],[AP],Mattermost,Zammad,Wiki.js DB,FastAPI,httpx,asyncpg
+**Deps:** [EM],[DB],[AP],[MM],[ZA],[WK] DB,[FA],[HX],[AS]
 **State:** stateful pool; per-request appliance clients
 
 `ENV -> DATABASE_URL|POSTGRES_*; MATTERMOST_URL|ADMIN_TOKEN; ZAMMAD_URL|ADMIN_TOKEN; WIKIJS_URL|ADMIN_TOKEN; WIKIJS_DB_{HOST,PORT,NAME,USER,PASSWORD}; BRANDING_ASSETS_DIR; DEFAULT_AVATAR_ASSET_ID=avatar-01`
@@ -1077,13 +1094,13 @@
 `POST /branding/emoji-pack/upload->idempotent results`
 
 **RATIONALE**
-^R1: Zammad avatar routes are current_user-only; no admin impersonation token API. Fresh bot password+Basic Auth is verified workaround.
-^R2: Zammad deleting final Avatar leaves dangling `user.image` hash and old blob still serves; explicit image:null restores initials.
-^R3: Wiki.js schema/controller exposes only read `/_userav/:uid`; no avatar mutation. Direct write targets exact table consumed by native route; architectural compromise requires [NW] DB access.
+^R1: [ZA] avatar routes are current_user-only; no admin impersonation token API. Fresh bot password+Basic Auth is verified workaround.
+^R2: [ZA] deleting final Avatar leaves dangling `user.image` hash and old blob still serves; explicit image:null restores initials.
+^R3: [WK] schema/controller exposes only read `/_userav/:uid`; no avatar mutation. Direct write targets exact table consumed by native route; architectural compromise requires [NW] DB access.
 ^R4: per-appliance errors do not block other pushes; recorded desired asset may differ from failed appliance state, intentionally visible via result details.
 
 ## File: /branding-manager/requirements.txt
-**Deps:** fastapi>=0.115.0,uvicorn[standard]>=0.30.0,asyncpg>=0.29.0,httpx>=0.27.0,pydantic>=2.0.0
+**Deps:** fastapi>=0.115.0,uvicorn[standard]>=0.30.0,[AS]>=0.29.0,[HX]>=0.27.0,pydantic>=2.0.0
 **State:** runtime-deps
 
 ## File: /branding-manager/assets/avatars/avatar-01.png
@@ -1127,27 +1144,27 @@
 **State:** binary RGB PNG 256x256; brown #7B2D26; white J; 1878B
 
 ## File: /branding-manager/assets/emoji/fakeco-alert.png
-**Deps:** generate_assets.py; Mattermost custom emoji
+**Deps:** generate_assets.py; [MM] custom emoji
 **State:** binary RGBA PNG 64x64; transparent+orange triangle; 330B
 
 ## File: /branding-manager/assets/emoji/fakeco-money.png
-**Deps:** generate_assets.py; Mattermost custom emoji
+**Deps:** generate_assets.py; [MM] custom emoji
 **State:** binary RGBA PNG 64x64; transparent+cyan circle; 355B
 
 ## File: /branding-manager/assets/emoji/fakeco-shipit.png
-**Deps:** generate_assets.py; Mattermost custom emoji
+**Deps:** generate_assets.py; [MM] custom emoji
 **State:** binary RGBA PNG 64x64; transparent+red square; 193B
 
 ## File: /branding-manager/assets/emoji/fakeco-star.png
-**Deps:** generate_assets.py; Mattermost custom emoji
+**Deps:** generate_assets.py; [MM] custom emoji
 **State:** binary RGBA PNG 64x64; transparent+amber 5-point star; 388B
 
 ## File: /branding-manager/assets/emoji/fakeco-thumbsup.png
-**Deps:** generate_assets.py; Mattermost custom emoji
+**Deps:** generate_assets.py; [MM] custom emoji
 **State:** binary RGBA PNG 64x64; transparent+teal circle; 355B
 
 ## File: /accounting-engine/Dockerfile
-**Deps:** python:3.12-slim, accounting-engine/requirements.txt, accounting-engine/main.py
+**Deps:** python:3.12-slim, [AE]/requirements.txt, [AE]/main.py
 **State:** image-build stateless
 
 `build() -> python image + pip deps + /app/main.py`
@@ -1158,19 +1175,19 @@
 ^R1: Shared custom-[SV] slim-image convention; curl-based checks previously made healthy services permanently unhealthy.
 
 ## File: /accounting-engine/README.md
-**Deps:** [DB], Akaunting, Zammad, Phase 15/24
+**Deps:** [DB], [AK], [ZA], Phase 15/24
 **State:** documentation; partially stale
 
-`declared` = deterministic financial math; expense routing; aggregate payroll; revenue; Books Auditor; idempotency; schema=`pending_approvals|employees|system_audit_log`; [AP]=Zammad+Akaunting.
+`declared` = deterministic financial math; expense routing; aggregate payroll; revenue; Books Auditor; [ID]; schema=`pending_approvals|employees|system_audit_log`; [AP]=[ZA]+Akaunting.
 `declared approval` = IC<=25 auto; IC>25->dept lead; lead<=500; >500->[PR]; [PR] unlimited.
 `declared pay-cut` = stub until Phase24.
-`stale` = wording “will contain”; `is_lead` reference while code uses `role_tier`; omits PTO delegation, API endpoints, Akaunting Host/X-Company/payment-method/category workarounds, Phase34 reject/cash/raise endpoints.^R1
+`stale` = wording “will contain”; `is_lead` reference while code uses `role_tier`; omits PTO delegation, API endpoints, [AK] Host/X-Company/payment-method/category workarounds, Phase34 reject/cash/raise endpoints.^R1
 
 **RATIONALE**
 ^R1: README predates implementation/fixes; `accounting-engine/main.py` + BUILD_LOG are stronger current-state evidence.
 
 ## File: /accounting-engine/main.py
-**Deps:** [SV], [DB], [SC], Akaunting REST, Zammad REST, asyncpg, httpx, FastAPI, Pydantic, Decimal
+**Deps:** [SV], [DB], [SC], [AK] REST, [ZA] REST, [AS], [HX], [FA], Pydantic, Decimal
 **State:** stateful; pooled [DB]; per-request [AP] clients; deterministic money engine
 
 `env` = `DATABASE_URL` || `POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_DB`; `AKAUNTING_URL`; `AKAUNTING_ADMIN_EMAIL`; `AKAUNTING_ADMIN_PASSWORD`; `AKAUNTING_COMPANY_ID=1`; `ZAMMAD_URL=http://zammad-nginx:8080`; `ZAMMAD_ADMIN_TOKEN`; `SIM_CLOCK_URL=http://sim-clock:8000`; `IC_AUTO_APPROVE_LIMIT=25.00`; `LEAD_AUTO_APPROVE_LIMIT=500.00`; `AKAUNTING_PAYROLL_ACCOUNT_ID`; `AKAUNTING_EXPENSE_ACCOUNT_ID`; `AKAUNTING_REVENUE_ACCOUNT_ID`; `AKAUNTING_LLM_EXPENSE_ACCOUNT_ID`; `AKAUNTING_PAYROLL_CATEGORY_ID`; `AKAUNTING_EXPENSE_CATEGORY_ID`; `AKAUNTING_REVENUE_CATEGORY_ID`; optional `AKAUNTING_PAYMENT_METHOD`.
@@ -1201,25 +1218,25 @@
 `key` = supplied || SHA256(`expense:<requester>:<description[0:50]>:<float amount>`)[0:32].
 `duplicate` = existing `pending_approvals.idempotency_key`->existing status/id.
 `new` = +`pending_approvals(expense_request_ref=pending_<key16>,requester,approver,principal,amount,status=approved|pending,key)`.
-`auto` = approver=self&&!principal => Akaunting expense `[AUTO-APPROVED]`; category/account env; ref=`approval:<id>` => update ref `akaunting:<tx>` + audit `expense_auto_approved`; Akaunting failure=>ERROR, row remains approved with pending ref for Books Auditor.^R8
-`manual` = Zammad ticket title/body+assignment note; hardcoded `customer_id=1`; success=>ref `zammad:<ticket>` + audit `expense_queued_for_approval`; failure=>ERROR, pending row retained without live ticket.^R9
+`auto` = approver=self&&!principal => [AK] expense `[AUTO-APPROVED]`; category/account env; ref=`approval:<id>` => update ref `akaunting:<tx>` + audit `expense_auto_approved`; [AK] failure=>ERROR, row remains approved with pending ref for Books Auditor.^R8
+`manual` = [ZA] ticket title/body+assignment note; hardcoded `customer_id=1`; success=>ref `zammad:<ticket>` + audit `expense_queued_for_approval`; failure=>ERROR, pending row retained without live ticket.^R9
 
 `approve_expense(pool,akaunting,approval_id,approved_by,note='') -> {status:'approved',akaunting_transaction_id}`
 `guard` = DB row status=pending || ValueError.
-`flow` = DB transaction + external Akaunting expense `[APPROVED by ...]`, ref=`approval:<id>` => DB status approved/ref `akaunting:<tx>` + audit `expense_approved`.^R10
-`reject_expense_endpoint(req,pool) -> {status:'rejected',approval_id}` = pending row || 404; DB status rejected/updated_at wall NOW + audit `expense_rejected`; no Akaunting mutation.
+`flow` = DB transaction + external [AK] expense `[APPROVED by ...]`, ref=`approval:<id>` => DB status approved/ref `akaunting:<tx>` + audit `expense_approved`.^R10
+`reject_expense_endpoint(req,pool) -> {status:'rejected',approval_id}` = pending row || 404; DB status rejected/updated_at wall NOW + audit `expense_rejected`; no [AK] mutation.
 
 `run_payroll(pool,akaunting,idempotency_key?) -> result`
 `key` = supplied || `payroll:<UTC YYYY-MM-DD-HH>`.^R11
 `duplicate` = `system_audit_log(action=payroll_posted,detail.idempotency_key)`->already_posted.
 `employees` = all status=active; empty->no_active_employees; terminated/vacant excluded.
-`total` = exact sum `Decimal(pay_rate)`; `POST` one Akaunting expense/category with description count, reference key; no employee vendor/contact records.^R12
+`total` = exact sum `Decimal(pay_rate)`; `POST` one [AK] expense/category with description count, reference key; no employee vendor/contact records.^R12
 `audit` = `payroll_posted` detail key,tx,total,count,full per-[EM] pay list; result posted.
 
 `post_revenue(pool,akaunting,customer_id,deal_amount,description,idempotency_key?) -> result`
 `key` = supplied || `revenue:customer:<id>:<float>`.
 `guard` = customer exists; `abs(customers.deal_size-input)<=0.01`; audit key not already posted.^R13
-`flow` = Akaunting income `[REVENUE]`, account/category, reference key => customer `akaunting_transaction_id`, `relationship_status=active` + audit `revenue_posted`.
+`flow` = [AK] income `[REVENUE]`, account/category, reference key => customer `akaunting_transaction_id`, `relationship_status=active` + audit `revenue_posted`.
 
 `propose_pay_cut(pool,employee_id,proposed_pay,initiated_by='principal') -> queued_for_negotiation`
 `behavior` = employee lookup; audit `pay_cut_proposed_stub`; no pay mutation; no meeting/pending_reaction actually created despite docstring wording.^R14
@@ -1229,7 +1246,7 @@
 `finish` = audit `audit_run_complete`.
 `audit_log(conn,actor,action,detail) -> None` = INSERT JSON into append-only-intended `system_audit_log`; DB default wall time.
 
-`_unhandled_exception_handler(request,exc) -> JSONResponse(500)` = flattened traceback via JSON logger=>[OB] `level=ERROR`; FastAPI `HTTPException`/validation unaffected; uvicorn may additionally emit plaintext traceback.^R16
+`_unhandled_exception_handler(request,exc) -> JSONResponse(500)` = flattened traceback via JSON logger=>[OB] `level=ERROR`; [FA] `HTTPException`/validation unaffected; uvicorn may additionally emit plaintext traceback.^R16
 `models` = `ExpenseRequest(amount>0)`; `PayrollRequest`; `RevenueRequest(deal_amount>0)`; `PayCutRequest(proposed_pay>0)`; `ApproveExpenseRequest`; `RejectExpenseRequest`.
 `GET /health -> {status:ok,service:accounting-engine}`
 `POST /expense/submit -> submit_expense_request`
@@ -1240,27 +1257,27 @@
 `POST /revenue/post -> post_revenue`
 `POST /payroll/propose-cut -> propose_pay_cut`
 `POST /audit/run -> run_books_audit`
-`POST /payroll/raise?employee_id&new_pay&reason -> result` = active employee ||404; `new_pay>old_pay` ||400 directing cuts to propose-cut; update pay/pay_last_changed_at/pay_last_change_reason + audit `raise_applied`; immediate/no approval/Akaunting post.^R17
+`POST /payroll/raise?employee_id&new_pay&reason -> result` = active employee ||404; `new_pay>old_pay` ||400 directing cuts to propose-cut; update pay/pay_last_changed_at/pay_last_change_reason + audit `raise_applied`; immediate/no approval/[AK] post.^R17
 
 **RATIONALE**
 ^R1: Financial correctness must remain deterministic/reproducible; [LLM] may narrate but never decide values.
 ^R2: Laravel TrustHosts rejects service DNS `akaunting`; configured APP_URL host required. `X-Company`, not `company` or query param, must exist before Laravel module activation; absent header caches zero payment-method listeners and causes misleading 422.
-^R3: Hardcoded `offline-payments.cash.1` drifted and broke all real transaction paths; live Akaunting settings are source, one-process cache limits calls; env override supports controlled recovery.
+^R3: Hardcoded `offline-payments.cash.1` drifted and broke all real transaction paths; live [AK] settings are source, one-process cache limits calls; env override supports controlled recovery.
 ^R4: Ticket-note helper lacks response validation; callers cannot trust delivery. No current call site.
 ^R5: Approval routing remains available during [SC] outage, but wall-time fallback can misclassify PTO relative to simulation time.
 ^R6: PTO cannot stall money approval; configured active backup first, then deterministic tier escalation.
 ^R7: Longest tenure resolves multiple leads without [LLM]; no lead escalates safely to [PR]. `role_tier` supersedes README `is_lead` wording.
-^R8: Retaining approved DB record on [AP] failure enables later auditor repair; status says approved before ledger exists, intentionally visible discrepancy. External post lacks propagated transaction idempotency number, so crash-after-post/before-DB-update can duplicate.^R18
-^R9: Zammad `customer_id` mandatory; id=1 is bootstrap assumption. Ticket failure is swallowed, leaving manual approval lacking UI surface.
-^R10: DB transaction cannot atomically include external Akaunting; rollback after successful external POST can duplicate retry. Service-level precheck limits ordinary duplicates but not crash windows.
+^R8: Retaining approved DB record on [AP] failure enables later auditor repair; status says approved before ledger exists, intentionally visible discrepancy. External post lacks propagated transaction [ID] number, so crash-after-post/before-DB-update can duplicate.^R18
+^R9: [ZA] `customer_id` mandatory; id=1 is bootstrap assumption. Ticket failure is swallowed, leaving manual approval lacking UI surface.
+^R10: DB transaction cannot atomically include external [AK]; rollback after successful external POST can duplicate retry. Service-level precheck limits ordinary duplicates but not crash windows.
 ^R11: Wall-hour default approximates payroll cycle, not biweekly [SC]; explicit scheduler key required for intended cycles.
 ^R12: One aggregate ledger transaction mandated by clarification #2; per-[EM] detail retained in [DB].
 ^R13: Revenue amount locked to deal size set at thread-open; prevents closing-time hallucination/manipulation.
 ^R14: Human-only cuts mandated; Phase24 absent. Current function only logs stub, contrary “queues pending_reaction/opens meeting” prose.
-^R15: Auditor repairs only missing approved-expense references; payroll validation shallow (presence in JSON only), latest-10 only, no Akaunting cross-check; correction POST has same external-transaction crash window.
+^R15: Auditor repairs only missing approved-expense references; payroll validation shallow (presence in JSON only), latest-10 only, no [AK] cross-check; correction POST has same external-transaction crash window.
 ^R16: Promtail labels JSON `level`; raw ASGI traceback previously invisible in dashboard Errors panel.
 ^R17: Raises intentionally frictionless; decrease rejected defense-in-depth until Phase24 negotiation.
-^R18: `post_transaction(idempotency_key=...)` supports stable Akaunting `number`, but all current money call sites pass `reference` only; generated timestamp `number` weakens appliance-side idempotency.
+^R18: `post_transaction(idempotency_key=...)` supports stable [AK] `number`, but all current money call sites pass `reference` only; generated timestamp `number` weakens appliance-side idempotency.
 
 ## File: /accounting-engine/requirements.txt
 **Deps:** PyPI
@@ -1272,8 +1289,8 @@
 ^R1: Unpinned upper versions improve install flexibility but reduce byte-reproducibility/API stability.
 
 ## File: /akaunting-init/entrypoint-idempotent.sh
-**Deps:** Akaunting vendor image, bash `-e`, PHP/PDO, artisan/tinker, Apache
-**State:** startup state machine; Akaunting container filesystem ephemeral + MariaDB persistent
+**Deps:** [AK] vendor image, bash `-e`, PHP/PDO, artisan/tinker, Apache
+**State:** startup state machine; [AK] container filesystem ephemeral + [MY] persistent
 
 `cwd` = `/var/www/html`.
 `if .env && APP_INSTALLED=true` => unset `AKAUNTING_SETUP`; exec `/usr/local/bin/akaunting.sh --start`.^R1
@@ -1288,15 +1305,15 @@
 ^R2: Recreated container loses `.env`/APP_KEY but keeps DB volume. Safe installer half reconstructs runtime config/migrations/permissions; company/admin transaction omitted to prevent duplicate/failure. Verified fresh install, restart, recreate.
 
 ## File: /purge-manager/Dockerfile
-**Deps:** python:3.12-slim, default-mysql-client, purge-manager/requirements.txt, purge-manager/main.py
+**Deps:** python:3.12-slim, default-mysql-client, [PM]/requirements.txt, [PM]/main.py
 **State:** image-build stateless
 
 `apt` = default-mysql-client; remove apt lists.
 `runtime` = `/app`; pip no-cache; `EXPOSE=8000`; uvicorn info.
-`mysql CLI` => Akaunting direct-MariaDB ledger purge; no Docker exec.^R1
+`mysql CLI` => [AK] direct-MariaDB ledger purge; no Docker exec.^R1
 
 **RATIONALE**
-^R1: Akaunting lacks usable bulk-wipe API; direct DB fallback preserves socket-proxy `EXEC=0` boundary.
+^R1: [AK] lacks usable bulk-wipe API; direct DB fallback preserves socket-proxy `EXEC=0` boundary.
 
 ## File: /purge-manager/README.md
 **Deps:** Phase29, [AP], [DB]
@@ -1311,12 +1328,12 @@
 ^R1: Exact phrase is server-side safety contract; stale README value guarantees operator 400 and must not be treated authoritative.
 
 ## File: /purge-manager/main.py
-**Deps:** [SV], [DB], snapshot-manager, [SC], Mattermost/Zammad/Wiki.js APIs, Akaunting MariaDB, asyncpg/httpx/mysql CLI
+**Deps:** [SV], [DB], snapshot-manager, [SC], [MM]/[ZA]/[WK] APIs, [AK] [MY], [AS]/[HX]/mysql CLI
 **State:** destructive stateful coordinator
 
-`env` = `DATABASE_URL` || Postgres vars; `SNAPSHOT_MANAGER_URL=http://snapshot-manager:8000`; `SIM_CLOCK_URL`; `ZAMMAD_URL`; `ZAMMAD_ADMIN_TOKEN`; `WIKIJS_URL`; `WIKIJS_ADMIN_TOKEN`; `MATTERMOST_URL`; `MATTERMOST_ADMIN_TOKEN`; `AKAUNTING_DB_PASSWORD`; fixed Akaunting DB host/name/user=`akaunting-db/akaunting/akaunting`.
+`env` = `DATABASE_URL` || Postgres vars; `SNAPSHOT_MANAGER_URL=http://snapshot-manager:8000`; `SIM_CLOCK_URL`; `ZAMMAD_URL`; `ZAMMAD_ADMIN_TOKEN`; `WIKIJS_URL`; `WIKIJS_ADMIN_TOKEN`; `MATTERMOST_URL`; `MATTERMOST_ADMIN_TOKEN`; `AKAUNTING_DB_PASSWORD`; fixed [AK] DB host/name/user=`akaunting-db/akaunting/akaunting`.
 `SCOPE_PHRASES` = emails:`PURGE EMAILS`; chat:`PURGE CHAT`; tickets:`PURGE TICKETS`; wiki:`PURGE WIKI`; meetings_narrative:`PURGE MEETINGS AND NARRATIVE MEMORY`; accounting:`PURGE ACCOUNTING LEDGER`; external_world:`PURGE EXTERNAL WORLD`; kpi_history:`PURGE KPI HISTORY`; roster:`PURGE ROSTER`; company_direction:`PURGE COMPANY DIRECTION`; full=`PURGE EVERYTHING`.
-`lifespan` = [DB] pool 1..5 + shared httpx timeout60s.
+`lifespan` = [DB] pool 1..5 + shared [HX] timeout60s.
 `_unhandled_exception_handler` = JSON ERROR+flattened traceback ->500; same [OB] workaround as accounting.
 `ScopeRequest(confirm:str)`.
 `set_maintenance_mode(pool,enabled,reason) -> UPSERT id=1,set_by=purge-manager,timestamps=wall NOW`
@@ -1328,7 +1345,7 @@
 `purge_emails(pool) -> note` = `UPDATE employees SET mailbox_address=NULL`; raw Maildir and mail accounts/messages preserved.^R3
 `purge_chat(pool) -> {deleted_posts,errors}` = admin Bearer; list teams; list channels; first-page channel posts; DELETE each post; catches all errors into array; channels retained; `deleted_channels` unused.^R4
 `purge_tickets(pool) -> {deleted_tickets,errors}` = token auth; GET ticket list then DELETE each; catches errors; likely API pagination not traversed.^R4
-`purge_wiki(pool) -> {deleted_pages,errors}` = GraphQL page list; per-id delete mutation; counts HTTP200 without checking `responseResult.succeeded`; catches errors.^R4
+`purge_wiki(pool) -> {deleted_pages,errors}` = [GQ] page list; per-id delete mutation; counts HTTP200 without checking `responseResult.succeeded`; catches errors.^R4
 `purge_meetings_narrative(pool) -> counts` = DB transaction; sequential `TRUNCATE ... CASCADE` for pending_reactions,pending_approvals,action_items,narrative_events,meetings,narrative_threads; `system_audit_log|snapshot_purge_log` untouched.
 `purge_accounting(pool) -> {returncode,stderr<=500}` = mysql direct DB; FK checks off; truncate transactions,documents,document_items,document_transactions; FK checks on.^R5
 `purge_external_world(pool) -> counts` = transaction truncate customers,market_benchmark CASCADE.
@@ -1346,8 +1363,8 @@
 ^R2: User sign-off mandated snapshot before every purge; server gate independent of [UI]'s four-step “nuclear launch” confirmation.
 ^R3: No exec-free bulk mailbox wipe was implemented; scope name overstates result. Snapshot/restore-from-empty suggested but no endpoint automates it.
 ^R4: Appliance APIs preserve internal derived state better than DB truncation; however swallowed errors remain normal return values, so `_run_scope` logs `succeeded`; full purge also sees no exception and can report overall success with nonempty `errors`. Pagination/completeness guarantees absent.
-^R5: Direct truncate required due absent Akaunting bulk API. Nonzero mysql return code is returned, not raised, so operation may be logged succeeded. Table set may not represent full ledger state and initialization/reseed is operator responsibility.
-^R6: Plan required default roster reset/deprovision ordering; v1 intentionally empties [EM] and orphans Mattermost/Zammad/Wiki.js/mail accounts. README contradicts actual behavior.
+^R5: Direct truncate required due absent [AK] bulk API. Nonzero mysql return code is returned, not raised, so operation may be logged succeeded. Table set may not represent full ledger state and initialization/reseed is operator responsibility.
+^R6: Plan required default roster reset/deprovision ordering; v1 intentionally empties [EM] and orphans [MM]/[ZA]/[WK]/mail accounts. README contradicts actual behavior.
 ^R7: Earlier draft invented columns; disposable live test corrected to migration002 names.
 ^R8: Full purge uses one pre-full snapshot, not one snapshot per internal scope; intentional composition avoids ten huge snapshots. Best-effort/partial semantics mean destructive later scopes continue after earlier failure. No distributed rollback.
 
@@ -1361,7 +1378,7 @@
 ^R1: MySQL capability comes from OS CLI, not Python package; broad minimum versions are non-reproducible.
 
 ## File: /snapshot-manager/Dockerfile
-**Deps:** python:3.12-slim, PGDG apt repository, PostgreSQL client16, default-mysql-client, tar, snapshot-manager requirements/main
+**Deps:** python:3.12-slim, PGDG apt repository, [PG] client16, default-mysql-client, tar, snapshot-manager requirements/main
 **State:** image-build stateless; network-fetching build
 
 `apt bootstrap` = ca-certificates,wget,gnupg,lsb-release; +PGDG signing key/repo over HTTP repository with signed packages; +`postgresql-client-16`,default-mysql-client,tar; apt-list cleanup.
@@ -1385,7 +1402,7 @@
 ^R1: README/spec intent not implemented. This is a verified safety/audit-integrity defect, not wording-only staleness.
 
 ## File: /snapshot-manager/main.py
-**Deps:** [SV], [DB], [SC], Docker socket proxy, PostgreSQL16 CLI, MariaDB CLI, tar, shared named volumes, asyncpg/httpx
+**Deps:** [SV], [DB], [SC], Docker socket proxy, PostgreSQL16 CLI, [MY] CLI, tar, shared named volumes, [AS]/[HX]
 **State:** destructive stateful backup/restore coordinator
 
 `env` = `DATABASE_URL`; Postgres fallback vars; `SIM_CLOCK_URL`; `SOCKET_PROXY_URL=http://docker-socket-proxy:2375`; `SNAPSHOT_ROOT=/snapshots`; `MAILDIR_PATH=/maildir`; `NEXTCLOUD_DATA_PATH=/nextcloud_data`; DB passwords=`POSTGRES_PASSWORD|MATTERMOST_DB_PASSWORD|ZAMMAD_DB_PASSWORD|WIKIJS_DB_PASSWORD|NEXTCLOUD_DB_PASSWORD|WORDPRESS_DB_PASSWORD|AKAUNTING_DB_PASSWORD`.
@@ -1393,7 +1410,7 @@
 `POSTGRES_TARGETS` = narrative@postgres/<POSTGRES_DB>/<POSTGRES_USER>; mattermost@mattermost-db; zammad@zammad-db; wikijs@wikijs-db; nextcloud@nextcloud-db; each `pg_dump -Fc`.
 `MYSQL_TARGETS` = wordpress@wordpress-db; akaunting@akaunting-db; each own DB/user.
 `APP_CONTAINERS_BY_TARGET` = mattermost:[fakeco-mattermost]; zammad:[fakeco-zammad-nginx,fakeco-zammad-websocket,fakeco-zammad-scheduler,fakeco-zammad-railsserver]; wikijs,nextcloud,wordpress,akaunting; narrative:[]; mail=`fakeco-mailserver`.
-`topology` = one privileged sidecar crosses all state [NW] + holds every DB password + RW Maildir/Nextcloud volumes; socket proxy still `EXEC=0`, only CONTAINERS+POST start/stop.^R1
+`topology` = one privileged sidecar crosses all state [NW] + holds every DB password + RW Maildir/[NC] volumes; socket proxy still `EXEC=0`, only CONTAINERS+POST start/stop.^R1
 `lifespan` = pool1..5 + httpx60.
 `_unhandled_exception_handler` = JSON ERROR traceback->500.
 `set_maintenance_mode(pool,enabled,reason,set_by) -> id=1 UPSERT`
@@ -1426,8 +1443,8 @@
 `Maria restore` = pipe archive into mysql; rc0 authoritative.
 `Maildir restore` = untar into existing `/maildir` while mail stopped; no pre-clean.
 `Nextcloud files restore` = untar into existing mounted tree while app stopped; no pre-clean.
-`restart` = mail then reverse each target container list; Zammad reverse yields railsserver,scheduler,websocket,nginx; ignore failures.
-`note` = Zammad Elasticsearch not reindexed; search may remain stale.
+`restart` = mail then reverse each target container list; [ZA] reverse yields railsserver,scheduler,websocket,nginx; ignore failures.
+`note` = [ZA] Elasticsearch not reindexed; search may remain stale.
 `failure` = aggregate failed=>HTTP500; non-HTTP exception logged=>HTTP500; finally only speed1+maintenance false, not guaranteed container restart if exception occurs before explicit restart block.^R10
 `GET /health -> {status:ok}`.
 
@@ -1440,8 +1457,8 @@
 ^R6: Delete is storage-only; basename prevents traversal. Lack of confirmation relies on [UI] modal and recoverability is absent after deletion.
 ^R7: Restore snapshot_name can contain `..`/absolute semantics depending Path composition; unlike delete, no containment guard.
 ^R8: Manifest hashes provide evidence but are unused during restore; corrupt/tampered artifacts discovered only through tool failure, and valid-but-altered archives may restore silently.
-^R9: `--single-transaction` makes rc authoritative and prevents partial PostgreSQL restore; added after brittle `ERROR` substring heuristic. PostgreSQL client16/server16 alignment avoids PG17-only GUC.
-^R10: Zammad index is derived but stale after DB restore; no exec-free reindex API. More critically, unexpected exception before restart leaves stopped apps down because restart is inside try, not finally. Tar extraction overlays rather than exact-replaces, so post-snapshot extra files can survive restore.
+^R9: `--single-transaction` makes rc authoritative and prevents partial [PG] restore; added after brittle `ERROR` substring heuristic. [PG] client16/server16 alignment avoids PG17-only GUC.
+^R10: [ZA] index is derived but stale after DB restore; no exec-free reindex API. More critically, unexpected exception before restart leaves stopped apps down because restart is inside try, not finally. Tar extraction overlays rather than exact-replaces, so post-snapshot extra files can survive restore.
 
 ## File: /snapshot-manager/requirements.txt
 **Deps:** PyPI
@@ -1653,11 +1670,11 @@
 **RATIONALE**
 ^R1: Phase32 runtime speed API/cadence audit deferred by user; visible disabled shape preserves future UX without cosmetic fake control. Worker-scale omitted because user scrapped undefined concept.
 ^R2: Force-directed graph matches relationship network; ReactFlow manual positioning rejected.
-^R3: Pay cuts require unbuilt Phase24 `pay_negotiation`; UI plus accounting-engine increase-only validation prevent direct cut bypass.
+^R3: Pay cuts require unbuilt Phase24 `pay_negotiation`; UI plus [AE] increase-only validation prevent direct cut bypass.
 ^R4: Hardcoded metric previously rendered empty despite data; runtime available-metric selection fixes misleading blank scoreboard.
 ^R5: Multi-scope operation requires explicit acknowledgement of every selected destruction scope; server independently validates each and mandates pre-purge snapshot.
 ^R6: Iframes rejected because [AP] frame policies/login boundaries; credentials intentionally visible only inside dashboard-wide Basic Auth. This is operator convenience, not per-[AP] SSO.
-^R7: User required nuclear/scary Settings-only UX and at least 3 post-selection confirmations; implementation provides 3 staged confirmations after initial selection, while BFF + purge-manager add independent server gates and mandatory snapshot.
+^R7: User required nuclear/scary Settings-only UX and at least 3 post-selection confirmations; implementation provides 3 staged confirmations after initial selection, while BFF + [PM] add independent server gates and mandatory snapshot.
 
 ## File: /dashboard/frontend/src/styles.css
 **Deps:** [UI]
@@ -1696,10 +1713,10 @@
 `dev.proxy(/api) -> http://localhost:8000`
 
 **RATIONALE**
-^R1: Output outside frontend tree lets multistage image copy one static directory into same FastAPI container; no second web server/container.
+^R1: Output outside frontend tree lets multistage image copy one static directory into same [FA] container; no second web server/container.
 
 ## File: /dashboard/main.py
-**Deps:** [UI], [SV], [DB], [SC], [OR], [HB], [LLM], [AP], [OB], asyncpg, aiomysql, httpx, FastAPI, Pydantic, PyYAML
+**Deps:** [UI], [SV], [DB], [SC], [OR], [HB], [LLM], [AP], [OB], [AS], aiomysql, [HX], [FA], Pydantic, PyYAML
 **State:** stateful BFF; async pools + static serving; no business-domain ownership
 
 `env -> DATABASE_URL|POSTGRES_*; SIM_CLOCK_URL; ORCHESTRATOR_URL; LITELLM_CONFIG_PATH; PROVISIONING_URL; ACCOUNTING_ENGINE_URL; AKAUNTING_COMPANY_ID; AKAUNTING_PUBLIC_URL; EXTERNAL_WORLD_URL; KPI_ENGINE_URL; HUMAN_BRIDGE_URL; PURGE_MANAGER_URL; SNAPSHOT_MANAGER_URL; BRANDING_MANAGER_URL; AKAUNTING_DB_HOST|NAME|USER|PASSWORD; DASHBOARD_AUTH_USER|PASSWORD; LOKI_URL; MATTERMOST_URL|ADMIN_TOKEN|TEAM_ID; ZAMMAD_URL|ADMIN_TOKEN; PRINCIPAL_EMAIL; MAILSERVER_BOT_SECRET; KPI_SCOREBOARD_LOOKBACK_DAYS`
@@ -1765,18 +1782,18 @@
 `GET /<path> -> existing static file || index.html; auth required; route declared last ^R13`
 
 **RATIONALE**
-^R1: Roundcube password is never stored separately; exact provisioning derivation reproduced. Deep-link plaintext secrets are accepted single-[PR] convenience behind dashboard Basic Auth; no iframe/SSO.
+^R1: Roundcube password is never stored separately; exact [PV] derivation reproduced. Deep-link plaintext secrets are accepted single-[PR] convenience behind dashboard Basic Auth; no iframe/SSO.
 ^R2: Entire SPA/API fails closed if credentials absent. `/health` exemption is container-internal probe convention.
 ^R3: Uvicorn/Starlette unhandled tracebacks were plaintext and invisible to Promtail JSON `level`; explicit JSON re-log restores Errors panel visibility while generic response avoids traceback leakage. Starlette may still emit duplicate plaintext.
 ^R4: No proven keyless LiteLLM config-introspection endpoint; read-only mounted YAML avoids API-key plumbing.
 ^R5: Query intentionally identical to Phase31 Grafana source. At speed>1, wall-hour covers more sim-hours; division gives per-sim-hour burn.
 ^R6: PTO table uses sim-time, but query uses wall-clock `NOW()`; badge is approximate/display-only and never gates behavior.
-^R7: Direct ledger DB read avoids Akaunting REST `Host: accounting.fakecorp.internal` + `X-Company` quirks and follows Grafana Phase31 pattern. Optional pool failure degrades one chart, not BFF startup.
+^R7: Direct ledger DB read avoids [AK] REST `Host: accounting.fakecorp.internal` + `X-Company` quirks and follows Grafana Phase31 pattern. Optional pool failure degrades one chart, not BFF startup.
 ^R8: Tier is embedded only in audit reason; parser avoids recomputing review formula.
 ^R9: Branding manager lacks browser-reachable [NW]; BFF streams assets without duplicating files or exposing internal service.
-^R10: Client confirmations are UX only; purge-manager revalidates exact phrase and forces fresh pre-purge snapshot. BFF never performs deletion itself.
+^R10: Client confirmations are UX only; [PM] revalidates exact phrase and forces fresh pre-purge snapshot. BFF never performs deletion itself.
 ^R11: Promtail promotes JSON `level` to Loki label; label match avoids text scan. Fixed list limits query/control exposure.
-^R12: SSE is sufficient one-way near-live transport; no WebSocket dependency. Timestamp cursor provides at-most-once-by-timestamp behavior; equal-nanosecond distinct lines could theoretically collapse.
+^R12: [SE] is sufficient one-way near-live transport; no WebSocket dependency. Timestamp cursor provides at-most-once-by-timestamp behavior; equal-nanosecond distinct lines could theoretically collapse.
 ^R13: Catch-all after API routes enables SPA navigation while preserving real assets and auth.
 
 ## File: /dashboard/requirements.txt
@@ -1786,7 +1803,7 @@
 `fastapi>=0.115; uvicorn[standard]>=0.30; asyncpg>=0.29; httpx>=0.27; pydantic>=2; pyyaml>=6; aiomysql>=0.2`
 
 **RATIONALE**
-^R1: aiomysql supports direct Akaunting ledger read with no native client package; direct read shares Phase31 reporting semantics.
+^R1: aiomysql supports direct [AK] ledger read with no native client package; direct read shares Phase31 reporting semantics.
 
 ## File: /monitoring/README.md
 **Deps:** [OB], [CP], [NW], [AP], [DB], [LLM]
@@ -1814,7 +1831,7 @@
 ^R1: Stable datasource uid `Prometheus` decouples dashboard JSON from Grafana-generated identifiers.
 
 ## File: /monitoring/grafana/dashboards/customer-pipeline-revenue.json
-**Deps:** [OB], [DB], Akaunting MariaDB
+**Deps:** [OB], [DB], [AK] [MY]
 **State:** provisioned mixed-datasource dashboard; uid=fakeco-customer-pipeline-revenue; refresh=1m; range=30d
 
 `P1 pie -> customers count by relationship_status`
@@ -1827,7 +1844,7 @@
 ^R1: One dashboard intentionally mixes narrative pipeline intent with authoritative ledger realization; customer-to-transaction granularity lives in [UI], while Grafana reports aggregate ledger truth.
 
 ## File: /monitoring/grafana/dashboards/financials.json
-**Deps:** [OB], Akaunting MariaDB
+**Deps:** [OB], [AK] [MY]
 **State:** provisioned dashboard; uid=fakeco-financials; refresh=1m; range=7d
 
 `P1 cash USD -> SUM(account opening_balance)+SUM(income)-SUM(expense); company_id=1; nondeleted`
@@ -1838,7 +1855,7 @@
 `P6 table -> expense category count+SUM DESC`
 
 **RATIONALE**
-^R1: Direct DB reporting bypasses Akaunting API host/company-header bugs; admin credential reuse accepted by user for implementation simplicity.
+^R1: Direct DB reporting bypasses [AK] API host/company-header bugs; admin credential reuse accepted by user for implementation simplicity.
 
 ## File: /monitoring/grafana/dashboards/headcount-by-status.json
 **Deps:** [OB], [DB], [EM]
@@ -1914,21 +1931,21 @@
 `P5 logs -> {container=~"fakeco-traefik|fakeco-dns"}`
 
 **RATIONALE**
-^R1: Log volume is an activity proxy, not semantic business throughput. P5 query is exact source reused by [UI] SSE tail.
+^R1: Log volume is an activity proxy, not semantic business throughput. P5 query is exact source reused by [UI] [SE] tail.
 
 ## File: /monitoring/grafana/provisioning/dashboards/dashboards.yml
 **Deps:** [OB], Grafana
-**State:** provisioning definition
+**State:** [PV] definition
 
 `provider fakeco-dashboards -> orgId1/folder FakeCo/type=file/path=/var/lib/grafana/dashboards`
 `disableDeletion=false; updateIntervalSeconds=30; allowUiUpdates=true; foldersFromFilesStructure=false`
 
 **RATIONALE**
-^R1: Dashboard file provider polls live files; unlike datasource provisioning, dashboard changes need no Grafana restart. UI edits are allowed but file state remains declarative authority on reprovision.
+^R1: Dashboard file provider polls live files; unlike datasource [PV], dashboard changes need no Grafana restart. UI edits are allowed but file state remains declarative authority on reprovision.
 
 ## File: /monitoring/grafana/provisioning/datasources/datasources.yml
-**Deps:** [OB], [DB], [NW], Prometheus, Loki, PostgreSQL16, Akaunting MariaDB
-**State:** startup provisioning; apiVersion=1
+**Deps:** [OB], [DB], [NW], Prometheus, Loki, PostgreSQL16, [AK] [MY]
+**State:** startup [PV]; apiVersion=1
 
 `Prometheus(uid=Prometheus,url=http://prometheus:9090,default,proxy,immutable)`
 `Loki(uid=Loki,url=http://loki:3100,proxy,immutable)`
@@ -1937,8 +1954,8 @@
 
 **RATIONALE**
 ^R1: Fixed uids prevent persisted auto-generated uid mismatch; initial Phase11 setup required Grafana restart/one-time data-volume reset after uid correction.
-^R2: Existing admin DB credentials reused by explicit user choice; dedicated read-only roles would require cross-DB provisioning/migrations. Security compromise acceptable for single-operator isolated stack; revisit for multi-tenant exposure.
-^R3: Direct MariaDB access avoids Akaunting's mandatory Host+X-Company API headers.
+^R2: Existing admin DB credentials reused by explicit user choice; dedicated read-only roles would require cross-DB [PV]/migrations. Security compromise acceptable for single-operator isolated stack; revisit for multi-tenant exposure.
+^R3: Direct [MY] access avoids [AK]'s mandatory Host+X-Company API headers.
 
 ## File: /monitoring/loki-config.yaml
 **Deps:** [OB], [NW]
@@ -1984,7 +2001,7 @@
 
 **RATIONALE**
 ^R1: Raw Docker socket is an observability exception; Promtail needs read discovery/log access and is not an application control surface. Managed-label filter excludes unrelated host containers.
-^R2: Only JSON logs with `level` gain ERROR label; explicit global FastAPI exception handlers were added to re-log unhandled crashes as JSON. Appliance/plaintext errors remain unlabelled unless their format supplies level.
+^R2: Only JSON logs with `level` gain ERROR label; explicit global [FA] exception handlers were added to re-log unhandled crashes as JSON. Appliance/plaintext errors remain unlabelled unless their format supplies level.
 
 ## OPEN_GAPS
 `phase24 -> pay_negotiation invocation+pay-cut workflow absent`
@@ -2018,10 +2035,10 @@
 `P0 audit-continuity` = snapshot narrative dump/restore currently includes `system_audit_log` + `snapshot_purge_log` + maintenance row, violating authoritative clarification #8 and [MG]008 comments.
 `P0 restore-safety` = no manifest checksum/size verification; restore path traversal; app stop failures ignored; unexpected mid-restore exception can leave containers stopped; tar restore overlays stale files.
 `P1 purge-truthfulness` = email scope no raw mail purge; roster no reseed/deprovision; appliance errors/nonzero mysql can still log success; chat/ticket pagination/completeness absent; Wiki delete success not inspected; accounting table coverage/reseed incomplete.
-`P1 money-idempotency` = stable idempotency key not passed into Akaunting `number`; external POST+DB update non-atomic crash windows can duplicate expense/payroll/revenue/corrections; Zammad ticket failure retained without repair queue.
-`P1 audit-depth` = Books Auditor only repairs approved expense ref gaps; payroll latest10/presence-only; no real Akaunting reconciliation; revenue/payroll duplication/cross-ledger checks absent.
+`P1 money-idempotency` = stable [ID] key not passed into [AK] `number`; external POST+DB update non-atomic crash windows can duplicate expense/payroll/revenue/corrections; [ZA] ticket failure retained without repair queue.
+`P1 audit-depth` = Books Auditor only repairs approved expense ref gaps; payroll latest10/presence-only; no real [AK] reconciliation; revenue/payroll duplication/cross-ledger checks absent.
 `P1 state-preservation` = purge/snapshot always resume [SC] at1.0; saved sim_time/speed never restored; maintenance excludes [OR] only, not direct human/appliance writes.
-`P1 restore-derived-state` = Zammad Elasticsearch reindex manual; restored DB and search can disagree.
+`P1 restore-derived-state` = [ZA] Elasticsearch reindex manual; restored DB and search can disagree.
 `P2 pay-cuts` = Phase24 absent; endpoint only logs stub despite claims of meeting/reaction queue.
 `P2 stale-docs` = purge README wrong full phrase and reset semantics; snapshot README false audit exclusion/current stop behavior; accounting README pre-implementation wording.
 `P2 reproducibility` = Python requirements use minimum-only versions; snapshot image depends on external PGDG/PyPI at build.
