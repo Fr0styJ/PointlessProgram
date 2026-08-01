@@ -156,6 +156,63 @@ that call), which failed `json.loads()` and fell back to a degraded `"(parse err
 
 ---
 
+### 2026-08-01T04:15 — Bugfix: unhandled exceptions now logged in structured JSON (Errors panel gap closed)
+
+Fixed the STATUS HEADER-documented bug: uncaught ASGI/Starlette-level 500s (genuine unhandled
+exceptions inside a route handler, never explicitly passed to `log.error()`) were logged by
+uvicorn's own default exception handling as plaintext, non-JSON lines. Promtail's `level` label
+extraction (see `monitoring/promtail-config.yml`) only understands this repo's JSON log format, so
+these were invisible to Phase 37's dashboard Errors panel — even though an unhandled crash is
+arguably the single most important thing that panel should surface.
+
+**Fix**: added a `@app.exception_handler(Exception)` global handler to all 12 custom FastAPI
+services (`accounting-engine`, `orchestrator`, `human-bridge`, `dashboard`, `snapshot-manager`,
+`sim-clock`, `external-world`, `meeting-simulator`, `kpi-engine`, `branding-manager`,
+`purge-manager`, `provisioning` — the definitive list of `fakeco-*` services with a `build:` block
+in `docker-compose.yml`), duplicated identically per this repo's established "small logic
+duplicated across services, no shared library" convention. Each handler captures
+`traceback.format_exc()`, collapses it to one line (newlines → ` | `, `"` → `'` so it can't break
+the single-line JSON log format), and calls the service's own existing `log.error(...)` — same
+JSON format/logger as every other log line in that service — before returning a plain
+`{"detail": "Internal Server Error"}` 500 response. `HTTPException` (and Pydantic 422s) are
+unaffected: Starlette's `ExceptionMiddleware` matches `HTTPException` via exact-class MRO lookup
+before ever falling through to the bare `Exception` handler, so existing 4xx/intentional-5xx
+behavior is untouched and not double-logged as a false-positive ERROR.
+
+One caveat found during verification, not a regression: registering a handler for the bare
+`Exception` class is special-cased by Starlette (`starlette/applications.py`'s
+`build_middleware_stack` routes it to `ServerErrorMiddleware`'s `handler`, not
+`ExceptionMiddleware`), and `ServerErrorMiddleware.__call__` *always* re-raises after invoking that
+handler ("allows servers to log the error" per Starlette's own comment) — so uvicorn's own
+plaintext "Exception in ASGI application" dump still appears in `docker logs`, in addition to our
+new JSON line. This is normal, documented FastAPI/Starlette behavior for this pattern, not
+something our fix can (or should) suppress, and it doesn't affect the caller's response or the
+Errors panel — Loki/promtail simply now has the JSON line to key off of alongside the harmless
+plaintext duplicate.
+
+**Verified against the live `pointlessprogram` compose stack** (rebuilt only `kpi-engine` and
+`accounting-engine` from this worktree, `-p pointlessprogram --env-file <main>/.env`, all edits
+confined to worktree `agent-a6fde3e92dde396f3`):
+- `POST /expense/submit` with a nonexistent `requester_employee_id` hits a genuine unhandled
+  `ValueError` deep in `resolve_approver()` (not any explicit `log.error()` call) → caller gets a
+  clean `500 {"detail": "Internal Server Error"}` (no hang), `docker logs fakeco-accounting-engine`
+  now shows a `{"time":...,"level":"ERROR",...}` line with the exception type/message/traceback,
+  and a direct Loki query (`{service="accounting-engine", level="ERROR"}` via
+  `/loki/api/v1/query_range`) returns that exact line with `level: "ERROR"` correctly extracted as
+  a label — confirmed this would NOT have appeared in Loki with a `level` label before the fix
+  (only the plaintext uvicorn dump would have existed).
+- Repeated with `POST /expense/approve` on a nonexistent `approval_id` (different unhandled
+  `ValueError`, same result).
+- Confirmed no regression: `POST /expense/reject` with a nonexistent `approval_id` (an explicit
+  `raise HTTPException(status_code=404, ...)` path) still returns `404 {"detail": "Pending approval
+  ... not found"}` and produces **no** `level":"ERROR"` log line — legitimate 4xx client errors are
+  not polluting the Errors panel. Same for a Pydantic 422 (bad field type on `/expense/submit`).
+
+All 12 `main.py` files verified with `python -m py_compile` before rebuild. No other files
+changed.
+
+---
+
 ### 2026-08-01T04:00 — Merge note: Deep Links panel confirmed correct, but exposed a pre-existing `.env` completeness gap (Zammad/WordPress admin credentials never captured) — flagged for Phase 38
 
 While verifying Phase 37's merge into master, confirmed via a live `GET /api/deep-links` call that

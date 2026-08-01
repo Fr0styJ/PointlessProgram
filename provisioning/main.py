@@ -28,12 +28,14 @@ import logging
 import os
 import re
 import sys
+import traceback
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 logging.basicConfig(
@@ -653,6 +655,24 @@ app = FastAPI(
     version="1.0.0",
     lifespan=_lifespan,
 )
+
+
+# Bug fix (2026-08-01): uncaught ASGI/Starlette-level 500s previously logged
+# as plaintext uvicorn traceback lines that promtail's `level` extraction
+# can't parse, so real unhandled crashes were invisible to the Errors panel.
+# This handler re-logs any otherwise-unhandled exception via the app's own
+# JSON logger (same format/level label as every other log line) before
+# returning a 500. HTTPException is matched by FastAPI's own default
+# handler first (exact-class lookup in Starlette's exception middleware),
+# so explicit 4xx/5xx responses are unaffected and not double-logged here.
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    tb = traceback.format_exc().replace("\n", " | ").replace('"', "'")
+    log.error(
+        "Unhandled exception on %s %s: %s: %s | %s",
+        request.method, request.url.path, type(exc).__name__, exc, tb,
+    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 
 @app.get("/health")
