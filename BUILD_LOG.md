@@ -8,7 +8,7 @@
 |---|—--|
 | **Current Phase** | Phases 1–23 and 27–37 are ALL built and runtime-verified against a live `docker compose` stack (39+ containers). Phase 24 (pay negotiation / performance-review-driven pay cuts) genuinely not started. Phase 32 (simulation speed slider, full integration) explicitly DEFERRED by user sign-off — see `Future_Plans.md`. Phase 38 (hardening) is the only remaining phase, not started. |
 | **Percent Complete** | ~92%. Every functional phase in the original plan (1-23, 27-31, 33-37) is built AND live-verified with real appliance calls, not just written. What's left: Phase 24 (a real but scoped feature gap), Phase 32 (deliberately deferred, not blocking), and Phase 38 (hardening/polish — the last checkbox before calling the build "done"). |
-| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). Remaining real, flagged-but-unfixed bugs for Phase 38 to address: (1) `.env` never captured `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD` — Deep Links panel correctly shows these blank in this dev environment; (2) uncaught ASGI/Starlette-level 500s emit plaintext (non-JSON) uvicorn log lines that promtail's `level` label extraction can't parse, so the dashboard's Errors panel only sees application-level `log.error()` calls, not framework-level tracebacks; (3) a pre-existing Roundcube provisioning gap (`roundcube` DB was never initialized, appliance times out) unrelated to any dashboard phase; (4) meeting-simulator's intermittent LLM-output-truncation issue on longer transcripts (noted during Phase 28 crisis-scenario testing); (5) purge-manager's pg_restore-error heuristic (blunt substring match on `"ERROR"`) can misfire on a harmless NOTICE. |
+| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). Remaining real, flagged-but-unfixed bugs for Phase 38 to address: (1) ~~`.env` never captured `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD`~~ — FIXED 2026-08-01T04:30: Zammad admin password reset via `rails runner` (its REST API rejects password changes even from admin tokens), WordPress admin account created via its install wizard (the site had never actually been installed), both new credentials recorded in local `.env` and verified live via the Deep Links panel; (2) uncaught ASGI/Starlette-level 500s emit plaintext (non-JSON) uvicorn log lines that promtail's `level` label extraction can't parse, so the dashboard's Errors panel only sees application-level `log.error()` calls, not framework-level tracebacks; (3) a pre-existing Roundcube provisioning gap (`roundcube` DB was never initialized, appliance times out) unrelated to any dashboard phase; (4) meeting-simulator's intermittent LLM-output-truncation issue on longer transcripts (noted during Phase 28 crisis-scenario testing); (5) purge-manager's pg_restore-error heuristic (blunt substring match on `"ERROR"`) can misfire on a harmless NOTICE. |
 | **Exact Next Action** | Phase 38 (hardening) — the last remaining phase. Scope: graceful error states across the dashboard (Phase 33's dashboard-wide Basic Auth is already done, this is about UX-level error handling, not auth), closing the Zammad/WordPress `.env`/`.env.example` credential-completeness gap above, first-boot/bootstrap polish (e.g. automating the currently-manual Mattermost/Wiki.js/Zammad admin-token bootstrap steps), and writing the top-level `README.md` including a dashboard walkthrough (no top-level README exists yet). Phase 24 and Phase 32 are separately-trackable outstanding items — neither blocks starting or finishing Phase 38. |
 | **BLOCKER** | None. Docker Desktop running. All appliance credentials/tokens are in `.env` (gitignored) — a fresh clone needs a real `.env` populated before `docker compose up` will do anything useful. |
 
@@ -46,6 +46,45 @@
 ---
 
 ## LOG (newest first)
+
+---
+
+### 2026-08-01T04:30 — Fixed: Zammad/WordPress `.env` credential gap closed; both admin accounts now real, working, and populated in `.env`
+
+Root-caused the two blank Deep Links rows from the 04:00 entry by checking each appliance's actual
+first-boot bootstrap in `docker-compose.yml`:
+
+- **Zammad**: the `zammad-init` container only runs `zammad-init` (DB migrate + seed), which does
+  NOT accept any `ZAMMAD_ADMIN_*`-style env var to set the admin password on creation — the image
+  has no such hook. The admin account (`principal@fakecorp.internal`, user id 2, role "Admin") was
+  created with some password that was never captured anywhere. Fix: reset it directly via
+  `docker exec fakeco-zammad-railsserver bundle exec rails runner "User.find_by(email:
+  'principal@fakecorp.internal').update!(password: '<new password>')"` (the existing
+  `ZAMMAD_ADMIN_TOKEN` API route was tried first — `PATCH /api/v1/users/2` with a `password` field
+  returns `403 Not authorized (Exceptions::Forbidden)` even from an admin-permissioned token, since
+  Zammad's `UsersController` blocks password changes over the token-authenticated REST API as a
+  security measure — so the rails-runner route is the correct, supported mechanism here). Verified
+  by a fresh `GET /api/v1/users/me` with HTTP Basic Auth using the new email/password — 200 OK,
+  correct user returned.
+- **WordPress**: turned out to be a deeper gap than blank `.env` — the `wordpress` service block
+  doesn't even pass `WORDPRESS_ADMIN_*` env vars to the container (only DB connection vars), and
+  the official `wordpress` image doesn't auto-run the install wizard from env vars anyway. Confirmed
+  the site had genuinely never been installed at all: `GET /` 302-redirected to
+  `/wp-admin/install.php`. Completed the standard WordPress install flow by POSTing to
+  `install.php?step=2` (site title, admin username, password, email) exactly as the browser-based
+  wizard would, which created the first (admin) user. Verified by POSTing valid credentials to
+  `wp-login.php` and confirming the `wordpress_logged_in_*` cookie was set on the resulting 302 to
+  `/wp-admin/`.
+
+Recorded both sets of new credentials in `.env` (`ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`,
+`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD`) — `.env.example` already documented all four var
+names as blank placeholders per this repo's convention, so no `.env.example` changes were needed.
+Recreated the `dashboard` container so it picked up the new `.env` values (env vars are only
+interpolated at container-create time, a plain `restart` would not have been enough) and confirmed
+via `GET /api/deep-links` that both Zammad and WordPress rows now show real, non-blank
+username/password alongside the other six appliances. `.env` itself is gitignored and intentionally
+not part of this commit — the actual password values only exist in the local `.env` on this machine,
+by design.
 
 ---
 
