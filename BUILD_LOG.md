@@ -6,10 +6,10 @@
 
 | Field | Value |
 |---|—--|
-| **Current Phase** | Phases 1–18 and 21–22 all runtime-verified against a live `docker compose` stack. Phases 19-20, 23-38 not started (mostly still README-stub or nonexistent). |
-| **Percent Complete** | ~60% by code volume; walking skeleton (1-11) + custom services (12-18) + external-world (21-22) are genuinely running and tested, not just written. |
-| **Status** | Every phase from 1 through 18, plus 21/22, has been brought up in live Docker and exercised with real requests (not just "container starts") — full trail below. ~27 real runtime bugs found and fixed along the way (bad ports, broken image references, missing dependencies, wrong API field names, silent Python `.get()` gotchas, a router config bug, missing healthcheck binaries, 2 Zammad ticket-creation field bugs, etc.). external-world's `customers` table is now seeded (`005_customers_seed.sql`) and the Phase 22 prospect-generation loop is runtime-verified end-to-end (real Zammad tickets created). Three genuine feature gaps remain, identified and NOT quick-patched (flagged as dedicated follow-ups since they need real design work): Akaunting's payment-method resolver bug (blocks Phase 15 ledger posting), meeting-simulator's missing Wiki.js integration, human-bridge's missing Principal-content detection layer (Phase 17's actual core requirement), and orchestrator's missing priority-queue/pending_actions retry mechanism (Phase 18's actual core requirement). |
-| **Exact Next Action** | Pick one of: (a) resolve the 4 remaining flagged follow-up gaps above, (b) move on to genuinely unstarted phases (19 PTO, 20 relationships, 23 KPI engine, 29 purge/snapshot, 30 branding, 33-37 dashboard, 38 hardening). |
+| **Current Phase** | Phases 1–23 and 27–37 are ALL built and runtime-verified against a live `docker compose` stack (39+ containers). Phase 24 (pay negotiation / performance-review-driven pay cuts) genuinely not started. Phase 32 (simulation speed slider, full integration) explicitly DEFERRED by user sign-off — see `Future_Plans.md`. Phase 38 (hardening) is the only remaining phase, not started. |
+| **Percent Complete** | ~92%. Every functional phase in the original plan (1-23, 27-31, 33-37) is built AND live-verified with real appliance calls, not just written. What's left: Phase 24 (a real but scoped feature gap), Phase 32 (deliberately deferred, not blocking), and Phase 38 (hardening/polish — the last checkbox before calling the build "done"). |
+| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). Remaining real, flagged-but-unfixed bugs for Phase 38 to address: (1) `.env` never captured `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD` — Deep Links panel correctly shows these blank in this dev environment; (2) uncaught ASGI/Starlette-level 500s emit plaintext (non-JSON) uvicorn log lines that promtail's `level` label extraction can't parse, so the dashboard's Errors panel only sees application-level `log.error()` calls, not framework-level tracebacks; (3) a pre-existing Roundcube provisioning gap (`roundcube` DB was never initialized, appliance times out) unrelated to any dashboard phase; (4) meeting-simulator's intermittent LLM-output-truncation issue on longer transcripts (noted during Phase 28 crisis-scenario testing); (5) purge-manager's pg_restore-error heuristic (blunt substring match on `"ERROR"`) can misfire on a harmless NOTICE. |
+| **Exact Next Action** | Phase 38 (hardening) — the last remaining phase. Scope: graceful error states across the dashboard (Phase 33's dashboard-wide Basic Auth is already done, this is about UX-level error handling, not auth), closing the Zammad/WordPress `.env`/`.env.example` credential-completeness gap above, first-boot/bootstrap polish (e.g. automating the currently-manual Mattermost/Wiki.js/Zammad admin-token bootstrap steps), and writing the top-level `README.md` including a dashboard walkthrough (no top-level README exists yet). Phase 24 and Phase 32 are separately-trackable outstanding items — neither blocks starting or finishing Phase 38. |
 | **BLOCKER** | None. Docker Desktop running. All appliance credentials/tokens are in `.env` (gitignored) — a fresh clone needs a real `.env` populated before `docker compose up` will do anything useful. |
 
 **Environment:**
@@ -22,24 +22,26 @@
 **Ports / credentials / tokens:** None yet established. See `.env.example` for expected credential env vars.
 
 **Deliverables checklist (§27) — checked off as completed (code written AND runtime-verified unless noted):**
-- [x] `docker-compose.yml` (Phases 1–18 services defined; verified: Phase 1 only so far)
-- [x] `.env.example` / `.env` (all `:?required` vars present, incl. `MAILSERVER_BOT_SECRET` added 2026-07-31)
-- [x] `orchestrator/` (code written, Phase 18 — not yet runtime-verified)
-- [x] `meeting-simulator/` (code written, Phase 16 — not yet runtime-verified)
-- [x] `human-bridge/` (Phase 17 — action-injection API AND detection layer (Mattermost/Zammad/Wiki.js polling + IMAP mail polling → `narrative_events`/`pending_reactions`) both written and runtime-verified 2026-07-31T21:45)
-- [x] `sim-clock/` (code written, Phase 12 — not yet runtime-verified)
-- [x] `accounting-engine/` (code written, Phase 15 — not yet runtime-verified)
-- [ ] `purge-manager/` (README stub only, Phase 29 not started)
-- [ ] `snapshot-manager/` (README stub only, Phase 29 not started)
-- [~] `external-world/` (Phase 21/22 `main.py` written, 517 lines, but no `Dockerfile`/`requirements.txt`, not wired into `docker-compose.yml` — INCOMPLETE)
-- [ ] `kpi-engine/` (README stub only, Phase 23 not started)
-- [ ] `branding-manager/` (README stub only, Phase 30 not started)
-- [x] `narrative-db/` (migrations 001–005 written and runtime-verified — 005 adds `customers` seed data, Phase 13/22)
-- [ ] `dashboard/` (README stub only, Phases 33–37 not started)
-- [x] `provisioning/` (code written, Phase 14 — not yet runtime-verified)
-- [x] `litellm/config.yaml` (written, Phase 10 — not yet runtime-verified)
-- [x] `monitoring/` (Prometheus/Loki/Promtail configs written, Phases 2/11 — not yet runtime-verified)
-- [ ] README (top-level, Phase 38 — not started)
+- [x] `docker-compose.yml` (services for Phases 1–23, 27–37 all defined and profile-gated; runtime-verified)
+- [x] `.env.example` / `.env` (all `:?required` vars present; **known gap**: `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD` never populated in this dev `.env` — flagged for Phase 38, not a code bug)
+- [x] `orchestrator/` (Phase 18 core + Phase 27 `pending_actions` retry queue/chaos controls + Phase 28 crisis-event triggers + Phase 33 tick pause/resume — all written and runtime-verified)
+- [x] `meeting-simulator/` (Phase 16 core + Phase 20 relationship-affinity hooks — written and runtime-verified; `pay_negotiation` meeting-type schema exists per §6.4 but is never invoked by anything — that's Phase 24, not started)
+- [x] `human-bridge/` (Phase 17 action-injection API + detection layer, runtime-verified; Phase 35 added Wiki.js company-direction pinned-page sync, also runtime-verified)
+- [x] `sim-clock/` (Phase 12 — code written and runtime-verified)
+- [x] `accounting-engine/` (Phase 15 — written and runtime-verified; Akaunting `payment_method`/`X-Company` bug that blocked every real transaction post was found and fixed 2026-08-01T02:10)
+- [x] `purge-manager/` (Phase 29 — built and runtime-verified via disposable-stack round-trip testing; Phase 36 wired its full-purge flow into the dashboard's "nuclear launch" Settings control)
+- [x] `snapshot-manager/` (Phase 29 — built and runtime-verified, incl. a real pg_dump/pg_restore client-vs-server version bug found and fixed)
+- [x] `external-world/` (Phase 21/22 — `Dockerfile`/`requirements.txt` added, wired into `docker-compose.yml`, `customers` table seeded via `005_customers_seed.sql`, prospect-generation loop runtime-verified end-to-end with real Zammad tickets)
+- [x] `kpi-engine/` (Phase 23 — built and runtime-verified, incl. live rollup against real Zammad/Wiki.js/Mattermost/Akaunting; Phase 35 added the live-switchable auto-apply vs. review-and-approve toggle, migration 011)
+- [x] `branding-manager/` (Phase 30 — built and runtime-verified against an isolated stack; 3 real appliance-API bugs/gaps found and fixed, incl. Zammad avatar-API and Wiki.js avatar-storage workarounds)
+- [x] `narrative-db/` (migrations 001–011 written and runtime-verified — see migration-to-phase map: 001 sim_clock, 002 narrative_core, 003 employees, 004 additive_schemas, 005 customers_seed/Phase 22, 006 Phase 19 PTO, 007 branding/Phase 30, 008 Phase 29 purge/snapshots, 009 Phase 27 pending_actions, 010 Phase 28 crisis, 011 Phase 35 kpi_engine_config)
+- [x] `dashboard/` (Phases 33–37 — React/Vite + FastAPI BFF, all 37's worth of tabs built and runtime-verified: Simulation/LLM Status/Narrative (33), HR/Payroll/Accounting (34), External World/KPI/Company Direction (35), Chaos/Data Management/Branding + Settings nuclear-purge (36), TV wall/Errors panel/deep links/log tail (37))
+- [x] `provisioning/` (Phase 14 CLI — runtime-verified; Phase 34 added an HTTP "serve" mode with `/hire`/`/fire` for the dashboard, reusing the same underlying functions)
+- [x] `litellm/config.yaml` (Phase 10 — written and runtime-verified)
+- [x] `monitoring/` (Prometheus/Loki/Promtail, Phases 2/11 — runtime-verified; Phase 31 added 7 Grafana dashboards + Postgres/Akaunting-MySQL datasources, also runtime-verified)
+- [ ] README (top-level, Phase 38 — genuinely not started; no `README.md` exists at repo root)
+- [ ] Phase 24 (pay negotiation / performance-review pay cuts) — genuinely not started; blocked/stubbed pay-cut UI path exists in the Payroll tab pending this
+- [~] Phase 32 (simulation speed slider, full integration) — explicitly DEFERRED by user sign-off 2026-07-31, not a gap; see `Future_Plans.md`. Dashboard's Simulation tab ships the slider UI disabled with a "Coming Soon" badge.
 
 ---
 
