@@ -553,20 +553,48 @@ async def run_meeting(
         log.error("LLM call failed for meeting: %s", exc)
         raise
 
-    # Parse LLM output
-    try:
-        parsed = json.loads(raw_response)
-    except json.JSONDecodeError:
-        # Attempt to strip stray markdown fences
-        cleaned = raw_response.strip()
-        if cleaned.startswith("```"):
-            cleaned = "\n".join(cleaned.split("\n")[1:])
-        if cleaned.endswith("```"):
-            cleaned = "\n".join(cleaned.split("\n")[:-1])
+    def _try_parse(text: str):
+        """Try to parse raw LLM text as JSON, stripping stray markdown fences if present."""
         try:
-            parsed = json.loads(cleaned)
+            return json.loads(text)
+        except json.JSONDecodeError:
+            cleaned = text.strip()
+            if cleaned.startswith("```"):
+                cleaned = "\n".join(cleaned.split("\n")[1:])
+            if cleaned.endswith("```"):
+                cleaned = "\n".join(cleaned.split("\n")[:-1])
+            return json.loads(cleaned)
+
+    # Parse LLM output, with a genuine retry on truncation/parse failure.
+    # Root cause (Phase 28 crisis-scenario testing): on longer transcripts the model's
+    # JSON response can get cut off mid-sentence before the structure closes (hitting the
+    # token budget), which fails json.loads(). Retrying once with a higher max_tokens and an
+    # explicit "be more concise" instruction is more robust than just guessing a bigger fixed
+    # budget, since transcript length varies a lot by meeting type/attendee count.
+    try:
+        parsed = _try_parse(raw_response)
+    except json.JSONDecodeError:
+        log.warning(
+            "Meeting LLM output failed to parse as JSON (likely truncated, %d chars) — "
+            "retrying once with higher max_tokens and a conciseness instruction",
+            len(raw_response),
+        )
+        retry_messages = messages + [
+            {"role": "assistant", "content": raw_response},
+            {"role": "user", "content": (
+                "Your previous response was not valid, complete JSON (it may have been cut off "
+                "before the closing brace). Respond again with the SAME JSON object, but keep "
+                "transcript_summary and all string fields noticeably shorter and more concise so "
+                "the entire object fits well within the token budget. Respond with ONLY valid "
+                "JSON, no markdown fences, and make sure the JSON is fully closed."
+            )},
+        ]
+        try:
+            retry_response = await llm.chat(retry_messages, model="heavy", max_tokens=4000)
+            parsed = _try_parse(retry_response)
+            log.info("Meeting LLM retry succeeded — parsed valid JSON on second attempt")
         except Exception:
-            log.error("Could not parse LLM output as JSON:\n%s", raw_response[:500])
+            log.error("Could not parse LLM output as JSON even after retry:\n%s", raw_response[:500])
             parsed = {
                 "transcript_summary": raw_response[:1000],
                 "decisions": [],

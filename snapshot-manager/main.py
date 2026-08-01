@@ -409,13 +409,23 @@ async def snapshot_restore(req: RestoreRequest, pool: PoolDep):
                 continue
             env = {**os.environ, "PGPASSWORD": password}
             rc, out, err = run_subprocess(
-                ["pg_restore", "-h", host, "-U", user, "-d", db, "--clean", "--if-exists", str(src)],
+                [
+                    "pg_restore", "-h", host, "-U", user, "-d", db,
+                    "--clean", "--if-exists", "--single-transaction", str(src),
+                ],
                 env=env,
             )
-            # pg_restore commonly returns nonzero on harmless "does not exist, skipping" NOTICEs
-            # during --clean --if-exists on a target that doesn't have every object yet; treat
-            # presence of "ERROR" (not just ignorable NOTICE) as the real failure signal.
-            ok = "ERROR" not in err.upper() or rc == 0
+            # Exit code is the authoritative success/failure signal, not a substring grep on
+            # stderr (that heuristic used to misfire: pg_restore/psql routinely emit lines
+            # containing "ERROR"/"error" as part of harmless NOTICEs or its own informational
+            # summary line, e.g. "pg_restore: warning: errors ignored on restore: N" — a plain
+            # `"ERROR" in output` check can misclassify those as fatal, or miss a real failure
+            # whose message happens not to contain that literal word).
+            # --single-transaction makes the exit code fully trustworthy here: pg_restore wraps
+            # the whole restore in one transaction, so ANY genuine error aborts the transaction
+            # and pg_restore exits non-zero; harmless --if-exists "does not exist, skipping"
+            # NOTICEs never affect the exit code either way.
+            ok = rc == 0
             results[name] = {"ok": ok, "returncode": rc, "stderr": err[-800:] if err else ""}
             overall_ok = overall_ok and ok
 

@@ -8,7 +8,7 @@
 |---|—--|
 | **Current Phase** | Phases 1–23 and 27–37 are ALL built and runtime-verified against a live `docker compose` stack (39+ containers). Phase 24 (pay negotiation / performance-review-driven pay cuts) genuinely not started. Phase 32 (simulation speed slider, full integration) explicitly DEFERRED by user sign-off — see `Future_Plans.md`. Phase 38 (hardening) is the only remaining phase, not started. |
 | **Percent Complete** | ~92%. Every functional phase in the original plan (1-23, 27-31, 33-37) is built AND live-verified with real appliance calls, not just written. What's left: Phase 24 (a real but scoped feature gap), Phase 32 (deliberately deferred, not blocking), and Phase 38 (hardening/polish — the last checkbox before calling the build "done"). |
-| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). Remaining real, flagged-but-unfixed bugs for Phase 38 to address: (1) ~~`.env` never captured `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD`~~ — FIXED 2026-08-01T04:30: Zammad admin password reset via `rails runner` (its REST API rejects password changes even from admin tokens), WordPress admin account created via its install wizard (the site had never actually been installed), both new credentials recorded in local `.env` and verified live via the Deep Links panel; (2) uncaught ASGI/Starlette-level 500s emit plaintext (non-JSON) uvicorn log lines that promtail's `level` label extraction can't parse, so the dashboard's Errors panel only sees application-level `log.error()` calls, not framework-level tracebacks; (3) a pre-existing Roundcube provisioning gap (`roundcube` DB was never initialized, appliance times out) unrelated to any dashboard phase; (4) meeting-simulator's intermittent LLM-output-truncation issue on longer transcripts (noted during Phase 28 crisis-scenario testing); (5) purge-manager's pg_restore-error heuristic (blunt substring match on `"ERROR"`) can misfire on a harmless NOTICE. |
+| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). Bug status as of 2026-08-01T04:30 (3 of 5 originally-flagged Phase 38 bugs now fixed via 3 parallel bugfix agents, see LOG entries below for full detail): (1) ~~`.env` never captured `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD`~~ — **FIXED** 2026-08-01T04:30 (Zammad admin password reset via `rails runner`, WordPress admin account created via its install wizard, both verified live via the Deep Links panel); (2) uncaught ASGI/Starlette-level 500s emitting unparseable plaintext logs, invisible to the dashboard's Errors panel — **FIXED** 2026-08-01T04:15 (global `@app.exception_handler(Exception)` added to all 12 custom FastAPI services, logging via the existing JSON format so `level="ERROR"` is now extractable by promtail; verified a real unhandled exception now appears in Loki with a proper level label, while legitimate 4xx `HTTPException`s remain unaffected); (3) a pre-existing Roundcube provisioning gap (`roundcube` DB was never initialized, appliance times out) — still **UNFIXED**, deliberately held out of this bugfix batch as a larger provisioning task, tracked separately for Phase 38; (4) meeting-simulator's intermittent LLM-output-truncation issue on longer transcripts — **FIXED** 2026-08-01T04:12 (genuine retry-on-parse-failure with higher `max_tokens` and a conciseness follow-up prompt, confirmed live via a real failure→retry→success cycle in logs); (5) purge-manager's/snapshot-manager's pg_restore-error heuristic (blunt substring match on `"ERROR"`) — **FIXED** 2026-08-01T04:14 (replaced with an authoritative exit-code check plus `--single-transaction`, confirmed live against both a real success case and a real induced failure case). |
 | **Exact Next Action** | Phase 38 (hardening) — the last remaining phase. Scope: graceful error states across the dashboard (Phase 33's dashboard-wide Basic Auth is already done, this is about UX-level error handling, not auth), closing the Zammad/WordPress `.env`/`.env.example` credential-completeness gap above, first-boot/bootstrap polish (e.g. automating the currently-manual Mattermost/Wiki.js/Zammad admin-token bootstrap steps), and writing the top-level `README.md` including a dashboard walkthrough (no top-level README exists yet). Phase 24 and Phase 32 are separately-trackable outstanding items — neither blocks starting or finishing Phase 38. |
 | **BLOCKER** | None. Docker Desktop running. All appliance credentials/tokens are in `.env` (gitignored) — a fresh clone needs a real `.env` populated before `docker compose up` will do anything useful. |
 
@@ -23,14 +23,14 @@
 
 **Deliverables checklist (§27) — checked off as completed (code written AND runtime-verified unless noted):**
 - [x] `docker-compose.yml` (services for Phases 1–23, 27–37 all defined and profile-gated; runtime-verified)
-- [x] `.env.example` / `.env` (all `:?required` vars present; **known gap**: `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD` never populated in this dev `.env` — flagged for Phase 38, not a code bug)
+- [x] `.env.example` / `.env` (all `:?required` vars present; `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD` gap fixed 2026-08-01T04:30)
 - [x] `orchestrator/` (Phase 18 core + Phase 27 `pending_actions` retry queue/chaos controls + Phase 28 crisis-event triggers + Phase 33 tick pause/resume — all written and runtime-verified)
 - [x] `meeting-simulator/` (Phase 16 core + Phase 20 relationship-affinity hooks — written and runtime-verified; `pay_negotiation` meeting-type schema exists per §6.4 but is never invoked by anything — that's Phase 24, not started)
 - [x] `human-bridge/` (Phase 17 action-injection API + detection layer, runtime-verified; Phase 35 added Wiki.js company-direction pinned-page sync, also runtime-verified)
 - [x] `sim-clock/` (Phase 12 — code written and runtime-verified)
 - [x] `accounting-engine/` (Phase 15 — written and runtime-verified; Akaunting `payment_method`/`X-Company` bug that blocked every real transaction post was found and fixed 2026-08-01T02:10)
 - [x] `purge-manager/` (Phase 29 — built and runtime-verified via disposable-stack round-trip testing; Phase 36 wired its full-purge flow into the dashboard's "nuclear launch" Settings control)
-- [x] `snapshot-manager/` (Phase 29 — built and runtime-verified, incl. a real pg_dump/pg_restore client-vs-server version bug found and fixed)
+- [x] `snapshot-manager/` (Phase 29 — built and runtime-verified, incl. a real pg_dump/pg_restore client-vs-server version bug found and fixed; restore success/failure heuristic fixed 2026-08-01T04:14 to use exit codes instead of a substring match)
 - [x] `external-world/` (Phase 21/22 — `Dockerfile`/`requirements.txt` added, wired into `docker-compose.yml`, `customers` table seeded via `005_customers_seed.sql`, prospect-generation loop runtime-verified end-to-end with real Zammad tickets)
 - [x] `kpi-engine/` (Phase 23 — built and runtime-verified, incl. live rollup against real Zammad/Wiki.js/Mattermost/Akaunting; Phase 35 added the live-switchable auto-apply vs. review-and-approve toggle, migration 011)
 - [x] `branding-manager/` (Phase 30 — built and runtime-verified against an isolated stack; 3 real appliance-API bugs/gaps found and fixed, incl. Zammad avatar-API and Wiki.js avatar-storage workarounds)
@@ -85,6 +85,74 @@ via `GET /api/deep-links` that both Zammad and WordPress rows now show real, non
 username/password alongside the other six appliances. `.env` itself is gitignored and intentionally
 not part of this commit — the actual password values only exist in the local `.env` on this machine,
 by design.
+
+---
+
+### 2026-08-01T04:14 — Fixed purge-manager/snapshot-manager: pg_restore success/failure now determined by exit code, not a blunt `"ERROR"` substring match — runtime-verified
+
+Fixed Phase 38 flagged bug (5): `snapshot-manager/main.py`'s `/snapshot/restore` handler
+previously computed `ok = "ERROR" not in err.upper() or rc == 0` — a substring grep on
+`pg_restore`'s stderr that could misfire in both directions (pg_restore/psql routinely emit
+lines containing "error"/"ERROR" as part of harmless NOTICEs or its own informational summary
+line like `pg_restore: warning: errors ignored on restore: N`, and the same heuristic could also
+mask a genuine failure whose message text didn't happen to contain that literal word).
+- **Fix:** added `--single-transaction` to the `pg_restore` invocation (in addition to the
+  existing `--clean --if-exists`) so the entire restore runs as one transaction — any genuine
+  error aborts it and pg_restore exits non-zero, while harmless `--if-exists` "does not exist,
+  skipping" NOTICEs never affect the exit code. Replaced the substring heuristic with
+  `ok = rc == 0`, keeping full stdout/stderr capture in `results[name]["stderr"]` for diagnostics
+  (logging untouched, only the pass/fail decision changed).
+- **Runtime-verified** against the live primary stack from an isolated worktree (no destructive
+  full restore run against primary's live data — used a disposable/manual round-trip instead,
+  matching Phase 29's own original test methodology):
+  - Ran a real `/snapshot/save` (label `bugfix-verify`) — succeeded, all 9 artifacts captured.
+  - **Success case:** manually ran the exact `pg_restore -h wikijs-db -U wikijs -d wikijs
+    --clean --if-exists --single-transaction <dump>` command from inside `snapshot-manager`'s
+    container against the just-captured `wikijs.sql` dump (restoring wikijs's DB back onto
+    itself — a no-op content-wise) → `rc=0`, confirming the new `ok = rc == 0` check passes.
+  - **Failure case:** truncated the same dump file to 2000 bytes (genuinely corrupt archive) and
+    re-ran the identical `pg_restore --single-transaction` command → `pg_restore: error: could
+    not read from input file: end of file`, `rc=1`, confirming a real failure is now correctly
+    detected by exit code (the old substring heuristic would have needed the literal word "ERROR"
+    to appear, which this message does contain, but the fix removes that fragile dependency
+    entirely).
+  - Deleted the test snapshot afterward (`DELETE /snapshot/{name}` → 200) — no artifacts left
+    behind, no primary stack containers were stopped or otherwise disrupted by this test.
+- **Files touched:** `snapshot-manager/main.py`, `BUILD_LOG.md`
+
+---
+
+### 2026-08-01T04:12 — Fixed meeting-simulator: intermittent LLM-output-truncation on longer transcripts now recovered via a genuine retry-on-parse-failure — runtime-verified live
+
+Fixed Phase 38 flagged bug (4), first noted during Phase 28 crisis-scenario testing: on longer
+transcripts (many attendees / long `custom_text`), the `heavy` model's JSON response could get
+cut off mid-sentence before the JSON structure closed (hitting the `max_tokens=2500` budget on
+that call), which failed `json.loads()` and fell back to a degraded `"(parse error)"` result with
+`action_items_created: 0`.
+- **Root-cause confirmed live** (see verification below): the prompt already asks for JSON only,
+  first and only (no separate prose-transcript-then-JSON split to restructure), so the fix
+  targeted the actual failure mode — truncation — rather than the prompt shape.
+- **Fix (retry-on-parse-failure):** in `meeting-simulator/main.py`'s `run_meeting()`, factored the
+  parse-with-fence-stripping logic into a `_try_parse()` helper, then wrapped it: on a
+  `json.JSONDecodeError`, the code now retries the LLM call exactly once with (a) a higher
+  `max_tokens` (4000 vs. the original 2500) and (b) an explicit follow-up user message asking the
+  model to resend the same JSON object but noticeably more concise so it fits the budget and is
+  fully closed. Only if the retry *also* fails to parse does it fall back to the original
+  degraded `"(parse error)"` result. Chosen over blindly raising the base `max_tokens` (doesn't
+  fix the root cause of variable-length transcripts) or restructuring the prompt (already
+  JSON-first) — retry is the most robust, lowest-risk option per the flagged bug's own guidance.
+- **Runtime-verified** against the live primary stack from an isolated worktree: rebuilt and
+  recreated `fakeco-meeting-simulator`, then triggered a real crisis event via orchestrator's
+  `POST /chaos/trigger-event` (`scenario: "custom"`) with a long, multi-department `custom_text`
+  designed to produce a long transcript. Container logs confirm the exact failure-then-recovery
+  path fired for real:
+  - `"Meeting LLM output failed to parse as JSON (likely truncated, 4808 chars) — retrying once
+    with higher max_tokens and a conciseness instruction"`
+  - `"Meeting LLM retry succeeded — parsed valid JSON on second attempt"`
+  - Meeting completed normally end-to-end afterward (affinity updates applied, posted to
+    Mattermost, Wiki.js meeting-notes page created) — response showed a real structured outcome
+    (`"action_items_created":5`), not the degraded parse-error path.
+- **Files touched:** `meeting-simulator/main.py`, `BUILD_LOG.md`
 
 ---
 
