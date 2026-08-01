@@ -17,6 +17,7 @@ All actions are logged to system_audit_log with actor='principal'.
 API is the backend for the Phase 33 dashboard's "Principal Control" tab.
 """
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -65,6 +66,17 @@ ACCOUNTING_ENGINE_URL = os.environ.get("ACCOUNTING_ENGINE_URL", "http://accounti
 MEETING_SIM_URL = os.environ.get("MEETING_SIM_URL", "http://meeting-simulator:8000")
 PRINCIPAL_EMAIL = os.environ.get("PRINCIPAL_EMAIL", "principal@fakecorp.internal")
 PRINCIPAL_NAME = os.environ.get("PRINCIPAL_NAME", "Admin")
+
+# Narrative-driven appliance content creation (Feature added alongside migration 012)
+WORDPRESS_URL = os.environ.get("WORDPRESS_URL", "http://wordpress")
+WORDPRESS_ADMIN_USER = os.environ.get("WORDPRESS_ADMIN_USER", "principal")
+WORDPRESS_ADMIN_APP_PASSWORD = os.environ.get("WORDPRESS_ADMIN_APP_PASSWORD", "")
+NEXTCLOUD_URL = os.environ.get("NEXTCLOUD_URL", "http://nextcloud")
+NEXTCLOUD_ADMIN_USER = os.environ.get("NEXTCLOUD_ADMIN_USER", "admin")
+NEXTCLOUD_ADMIN_PASSWORD = os.environ.get("NEXTCLOUD_ADMIN_PASSWORD", "placeholder")
+LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000")
+LITELLM_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
+DELIVERABLE_POLL_INTERVAL_SECONDS = float(os.environ.get("DELIVERABLE_POLL_INTERVAL_SECONDS", "30"))
 
 # Mailserver bot secret (same as provisioning — derive bot passwords)
 import hashlib
@@ -661,6 +673,390 @@ async def _detection_loop(pool: asyncpg.Pool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Narrative-driven appliance content creation
+# Feature (added with migration 012_deliverable_action_items.sql)
+#
+# Motivation: meeting-simulator's LLM output can flag a specific action_item
+# as requiring a real artifact (deliverable_type='wordpress_post' or
+# 'nextcloud_file'). This fulfillment loop picks up those items, calls LiteLLM
+# to generate narrative-grounded content (using the action item description
+# + thread context), and posts to the real appliance. Zero random or periodic
+# content — every artifact is attributable to a specific meeting outcome.
+#
+# WordPress: REST API via Application Password auth (Basic Auth with
+#   username:app_password, requires the mu-plugin that bypasses HTTPS-only
+#   restriction — see fix_wp_app_passwords.php notes).
+# Nextcloud:  WebDAV PUT to /remote.php/dav/files/{user}/{path}.
+# ---------------------------------------------------------------------------
+
+class _LLMClient:
+    """Minimal LiteLLM chat client for content generation (cheap tier)."""
+    def __init__(self, base_url: str, api_key: str):
+        self.base = base_url.rstrip("/")
+        self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    async def chat(self, messages: list[dict], model: str = "cheap", max_tokens: int = 1500) -> str:
+        async with httpx.AsyncClient(headers=self.headers, timeout=90.0) as http:
+            r = await http.post(f"{self.base}/chat/completions", json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.7,
+            })
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+
+class _WordPressClient:
+    """
+    WordPress REST API client using Application Password auth.
+    The Authorization header is passed as Basic auth (user:app_password).
+    Application Passwords require the mu-plugin that allows them over HTTP
+    (see fix_wp_app_passwords.php: wp_is_application_passwords_available filter).
+    """
+    def __init__(self, base_url: str, username: str, app_password: str):
+        self.base = base_url.rstrip("/")
+        raw = f"{username}:{app_password}"
+        self._auth = "Basic " + base64.b64encode(raw.encode()).decode()
+        self.headers = {"Authorization": self._auth, "Content-Type": "application/json"}
+
+    async def create_post(self, title: str, content: str, excerpt: str = "") -> dict:
+        """
+        Create a published WordPress post. Returns the full post object from the
+        REST API including 'id', 'link', and 'slug'.
+        """
+        async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as http:
+            r = await http.post(f"{self.base}/wp-json/wp/v2/posts", json={
+                "title": title,
+                "content": content,
+                "excerpt": excerpt,
+                "status": "publish",
+            })
+            r.raise_for_status()
+            return r.json()
+
+
+class _NextcloudClient:
+    """
+    Nextcloud WebDAV client for file creation.
+    Uses Basic auth with the admin credentials.
+    Path convention: FakeCo-Docs/{department}/{filename}.md
+    """
+    def __init__(self, base_url: str, username: str, password: str):
+        self.dav_base = base_url.rstrip("/") + f"/remote.php/dav/files/{username}"
+        raw = f"{username}:{password}"
+        self._auth = "Basic " + base64.b64encode(raw.encode()).decode()
+        self.headers = {"Authorization": self._auth}
+
+    async def put_file(self, path: str, content: str) -> str:
+        """
+        PUT a file at {dav_base}/{path}. Creates parent directories if needed
+        (Nextcloud WebDAV auto-creates missing parents on PUT). Returns the full
+        WebDAV URL of the created file.
+        """
+        url = f"{self.dav_base}/{path.lstrip('/')}"
+        async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as http:
+            r = await http.put(url, content=content.encode("utf-8"), headers={
+                **self.headers,
+                "Content-Type": "text/markdown; charset=utf-8",
+            })
+            # WebDAV PUT returns 201 (Created) or 204 (No Content / overwrite)
+            if r.status_code not in (201, 204):
+                r.raise_for_status()
+        return url
+
+
+async def _generate_content_for_action_item(
+    llm: _LLMClient,
+    action_description: str,
+    thread_summary: str,
+    employee_name: str,
+    deliverable_type: str,
+    sim_time: datetime,
+) -> dict:
+    """
+    Call LiteLLM to generate narrative-grounded content for a deliverable action
+    item. Returns {"title": str, "content": str, "excerpt": str}.
+    Content is derived from the action item's description and thread context,
+    NOT randomly generated — the LLM has explicit context to work from.
+    """
+    if deliverable_type == "wordpress_post":
+        format_instructions = (
+            "Write a professional, publishable company blog post or news announcement "
+            "for FakeCo's public-facing website. Use plain text with simple paragraph "
+            "breaks (no markdown headers). Length: 3–4 paragraphs. Tone: professional "
+            "but approachable. Do NOT invent facts — only use what is in the context below."
+        )
+    else:  # nextcloud_file
+        format_instructions = (
+            "Write an internal business document in Markdown format. Use headers (##), "
+            "bullet lists, and a clear structure. Length: 4–6 sections. Tone: professional, "
+            "concise, direct. Do NOT invent facts — only use what is in the context below."
+        )
+
+    system_msg = (
+        f"You are a content writer at FakeCo, a B2B software company. "
+        f"The simulation date is {sim_time.strftime('%B %d, %Y')}.\n"
+        f"Your job is to produce real business content based on actual events — never filler text."
+    )
+    user_msg = (
+        f"The following action item was assigned to {employee_name} as an outcome of a FakeCo meeting:\n"
+        f"Action: {action_description}\n\n"
+        f"Narrative context (meeting thread summary): {thread_summary or 'No additional context.'}\n\n"
+        f"{format_instructions}\n\n"
+        f"Respond with a JSON object containing:\n"
+        f"  title: short, descriptive title (max 80 chars)\n"
+        f"  content: the full document/post body\n"
+        f"  excerpt: one-sentence summary (for WordPress excerpt / Nextcloud metadata)\n"
+        f"Respond with ONLY valid JSON, no markdown fences."
+    )
+    raw = await llm.chat(
+        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
+        model="cheap",
+        max_tokens=1200,
+    )
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        # Strip markdown fences if the model added them despite instructions
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[1:])
+        if cleaned.endswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[:-1])
+        try:
+            parsed = json.loads(cleaned)
+        except Exception:
+            # Fallback: treat the whole output as the content
+            parsed = {"title": action_description[:80], "content": raw, "excerpt": action_description[:200]}
+    return {
+        "title": str(parsed.get("title", action_description[:80])),
+        "content": str(parsed.get("content", "")),
+        "excerpt": str(parsed.get("excerpt", action_description[:200])),
+    }
+
+
+async def _fulfill_one_deliverable(
+    conn: asyncpg.Connection,
+    row: asyncpg.Record,
+    llm: _LLMClient,
+    wp: _WordPressClient,
+    nc: _NextcloudClient,
+    sim_time: datetime,
+) -> None:
+    """
+    Fulfill a single open action_item with a non-null deliverable_type.
+    Steps:
+      1. Fetch context (thread summary, employee name).
+      2. Call LiteLLM to generate narrative content from that context.
+      3. POST to WordPress or PUT to Nextcloud.
+      4. Mark action_item done, write deliverable_url + fulfilled_at.
+      5. Insert a narrative_event(origin='ai', source_type='wiki'/'external')
+         so the fulfillment is traceable in the narrative backlog.
+      6. Write a system_audit_log entry.
+    All side effects happen in a single logical sequence; if the appliance call
+    fails the action_item row is left open so the next poll cycle retries.
+    """
+    item_id: int = row["id"]
+    description: str = row["description"]
+    deliverable_type: str = row["deliverable_type"]
+    thread_id = row["thread_id"]
+    owner_id = row["owner_employee_id"]
+
+    # 1. Fetch context
+    thread = await conn.fetchrow(
+        "SELECT summary, topic, department FROM narrative_threads WHERE id = $1", thread_id
+    ) if thread_id else None
+    thread_summary = (thread["summary"] or thread["topic"] if thread else "") or ""
+
+    employee = await conn.fetchrow(
+        "SELECT name, department FROM employees WHERE id = $1", owner_id
+    )
+    employee_name = employee["name"] if employee else "Unknown"
+    department = (employee["department"] if employee else None) or "General"
+
+    # 2. Generate content via LLM
+    try:
+        generated = await _generate_content_for_action_item(
+            llm=llm,
+            action_description=description,
+            thread_summary=thread_summary,
+            employee_name=employee_name,
+            deliverable_type=deliverable_type,
+            sim_time=sim_time,
+        )
+    except Exception as exc:
+        log.error("human-bridge: LLM content generation failed for action_item %d: %s", item_id, exc)
+        return  # Leave the action_item open; retry next poll cycle
+
+    title = generated["title"]
+    content = generated["content"]
+    excerpt = generated["excerpt"]
+    deliverable_url: Optional[str] = None
+
+    # 3. Post to the real appliance
+    try:
+        if deliverable_type == "wordpress_post":
+            post = await wp.create_post(title=title, content=content, excerpt=excerpt)
+            # The 'link' field is the public-facing URL for this post
+            deliverable_url = post.get("link") or f"{WORDPRESS_URL}/wp-json/wp/v2/posts/{post.get('id')}"
+            log.info(
+                "human-bridge: published WordPress post '%s' (id=%s) for action_item %d",
+                title, post.get("id"), item_id,
+            )
+        elif deliverable_type == "nextcloud_file":
+            # Path: FakeCo-Docs/{department}/{sim_date}-{item_id}-{slug}.md
+            safe_title = title[:50].replace(" ", "-").replace("/", "-")
+            nc_path = (
+                f"FakeCo-Docs/{department}/"
+                f"{sim_time.strftime('%Y-%m-%d')}-ai-{item_id}-{safe_title}.md"
+            )
+            # Prepend a YAML front matter block for metadata
+            file_content = (
+                f"---\n"
+                f"title: {title}\n"
+                f"author: {employee_name}\n"
+                f"date: {sim_time.strftime('%Y-%m-%d')}\n"
+                f"context: action_item:{item_id}\n"
+                f"thread_id: {thread_id or 'n/a'}\n"
+                f"---\n\n"
+                f"{content}"
+            )
+            deliverable_url = await nc.put_file(nc_path, file_content)
+            log.info(
+                "human-bridge: created Nextcloud file '%s' for action_item %d",
+                nc_path, item_id,
+            )
+    except Exception as exc:
+        log.error(
+            "human-bridge: appliance call failed for action_item %d (%s): %s",
+            item_id, deliverable_type, exc,
+        )
+        return  # Leave the action_item open; retry next poll cycle
+
+    # 4. Mark done, write deliverable_url and fulfilled_at
+    await conn.execute("""
+        UPDATE action_items
+        SET status = 'done',
+            deliverable_url = $2,
+            deliverable_fulfilled_at = $3
+        WHERE id = $1
+    """, item_id, deliverable_url, datetime.now(timezone.utc))
+
+    # 5. narrative_event so the fulfillment appears in the thread timeline
+    source_type = "wiki" if deliverable_type == "nextcloud_file" else "external"
+    await conn.execute("""
+        INSERT INTO narrative_events
+            (thread_id, employee_id, origin, source_type, source_ref, short_summary, created_at)
+        VALUES ($1, $2, 'ai', $3, $4, $5, $6)
+    """,
+        thread_id, owner_id,
+        source_type,
+        f"{deliverable_type}:action_item:{item_id}",
+        f"{employee_name} fulfilled deliverable: '{title}' "
+        f"({deliverable_type.replace('_', ' ')}) — {excerpt[:200]}",
+        sim_time,
+    )
+
+    # 6. system_audit_log
+    await audit_log(conn, "human-bridge", "deliverable_fulfilled", {
+        "action_item_id": item_id,
+        "deliverable_type": deliverable_type,
+        "deliverable_url": deliverable_url,
+        "title": title,
+        "thread_id": thread_id,
+        "employee_id": owner_id,
+    })
+
+
+async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
+    """
+    Background loop: polls for open action_items with deliverable_type set,
+    generates narrative content via LiteLLM, and posts to WordPress or Nextcloud.
+
+    Design invariants:
+    - Only acts on action_items that have deliverable_type != NULL (set by
+      meeting-simulator based on explicit LLM output requesting a document).
+    - Every piece of content is grounded in that action item's description +
+      thread context — no random or periodic content generation.
+    - If the LLM call or appliance POST fails, the row stays 'open' and the
+      next poll cycle retries (cheap — cheap-tier LLM, no DB state changes on
+      failure).
+    - Skips items with deliverable_url already set (already fulfilled).
+    """
+    # Allow a startup grace period before the first poll
+    await asyncio.sleep(15.0)
+
+    if not WORDPRESS_ADMIN_APP_PASSWORD:
+        log.warning(
+            "human-bridge: WORDPRESS_ADMIN_APP_PASSWORD not set — "
+            "deliverable fulfillment loop will skip wordpress_post items"
+        )
+    if not LITELLM_API_KEY:
+        log.warning(
+            "human-bridge: LITELLM_MASTER_KEY not set — "
+            "deliverable fulfillment loop will not generate content"
+        )
+
+    llm = _LLMClient(LITELLM_URL, LITELLM_API_KEY)
+    wp  = _WordPressClient(WORDPRESS_URL, WORDPRESS_ADMIN_USER, WORDPRESS_ADMIN_APP_PASSWORD)
+    nc  = _NextcloudClient(NEXTCLOUD_URL, NEXTCLOUD_ADMIN_USER, NEXTCLOUD_ADMIN_PASSWORD)
+
+    log.info(
+        "human-bridge: deliverable fulfillment loop started (interval=%.0fs)",
+        DELIVERABLE_POLL_INTERVAL_SECONDS,
+    )
+
+    while True:
+        try:
+            async with pool.acquire() as conn:
+                # Fetch open deliverable action_items that haven't been fulfilled yet.
+                # The deliverable_url IS NULL guard prevents re-processing items that
+                # were previously fulfilled but for some reason still have status='open'.
+                rows = await conn.fetch("""
+                    SELECT id, description, deliverable_type, thread_id, owner_employee_id
+                    FROM action_items
+                    WHERE deliverable_type IS NOT NULL
+                      AND status = 'open'
+                      AND deliverable_url IS NULL
+                    ORDER BY id
+                    LIMIT 10
+                """)
+
+            if rows:
+                log.info(
+                    "human-bridge: deliverable loop found %d pending item(s)", len(rows)
+                )
+                # Fetch sim time once per poll cycle (saves one HTTP call per item)
+                try:
+                    sim_time_resp = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: __import__('urllib.request', fromlist=['urlopen']).urlopen(
+                            "http://sim-clock:8000/sim_time", timeout=5
+                        ).read()
+                    )
+                    sim_time = datetime.fromisoformat(
+                        json.loads(sim_time_resp)["sim_time"]
+                    )
+                except Exception:
+                    sim_time = datetime.now(timezone.utc)
+
+                for row in rows:
+                    try:
+                        async with pool.acquire() as conn:
+                            await _fulfill_one_deliverable(conn, row, llm, wp, nc, sim_time)
+                    except Exception as exc:
+                        log.error(
+                            "human-bridge: deliverable fulfillment error for item %d: %s",
+                            row["id"], exc,
+                        )
+        except Exception as exc:
+            log.error("human-bridge: deliverable fulfillment loop error: %s", exc)
+
+        await asyncio.sleep(DELIVERABLE_POLL_INTERVAL_SECONDS)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 @asynccontextmanager
@@ -668,11 +1064,19 @@ async def lifespan(app: FastAPI):
     global _pool
     _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     detection_task = asyncio.create_task(_detection_loop(_pool))
+    # Deliverable fulfillment: polls open action_items with deliverable_type set
+    # and creates real WordPress posts / Nextcloud files via LLM-generated content.
+    deliverable_task = asyncio.create_task(_deliverable_fulfillment_loop(_pool))
     log.info("human-bridge: ready")
     yield
     detection_task.cancel()
+    deliverable_task.cancel()
     try:
         await detection_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await deliverable_task
     except (asyncio.CancelledError, Exception):
         pass
     await _pool.close()
@@ -1048,3 +1452,64 @@ async def action_write_wiki_page(req: WikiPageRequest, pool: PoolDep):
             "path": req.path, "title": req.title
         })
     return {"status": "written", "graphql_response": data}
+
+
+@app.post("/action/deliverables/poll-now")
+async def action_poll_deliverables_now(pool: PoolDep):
+    """Manually trigger a single fulfillment check of all open deliverable action items."""
+    if not WORDPRESS_ADMIN_APP_PASSWORD:
+        log.warning("WordPress admin application password is not set.")
+    
+    llm = _LLMClient(LITELLM_URL, LITELLM_API_KEY)
+    wp  = _WordPressClient(WORDPRESS_URL, WORDPRESS_ADMIN_USER, WORDPRESS_ADMIN_APP_PASSWORD)
+    nc  = _NextcloudClient(NEXTCLOUD_URL, NEXTCLOUD_ADMIN_USER, NEXTCLOUD_ADMIN_PASSWORD)
+    
+    # Fetch sim time
+    try:
+        sim_time_resp = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: __import__('urllib.request', fromlist=['urlopen']).urlopen(
+                "http://sim-clock:8000/sim_time", timeout=5
+            ).read()
+        )
+        sim_time = datetime.fromisoformat(json.loads(sim_time_resp)["sim_time"])
+    except Exception:
+        sim_time = datetime.now(timezone.utc)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, description, deliverable_type, thread_id, owner_employee_id
+            FROM action_items
+            WHERE deliverable_type IS NOT NULL
+              AND status = 'open'
+              AND deliverable_url IS NULL
+            ORDER BY id
+        """)
+        
+        fulfilled_count = 0
+        for row in rows:
+            try:
+                # Runs each fulfillment in its own transaction context
+                async with conn.transaction():
+                    await _fulfill_one_deliverable(conn, row, llm, wp, nc, sim_time)
+                fulfilled_count += 1
+            except Exception as exc:
+                log.error("human-bridge: manual poll fulfillment failed for action_item %d: %s", row["id"], exc)
+
+    return {"status": "ok", "found": len(rows), "fulfilled": fulfilled_count}
+
+
+@app.get("/action/deliverables/pending")
+async def action_get_pending_deliverables(pool: PoolDep):
+    """Get all open action items requiring a deliverable that have not been fulfilled yet."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, meeting_id, thread_id, owner_employee_id, description, due_at, status, deliverable_type
+            FROM action_items
+            WHERE deliverable_type IS NOT NULL
+              AND status = 'open'
+              AND deliverable_url IS NULL
+            ORDER BY id
+        """)
+        return [dict(r) for r in rows]
+

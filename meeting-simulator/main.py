@@ -486,7 +486,16 @@ async def build_meeting_prompt(
         f"      (i.e. they went along with it without strong feelings either way). Base stances\n"
         f"      on realistic workplace dynamics — attendees in the same department, or whose\n"
         f"      priorities align with the decision, are more likely to agree.\n"
-        f"  action_items: array of objects with fields: assignee_name, description, due_in_days\n"
+        f"  action_items: array of objects with fields: assignee_name, description, due_in_days,\n"
+        f"    and an OPTIONAL deliverable_type field — set ONLY when the action item literally\n"
+        f"    requires creating a public or internal document as its concrete output:\n"
+        f"      'wordpress_post'  — when the item is to publish a company news post, announcement,\n"
+        f"        blog entry, or product update on the company website (Marketing/Sales actions).\n"
+        f"      'nextcloud_file'  — when the item is to produce an internal report, policy doc,\n"
+        f"        proposal, meeting minutes, or technical spec (any department, internal use).\n"
+        f"      null (omit field) — for all other tasks: code reviews, meetings, emails, etc.\n"
+        f"    Set deliverable_type for at most ONE action item per meeting. Only set it when the\n"
+        f"    description itself says 'write', 'draft', 'publish', 'create a document', etc.\n"
         f"  outcome: object with type-specific fields (see below)\n"
         f"  short_summary: one-sentence event summary for the narrative log\n\n"
         f"Outcome type-specific fields:\n"
@@ -653,12 +662,22 @@ async def run_meeting(
                 if not assignee_id and attendees:
                     assignee_id = attendees[0]["id"]  # fallback to first attendee
 
+                # deliverable_type: only set when the LLM explicitly included the field and the
+                # column exists (migration 012).  Guard against None / missing gracefully.
+                raw_deliverable = ai.get("deliverable_type")
+                deliverable_type = raw_deliverable if raw_deliverable in ("wordpress_post", "nextcloud_file") else None
+
                 if assignee_id:
                     await conn.execute("""
                         INSERT INTO action_items
-                            (meeting_id, thread_id, owner_employee_id, description, due_at, status)
-                        VALUES ($1, $2, $3, $4, $5, 'open')
-                    """, meeting_id, thread_id, assignee_id, ai.get("description", ""), due_at)
+                            (meeting_id, thread_id, owner_employee_id, description, due_at, status, deliverable_type)
+                        VALUES ($1, $2, $3, $4, $5, 'open', $6)
+                    """, meeting_id, thread_id, assignee_id, ai.get("description", ""), due_at, deliverable_type)
+                    if deliverable_type:
+                        log.info(
+                            "Meeting %d: action_item with deliverable_type=%s assigned to employee %d",
+                            meeting_id, deliverable_type, assignee_id,
+                        )
 
             # Deterministic relationship-affinity update (Phase 20 §3) — plain Python over the
             # per-attendee `stances` that rode this same LLM call, no second LLM call spent.

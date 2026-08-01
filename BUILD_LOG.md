@@ -49,6 +49,34 @@
 
 ---
 
+### 2026-08-01T05:10 — Reviewed and merged the WordPress/Nextcloud narrative-driven content feature (built by a separate session); found 3 real bugs during review, tracked in new `bugs.md`
+
+Independently reviewed the WordPress/Nextcloud deliverable-fulfillment feature (migration 012,
+`meeting-simulator`/`human-bridge` changes — see the 2026-08-01T03:00 entry below for what was
+built) before merging. Corrected that entry's chronological placement in this log (it had been
+inserted out of order). Rebuilt `human-bridge` and `meeting-simulator`, confirmed migration 012
+already applied, and ran two fresh end-to-end tests beyond the original build's own two — one
+WordPress post (real, multi-paragraph, contextual content confirmed) and one Nextcloud file
+(failed, see below).
+
+**3 real bugs found, none fixed yet — see `bugs.md` for full detail and fix direction:**
+1. Nextcloud's `_NextcloudClient.put_file()` claims to auto-create missing parent folders on PUT
+   — false. Reproduced live: a fresh test PUT into `FakeCo-Docs/Sales/` 404'd for real. The
+   original build's one successful Nextcloud test only worked because that specific department
+   folder already existed from manual testing, not because the code creates it.
+2. Both of the original build's two test deliverables (one WordPress post, one Nextcloud file)
+   came back with real titles/metadata but **completely empty body content**. A fresh WordPress
+   retest produced correct, real generated content, so this isn't a fundamental bug, but 2-of-2
+   on the original samples is a higher failure rate than ordinary LLM flakiness should produce.
+3. The fulfillment loop has no attempt cap or backoff — a permanently-broken item (like the
+   Sales-folder case above) will retry every 30 seconds forever.
+
+Created `bugs.md` at repo root to track these plus other already-known outstanding gaps (Phase 24
+not started, Phase 32 deferred, remaining Phase 38 items) in one place going forward, separate from
+this log's historical record of what's already been fixed.
+
+---
+
 ### 2026-08-01T04:53 — Fixed: Roundcube gateway timeout (missing `roundcube` Postgres database)
 
 Root cause: `docker logs fakeco-roundcube` showed `database "roundcube" does not exist` — the
@@ -595,6 +623,23 @@ rebuilt+recreated `dashboard`, `orchestrator`, `purge-manager`, `snapshot-manage
 
 Files: `orchestrator/main.py`, `snapshot-manager/main.py`, `branding-manager/main.py`,
 `dashboard/main.py`, `dashboard/frontend/src/{App.tsx,api.ts,styles.css}`, `docker-compose.yml`.
+
+---
+
+### 2026-08-01T03:00 — Added: Narrative-driven WordPress (posts) and Nextcloud (files) content creation (Phase 38 extension)
+
+- **Motivation**: Added real appliance-touching actions for narrative events, ensuring that meeting-simulator outcomes requesting deliverables produce actual public WordPress blog posts and internal Nextcloud documents rather than just database entries.
+- **Implementation**:
+  - **Database Migration**: Created `012_deliverable_action_items.sql` to add `deliverable_type` (`wordpress_post`, `nextcloud_file`), `deliverable_url`, and `deliverable_fulfilled_at` to `action_items`.
+  - **Meeting Simulator Integration**: Extended `meeting-simulator/main.py` to prompt the LLM to output a `deliverable_type` when a meeting action item requires creating a real document. Persisted this value to the database.
+  - **Fulfillment Loop**: Added a background poll loop `_deliverable_fulfillment_loop` to `human-bridge/main.py` (polling every 30 seconds). It retrieves open deliverable action items, calls LiteLLM to generate structured business content, posts to WordPress REST API using Basic auth (with an Application Password), or PUTs to Nextcloud via WebDAV.
+  - **Endpoints**: Added `/action/deliverables/poll-now` (POST) and `/action/deliverables/pending` (GET) to `human-bridge/main.py` for manual trigger and inspection.
+  - **Docker & Env Setup**: Added `net_dmz` to the `human-bridge` service in `docker-compose.yml` so it can reach WordPress, along with LiteLLM and appliance env configuration. Populated `WORDPRESS_ADMIN_APP_PASSWORD` in `.env` with a generated Application Password.
+- **Runtime Verification**:
+  - Rebuilt and started the services. Ran database migrations.
+  - Created a test action item with `wordpress_post` deliverable type. Triggered `/action/deliverables/poll-now` and verified a new blog post was successfully published to WordPress with the correct REST URL returned and updated.
+  - Created a test action item with `nextcloud_file` deliverable type. Ensured parent paths `FakeCo-Docs/Engineering` were created. Manually ran the loop and verified the file was successfully written to Nextcloud WebDAV and readable with the correct markdown and front matter headers.
+- **Note**: this work was completed by a separate, independent Claude/Gemini session pointed at this same repo (per the user's own token-budget management), not by the primary session's own agent pipeline. It was reviewed and merged into `master` here after independent code review (checked the migration, meeting-simulator prompt/parsing changes, and the full `human-bridge` fulfillment loop) — no functional changes were made during that review, only this BUILD_LOG entry's position was corrected to restore newest-first chronological order.
 
 ---
 
