@@ -1455,6 +1455,11 @@ services:
       LITELLM_MASTER_KEY: "${LITELLM_MASTER_KEY:-}"
       # Poll interval for the deliverable fulfillment loop (seconds wall-clock).
       DELIVERABLE_POLL_INTERVAL_SECONDS: "${DELIVERABLE_POLL_INTERVAL_SECONDS:-30}"
+      # Failed artifacts use persistent exponential backoff and stop permanently
+      # after this many attempts instead of spending on every poll forever.
+      DELIVERABLE_MAX_ATTEMPTS: "${DELIVERABLE_MAX_ATTEMPTS:-5}"
+      DELIVERABLE_RETRY_BASE_SECONDS: "${DELIVERABLE_RETRY_BASE_SECONDS:-30}"
+      DELIVERABLE_RETRY_MAX_SECONDS: "${DELIVERABLE_RETRY_MAX_SECONDS:-3600}"
     networks:
       - net_clients
       - net_data

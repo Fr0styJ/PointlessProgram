@@ -77,6 +77,9 @@ NEXTCLOUD_ADMIN_PASSWORD = os.environ.get("NEXTCLOUD_ADMIN_PASSWORD", "placehold
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000")
 LITELLM_API_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
 DELIVERABLE_POLL_INTERVAL_SECONDS = float(os.environ.get("DELIVERABLE_POLL_INTERVAL_SECONDS", "30"))
+DELIVERABLE_MAX_ATTEMPTS = int(os.environ.get("DELIVERABLE_MAX_ATTEMPTS", "5"))
+DELIVERABLE_RETRY_BASE_SECONDS = float(os.environ.get("DELIVERABLE_RETRY_BASE_SECONDS", "30"))
+DELIVERABLE_RETRY_MAX_SECONDS = float(os.environ.get("DELIVERABLE_RETRY_MAX_SECONDS", "3600"))
 
 # Mailserver bot secret (same as provisioning — derive bot passwords)
 import hashlib
@@ -706,6 +709,15 @@ class _LLMClient:
             r.raise_for_status()
             return r.json()["choices"][0]["message"]["content"]
 
+    async def is_available(self) -> bool:
+        """Return whether LiteLLM is reachable, without invoking a paid model."""
+        try:
+            async with httpx.AsyncClient(headers=self.headers, timeout=5.0) as http:
+                r = await http.get(f"{self.base}/health/liveliness")
+                return r.status_code < 500
+        except httpx.HTTPError:
+            return False
+
 
 class _WordPressClient:
     """
@@ -750,12 +762,23 @@ class _NextcloudClient:
 
     async def put_file(self, path: str, content: str) -> str:
         """
-        PUT a file at {dav_base}/{path}. Creates parent directories if needed
-        (Nextcloud WebDAV auto-creates missing parents on PUT). Returns the full
-        WebDAV URL of the created file.
+        PUT a file at {dav_base}/{path}, explicitly creating every missing
+        parent collection first. WebDAV PUT does not create parent folders.
+        Returns the full WebDAV URL of the created file.
         """
-        url = f"{self.dav_base}/{path.lstrip('/')}"
+        clean_path = path.strip("/")
+        parts = [part for part in clean_path.split("/") if part]
+        if len(parts) < 2:
+            raise ValueError("Nextcloud deliverable path must include a parent folder")
+
+        url = f"{self.dav_base}/{clean_path}"
         async with httpx.AsyncClient(headers=self.headers, timeout=30.0) as http:
+            for depth in range(1, len(parts)):
+                collection_url = f"{self.dav_base}/{'/'.join(parts[:depth])}"
+                r = await http.request("MKCOL", collection_url)
+                # 201 = created; 405 = collection already exists.
+                if r.status_code not in (201, 405):
+                    r.raise_for_status()
             r = await http.put(url, content=content.encode("utf-8"), headers={
                 **self.headers,
                 "Content-Type": "text/markdown; charset=utf-8",
@@ -810,30 +833,87 @@ async def _generate_content_for_action_item(
         f"  excerpt: one-sentence summary (for WordPress excerpt / Nextcloud metadata)\n"
         f"Respond with ONLY valid JSON, no markdown fences."
     )
-    raw = await llm.chat(
-        messages=[{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}],
-        model="cheap",
-        max_tokens=1200,
-    )
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        # Strip markdown fences if the model added them despite instructions
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+
+    def parse_and_validate(raw: str) -> dict:
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = "\n".join(cleaned.split("\n")[1:])
         if cleaned.endswith("```"):
             cleaned = "\n".join(cleaned.split("\n")[:-1])
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            raise ValueError("LLM response is not a JSON object")
+        title = str(parsed.get("title") or "").strip()
+        content = str(parsed.get("content") or "").strip()
+        excerpt = str(parsed.get("excerpt") or "").strip()
+        if not title:
+            raise ValueError("generated title is empty")
+        if len(content) < 120:
+            raise ValueError(f"generated content is too short ({len(content)} chars)")
+        if not excerpt:
+            raise ValueError("generated excerpt is empty")
+        return {"title": title[:80], "content": content, "excerpt": excerpt}
+
+    first_error: Optional[Exception] = None
+    for attempt in range(2):
+        raw = await llm.chat(messages=messages, model="cheap", max_tokens=1200 if attempt == 0 else 1800)
         try:
-            parsed = json.loads(cleaned)
-        except Exception:
-            # Fallback: treat the whole output as the content
-            parsed = {"title": action_description[:80], "content": raw, "excerpt": action_description[:200]}
-    return {
-        "title": str(parsed.get("title", action_description[:80])),
-        "content": str(parsed.get("content", "")),
-        "excerpt": str(parsed.get("excerpt", action_description[:200])),
-    }
+            return parse_and_validate(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            if attempt == 1:
+                raise ValueError(f"LLM returned invalid deliverable content twice: {exc}") from exc
+            first_error = exc
+            log.warning("human-bridge: invalid generated deliverable (%s); retrying once", exc)
+            messages.extend([
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": (
+                    "The response was unusable because it was invalid JSON or had empty/too-short fields. "
+                    "Return the complete deliverable again as ONLY valid JSON. Ensure title and excerpt "
+                    "are non-empty and content contains the full requested document."
+                )},
+            ])
+    raise ValueError(f"Could not generate valid deliverable content: {first_error}")
+
+
+async def _record_deliverable_failure(
+    conn: asyncpg.Connection,
+    item_id: int,
+    error: Exception,
+) -> None:
+    """Persist exponential backoff and terminal failure state for one item."""
+    row = await conn.fetchrow(
+        "SELECT deliverable_attempts FROM action_items WHERE id = $1 FOR UPDATE", item_id
+    )
+    attempts = int(row["deliverable_attempts"] if row else 0) + 1
+    terminal = attempts >= DELIVERABLE_MAX_ATTEMPTS
+    delay = min(
+        DELIVERABLE_RETRY_BASE_SECONDS * (2 ** max(0, attempts - 1)),
+        DELIVERABLE_RETRY_MAX_SECONDS,
+    )
+    error_text = f"{type(error).__name__}: {error}"[:2000]
+    await conn.execute("""
+        UPDATE action_items
+        SET deliverable_attempts = $2,
+            deliverable_last_error = $3,
+            deliverable_next_retry_at = CASE
+                WHEN $4 THEN NULL
+                ELSE NOW() + ($5 * INTERVAL '1 second')
+            END,
+            deliverable_failed_at = CASE WHEN $4 THEN NOW() ELSE NULL END,
+            status = CASE WHEN $4 THEN 'failed' ELSE status END
+        WHERE id = $1
+    """, item_id, attempts, error_text, terminal, delay)
+    if terminal:
+        log.error(
+            "human-bridge: action_item %d permanently failed after %d attempts: %s",
+            item_id, attempts, error_text,
+        )
+    else:
+        log.warning(
+            "human-bridge: action_item %d failed attempt %d/%d; retrying in %.0fs: %s",
+            item_id, attempts, DELIVERABLE_MAX_ATTEMPTS, delay, error_text,
+        )
 
 
 async def _fulfill_one_deliverable(
@@ -843,7 +923,7 @@ async def _fulfill_one_deliverable(
     wp: _WordPressClient,
     nc: _NextcloudClient,
     sim_time: datetime,
-) -> None:
+) -> bool:
     """
     Fulfill a single open action_item with a non-null deliverable_type.
     Steps:
@@ -887,7 +967,8 @@ async def _fulfill_one_deliverable(
         )
     except Exception as exc:
         log.error("human-bridge: LLM content generation failed for action_item %d: %s", item_id, exc)
-        return  # Leave the action_item open; retry next poll cycle
+        await _record_deliverable_failure(conn, item_id, exc)
+        return False
 
     title = generated["title"]
     content = generated["content"]
@@ -932,14 +1013,18 @@ async def _fulfill_one_deliverable(
             "human-bridge: appliance call failed for action_item %d (%s): %s",
             item_id, deliverable_type, exc,
         )
-        return  # Leave the action_item open; retry next poll cycle
+        await _record_deliverable_failure(conn, item_id, exc)
+        return False
 
     # 4. Mark done, write deliverable_url and fulfilled_at
     await conn.execute("""
         UPDATE action_items
         SET status = 'done',
             deliverable_url = $2,
-            deliverable_fulfilled_at = $3
+            deliverable_fulfilled_at = $3,
+            deliverable_last_error = NULL,
+            deliverable_next_retry_at = NULL,
+            deliverable_failed_at = NULL
         WHERE id = $1
     """, item_id, deliverable_url, datetime.now(timezone.utc))
 
@@ -967,6 +1052,7 @@ async def _fulfill_one_deliverable(
         "thread_id": thread_id,
         "employee_id": owner_id,
     })
+    return True
 
 
 async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
@@ -979,9 +1065,8 @@ async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
       meeting-simulator based on explicit LLM output requesting a document).
     - Every piece of content is grounded in that action item's description +
       thread context — no random or periodic content generation.
-    - If the LLM call or appliance POST fails, the row stays 'open' and the
-      next poll cycle retries (cheap — cheap-tier LLM, no DB state changes on
-      failure).
+    - Failures use persistent exponential backoff and become terminal after
+      DELIVERABLE_MAX_ATTEMPTS; no item can retry every poll forever.
     - Skips items with deliverable_url already set (already fulfilled).
     """
     # Allow a startup grace period before the first poll
@@ -1009,6 +1094,13 @@ async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
 
     while True:
         try:
+            # A deliberately stopped LiteLLM pauses fulfillment without consuming
+            # item retry attempts. Retry state is reserved for actual generation
+            # or appliance failures, not operator-controlled provider downtime.
+            if not await llm.is_available():
+                log.info("human-bridge: LiteLLM unavailable; deliverable fulfillment paused")
+                await asyncio.sleep(DELIVERABLE_POLL_INTERVAL_SECONDS)
+                continue
             async with pool.acquire() as conn:
                 # Fetch open deliverable action_items that haven't been fulfilled yet.
                 # The deliverable_url IS NULL guard prevents re-processing items that
@@ -1019,6 +1111,7 @@ async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
                     WHERE deliverable_type IS NOT NULL
                       AND status = 'open'
                       AND deliverable_url IS NULL
+                      AND COALESCE(deliverable_next_retry_at, NOW()) <= NOW()
                     ORDER BY id
                     LIMIT 10
                 """)
@@ -1463,6 +1556,11 @@ async def action_poll_deliverables_now(pool: PoolDep):
     llm = _LLMClient(LITELLM_URL, LITELLM_API_KEY)
     wp  = _WordPressClient(WORDPRESS_URL, WORDPRESS_ADMIN_USER, WORDPRESS_ADMIN_APP_PASSWORD)
     nc  = _NextcloudClient(NEXTCLOUD_URL, NEXTCLOUD_ADMIN_USER, NEXTCLOUD_ADMIN_PASSWORD)
+    if not await llm.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="LiteLLM is unavailable; deliverable retry state was not changed",
+        )
     
     # Fetch sim time
     try:
@@ -1483,6 +1581,7 @@ async def action_poll_deliverables_now(pool: PoolDep):
             WHERE deliverable_type IS NOT NULL
               AND status = 'open'
               AND deliverable_url IS NULL
+              AND COALESCE(deliverable_next_retry_at, NOW()) <= NOW()
             ORDER BY id
         """)
         
@@ -1491,8 +1590,9 @@ async def action_poll_deliverables_now(pool: PoolDep):
             try:
                 # Runs each fulfillment in its own transaction context
                 async with conn.transaction():
-                    await _fulfill_one_deliverable(conn, row, llm, wp, nc, sim_time)
-                fulfilled_count += 1
+                    fulfilled = await _fulfill_one_deliverable(conn, row, llm, wp, nc, sim_time)
+                if fulfilled:
+                    fulfilled_count += 1
             except Exception as exc:
                 log.error("human-bridge: manual poll fulfillment failed for action_item %d: %s", row["id"], exc)
 
@@ -1504,10 +1604,12 @@ async def action_get_pending_deliverables(pool: PoolDep):
     """Get all open action items requiring a deliverable that have not been fulfilled yet."""
     async with pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT id, meeting_id, thread_id, owner_employee_id, description, due_at, status, deliverable_type
+            SELECT id, meeting_id, thread_id, owner_employee_id, description, due_at, status,
+                   deliverable_type, deliverable_attempts, deliverable_next_retry_at,
+                   deliverable_last_error, deliverable_failed_at
             FROM action_items
             WHERE deliverable_type IS NOT NULL
-              AND status = 'open'
+              AND status IN ('open', 'failed')
               AND deliverable_url IS NULL
             ORDER BY id
         """)

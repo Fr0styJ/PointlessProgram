@@ -8,7 +8,7 @@
 |---|—--|
 | **Current Phase** | Phases 1–23 and 27–37 are ALL built and runtime-verified against a live `docker compose` stack (39+ containers). Phase 24 (pay negotiation / performance-review-driven pay cuts) genuinely not started. Phase 32 (simulation speed slider, full integration) explicitly DEFERRED by user sign-off — see `Future_Plans.md`. Phase 38 (hardening) is the only remaining phase, not started. |
 | **Percent Complete** | ~92%. Every functional phase in the original plan (1-23, 27-31, 33-37) is built AND live-verified with real appliance calls, not just written. What's left: Phase 24 (a real but scoped feature gap), Phase 32 (deliberately deferred, not blocking), and Phase 38 (hardening/polish — the last checkbox before calling the build "done"). |
-| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including (non-exhaustive): the Akaunting `payment_method`/`X-Company` bug that silently 422'd every real ledger post (fixed 2026-08-01T02:10), Wiki.js `pages.create`'s required `isPrivate` arg, Zammad's `Token.create!` permissions-array bug, Zammad's no-admin-avatar-API gap (workaround built), a stale `CHAOS_ALLOWED_CONTAINERS` entry (`fakeco-zammad` → `fakeco-zammad-nginx`, fixed), and a frontend/backend confirm-phrase mismatch on snapshot restore. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings — `meeting-simulator` has a `pay_negotiation` meeting-type schema/attendee-selection stub, §6.4, but nothing anywhere calls it; the Payroll tab's pay-cut path is deliberately client- and server-side blocked with "Phase 24 not yet built" messaging) and **Phase 32** (speed slider, deferred by explicit user sign-off, not a gap). **All 5 originally-flagged Phase 38 bugs are now fixed** (as of 2026-08-01T04:53, via 5 parallel bugfix agents across two batches, see LOG entries below for full detail): (1) Zammad/WordPress `.env` credential gap — FIXED 04:30; (2) unhandled-exception logging invisible to Errors panel — FIXED 04:15; (3) Roundcube DB never initialized (gateway timeout) — FIXED 04:53 (DB created, real schema loaded directly from the container's own bundled SQL file); (4) meeting-simulator LLM-truncation flakiness — FIXED 04:12; (5) purge-manager/snapshot-manager pg_restore heuristic — FIXED 04:14. Three MORE real bugs were found and fixed via live manual testing of the dashboard's Deep Links panel after these 5: (6) Mattermost admin password was never actually captured correctly — FIXED (reset via `mmctl`); (7) Zammad "logs in then nothing happens" — FIXED 04:52 (its `fqdn` Setting was still the install default `zammad.example.com`, so ActionCable rejected the real browser's websocket `Origin` header after an otherwise-successful login — fixed via `rails runner`); (8) Wiki.js showing raw i18n keys (`actions.exit`, `comments.title`, etc.) instead of real labels — FIXED 04:35 (its cloud translation backend `graph.requarks.io` is long-discontinued and unreachable regardless of this stack's intentional no-internet-access policy; real English strings were hand-curated from the frontend's own key usage and loaded directly into Postgres); (9) Akaunting showing no data for the Principal's account — FIXED 04:35 (root cause: a composite unique index on `(email, deleted_at)` doesn't enforce uniqueness in MySQL/MariaDB when `deleted_at IS NULL` on both rows, so two duplicate `admin@fakecorp.internal` user rows existed; deduplicated, confirmed the real login flow resolves consistently and shows real transaction data). **A tenth item — real narrative-driven content creation for WordPress (posts) and Nextcloud (files/deliverables) — is a genuine feature gap, not a bug, and is being built separately** (dispatched to an independent Claude session as of 2026-08-01, not yet merged as of this entry). |
+| **Status** | Phases 1–23 and 27–37 have all been brought up in live Docker and exercised with real requests end-to-end (full trail below in the LOG). Dozens of real runtime bugs were found and fixed along the way, including the Akaunting transaction headers/payment-method bug, Wiki.js GraphQL and locale gaps, Zammad authentication/setup issues, Roundcube database initialization, structured ASGI error logging, LLM truncation recovery, and snapshot restore classification. Narrative-driven WordPress posts and Nextcloud deliverables are built and merged; their three post-merge review bugs (missing WebDAV parents, empty generated content, and unbounded retries) were fixed and verified on 2026-08-01. Two genuine feature gaps remain out of scope for Phase 38 and tracked separately: **Phase 24** (pay negotiation meetings/pay cuts, not started) and **Phase 32** (speed slider, explicitly deferred). |
 | **Exact Next Action** | Phase 38 (hardening) — the last remaining phase. Scope: graceful error states across the dashboard (Phase 33's dashboard-wide Basic Auth is already done, this is about UX-level error handling, not auth), closing the Zammad/WordPress `.env`/`.env.example` credential-completeness gap above, first-boot/bootstrap polish (e.g. automating the currently-manual Mattermost/Wiki.js/Zammad admin-token bootstrap steps), and writing the top-level `README.md` including a dashboard walkthrough (no top-level README exists yet). Phase 24 and Phase 32 are separately-trackable outstanding items — neither blocks starting or finishing Phase 38. |
 | **BLOCKER** | None. Docker Desktop running. All appliance credentials/tokens are in `.env` (gitignored) — a fresh clone needs a real `.env` populated before `docker compose up` will do anything useful. |
 
@@ -34,7 +34,7 @@
 - [x] `external-world/` (Phase 21/22 — `Dockerfile`/`requirements.txt` added, wired into `docker-compose.yml`, `customers` table seeded via `005_customers_seed.sql`, prospect-generation loop runtime-verified end-to-end with real Zammad tickets)
 - [x] `kpi-engine/` (Phase 23 — built and runtime-verified, incl. live rollup against real Zammad/Wiki.js/Mattermost/Akaunting; Phase 35 added the live-switchable auto-apply vs. review-and-approve toggle, migration 011)
 - [x] `branding-manager/` (Phase 30 — built and runtime-verified against an isolated stack; 3 real appliance-API bugs/gaps found and fixed, incl. Zammad avatar-API and Wiki.js avatar-storage workarounds)
-- [x] `narrative-db/` (migrations 001–011 written and runtime-verified — see migration-to-phase map: 001 sim_clock, 002 narrative_core, 003 employees, 004 additive_schemas, 005 customers_seed/Phase 22, 006 Phase 19 PTO, 007 branding/Phase 30, 008 Phase 29 purge/snapshots, 009 Phase 27 pending_actions, 010 Phase 28 crisis, 011 Phase 35 kpi_engine_config)
+- [x] `narrative-db/` (migrations 001–013 written and runtime-verified; 012 adds narrative deliverables and 013 adds bounded persistent deliverable retry state)
 - [x] `dashboard/` (Phases 33–37 — React/Vite + FastAPI BFF, all 37's worth of tabs built and runtime-verified: Simulation/LLM Status/Narrative (33), HR/Payroll/Accounting (34), External World/KPI/Company Direction (35), Chaos/Data Management/Branding + Settings nuclear-purge (36), TV wall/Errors panel/deep links/log tail (37))
 - [x] `provisioning/` (Phase 14 CLI — runtime-verified; Phase 34 added an HTTP "serve" mode with `/hire`/`/fire` for the dashboard, reusing the same underlying functions)
 - [x] `litellm/config.yaml` (Phase 10 — written and runtime-verified)
@@ -48,6 +48,31 @@
 ## LOG (newest first)
 
 ---
+
+### 2026-08-01T05:20 — Fixed all three narrative-deliverable review bugs without restarting LiteLLM
+
+Fixed the three confirmed issues tracked in `bugs.md`. `human-bridge`'s Nextcloud client now
+issues WebDAV `MKCOL` for each parent path segment, accepting 201 (created) and 405 (already
+exists), before the final PUT. Live verification created a previously nonexistent nested folder,
+wrote and read a Markdown file byte-for-byte through Nextcloud, then deleted the test folder.
+
+Generated deliverables now require a non-empty title/excerpt and at least 120 characters of body
+content. Invalid JSON or invalid fields trigger one corrective retry with a larger token budget;
+a second invalid response fails loudly and is never published. This was exercised with a fake LLM
+inside the rebuilt service: empty content retried once and accepted a valid second response, while
+two invalid responses raised a terminal validation error. No paid provider call was made.
+
+Migration `013_deliverable_retry_state.sql` adds persistent attempt count, next-retry time,
+last-error, and failed-at fields. Failures now use configurable exponential backoff (30s base,
+one-hour cap by default) and set the action item to `failed` after five attempts. A rolled-back
+live-DB test confirmed 30/60/120/240-second progression and terminal state on attempt five,
+leaving no test row. The manual poll's `fulfilled` count was also corrected so failed attempts are
+not reported as successes. A provider-availability guard also pauses automatic fulfillment while
+LiteLLM is intentionally stopped, without consuming an item's attempt budget; manual polling now
+returns a truthful 503 in that state. The two outage-induced attempts on the pre-existing pending
+test item were cleared, and a live 503 test confirmed its attempt count remained zero.
+`fakeco-human-bridge` was rebuilt and remained healthy; `fakeco-litellm` remained stopped
+throughout.
 
 ### 2026-08-01T05:10 — Reviewed and merged the WordPress/Nextcloud narrative-driven content feature (built by a separate session); found 3 real bugs during review, tracked in new `bugs.md`
 
