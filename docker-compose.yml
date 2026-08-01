@@ -9,7 +9,8 @@
 #   net_mail     — internal: true
 #   net_dmz      — internal: true
 #   net_data     — internal: true
-#   net_llm_bridge — internal: false (only network with real internet — LiteLLM reaches providers)
+#   net_llm_bridge — internal: false (LiteLLM provider egress only)
+#   net_wikijs_egress — internal: false (Wiki.js upstream locale/update access only)
 #   net_mgmt     — internal: false (host-published for dashboard/monitoring browser access)
 #
 # PHASE BUILD ORDER — services added per phase:
@@ -81,6 +82,12 @@ networks:
 
   net_llm_bridge:
     # LiteLLM proxy only — its only job is reaching LLM providers (real internet)
+    driver: bridge
+    internal: false
+
+  net_wikijs_egress:
+    # Dedicated Wiki.js internet egress. Kept separate from LiteLLM so Wiki.js
+    # cannot reach the provider-facing proxy network or any other appliance.
     driver: bridge
     internal: false
 
@@ -769,9 +776,7 @@ services:
       - phase7
 
   wikijs:
-    build:
-      context: ./wikijs-init
-    image: fakeco-wikijs:2.5.314-offline-locale
+    image: requarks/wiki:2
     container_name: fakeco-wikijs
     restart: unless-stopped
     depends_on:
@@ -787,6 +792,7 @@ services:
     networks:
       - net_office
       - net_data
+      - net_wikijs_egress
     labels:
       fakeco.service: "wikijs"
       fakeco.phase: "7"

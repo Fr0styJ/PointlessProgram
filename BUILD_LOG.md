@@ -49,6 +49,20 @@
 
 ---
 
+### 2026-08-01T07:10 — Rolled back custom Wiki.js localization image; enabled dedicated internet egress
+
+Per user direction, removed the entire repository-backed `wikijs-init/` image, generated locale
+fallback, client-cache patch, and asset-version workaround. Wiki.js is restored to the upstream
+`requarks/wiki:2` image. A dedicated non-internal `net_wikijs_egress` network gives only Wiki.js
+internet access without placing it on LiteLLM's provider network or opening internet access for
+any other office appliance. Live verification from inside the upstream container reached
+`https://example.com` (HTTP 200) and `https://graph.requarks.io` (reachable HTTP response). Wiki.js's
+startup locale-sync job then completed successfully and reported that it pulled current English
+locale updates from the Graph endpoint. Existing Wiki database/content volumes were preserved.
+Mattermost DM reaction changes and queued Bob reactions were not touched; LiteLLM remained stopped.
+
+---
+
 ### 2026-08-01T06:55 — Fixed Mattermost DM detection and made Wiki.js localization fully offline/persistent
 
 Mattermost reactions previously watched the cross-appliance `PRINCIPAL_EMAIL` account and only
