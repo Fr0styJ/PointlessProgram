@@ -49,6 +49,30 @@
 
 ---
 
+### 2026-08-01T06:10 — Added Zammad and Wiki.js Principal-reaction adapters; fixed Wiki automation revision-loop risk
+
+Two parallel agents reused the established chat/email reaction conventions to add
+`reaction_zammad.py` and `reaction_wikijs.py`. Zammad reactions retrieve the exact
+`zammad:<article-id>`, verify Principal authorship and employee ticket ownership, generate with the
+assigned personality on the `heavy` tier, then post through the existing temporary-password/Basic
+Auth employee-impersonation workaround. Article preferences plus a hidden body marker provide
+appliance-side idempotency.
+
+Wiki.js 2.x has no verified comment/discussion mutation, so its adapter appends a clearly
+employee-attributed follow-up section to the exact triggering page while preserving the full set
+of fields required by `pages.update`. It validates Principal authorship, the exact detected
+revision, and the `emp-<id>` target tag; a hidden marker makes retries idempotent. Review found an
+agent-omitted loop risk: this Wiki.js API exposes page creator rather than latest revision author,
+so the detector could mistake the bridge's update for another Principal edit. Fixed with an exact
+`wikijs:ignore:<page-id>` revision cursor written after publish; only that automation revision is
+skipped, while any subsequent human edit has a new `updatedAt` and remains detectable.
+
+Both adapters are wired into the same oldest-first priority worker and reuse its persistent
+bounded retry state, PTO deferral, provider pause, and deliverable-preemption behavior. The Docker
+image includes all four channel modules. The full reaction test suite now has 22 passing tests.
+The rebuilt live service remained healthy; with LiteLLM intentionally stopped, a manual poll
+returned `paused` and the existing queue hash remained unchanged. No paid generation occurred.
+
 ### 2026-08-01T05:55 — Built and live-verified personality-grounded Mattermost and email reaction workers
 
 Integrated two independently authored channel workers into `human-bridge` to close the direct

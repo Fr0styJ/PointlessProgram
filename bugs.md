@@ -7,19 +7,16 @@ Tracks currently-open bugs and gaps as of 2026-08-01. Fixed issues are not kept 
 
 ## Bugs (confirmed, reproducible)
 
-### 1. Zammad/Wiki.js pending reactions still have no channel-specific response adapter
-
-Mattermost and email reactions are now consumed by a personality-grounded higher-tier reaction
-worker and delivered through the real appliance channels. Principal-authored Zammad comments and
-Wiki.js edits are still detected and queued, but no adapter writes a Zammad ticket reply or Wiki.js
-follow-up yet. Those rows remain pending. LiteLLM is intentionally stopped, so the completed
-chat/email worker currently pauses without consuming queued reactions until the user explicitly
-restarts it.
+None currently tracked. Mattermost, email, Zammad, and Wiki.js Principal reactions all have
+personality-grounded channel adapters. LiteLLM is intentionally stopped, so the shared worker
+pauses without consuming queued reactions until the user explicitly restarts it.
 
 ### Recently fixed
 
 - Principal Mattermost messages now receive in-character threaded employee replies.
 - Principal emails now receive in-character employee replies with correct mail threading headers.
+- Principal Zammad articles now receive employee-authored ticket replies.
+- Principal Wiki.js edits now receive idempotent employee-attributed follow-up sections.
 - Reaction failures use persistent bounded exponential backoff instead of retrying/spending every
   poll forever; provider downtime and PTO do not consume attempts.
 

@@ -33,6 +33,8 @@ import asyncpg
 import httpx
 from reaction_chat import ChatReactionConfig, process_chat_reaction
 from reaction_email import EmailReactionConfig, EmailReactionWorker
+from reaction_wikijs import WikiReactionConfig, process_wikijs_reaction
+from reaction_zammad import ZammadReactionConfig, process_zammad_reaction
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -565,6 +567,9 @@ async def _poll_wikijs_once(pool: asyncpg.Pool) -> None:
                     continue
                 if updated_at > latest:
                     latest = updated_at
+                ignored_revision = await _get_cursor(conn, f"wikijs:ignore:{page['id']}")
+                if ignored_revision and ignored_revision == updated_at:
+                    continue
                 sr = await http.post(
                     f"{WIKIJS_URL}/graphql",
                     headers={"Authorization": f"Bearer {WIKIJS_ADMIN_TOKEN}"},
@@ -1118,7 +1123,7 @@ async def _deliverable_fulfillment_loop(pool: asyncpg.Pool) -> None:
                         JOIN narrative_events ne ON ne.id = pr.triggering_event_id
                         WHERE pr.status = 'pending'
                           AND ne.origin = 'human'
-                          AND ne.source_type IN ('chat', 'email')
+                          AND ne.source_type IN ('chat', 'email', 'ticket', 'wiki')
                           AND COALESCE(pr.next_retry_at, NOW()) <= NOW()
                     )
                 """)
@@ -1201,10 +1206,9 @@ async def _record_reaction_failure(
 
 
 async def _process_pending_reactions_once(pool: asyncpg.Pool) -> dict:
-    """Process pending Principal chat/email reactions once, oldest first.
+    """Process pending Principal reactions once, oldest first.
 
-    A stopped LiteLLM pauses the batch before any row is mutated. Other
-    detection sources (ticket/wiki) remain pending for future channel adapters.
+    A stopped LiteLLM pauses the batch before any row is mutated.
     """
     llm_probe = _LLMClient(LITELLM_URL, LITELLM_API_KEY)
     if not await llm_probe.is_available():
@@ -1217,7 +1221,7 @@ async def _process_pending_reactions_once(pool: asyncpg.Pool) -> dict:
             JOIN narrative_events ne ON ne.id = pr.triggering_event_id
             WHERE pr.status = 'pending'
               AND ne.origin = 'human'
-              AND ne.source_type IN ('chat', 'email')
+              AND ne.source_type IN ('chat', 'email', 'ticket', 'wiki')
               AND COALESCE(pr.next_retry_at, NOW()) <= NOW()
             ORDER BY pr.id
             LIMIT 10
@@ -1242,6 +1246,26 @@ async def _process_pending_reactions_once(pool: asyncpg.Pool) -> dict:
         litellm_api_key=LITELLM_API_KEY,
         model="heavy",
     ))
+    zammad_config = ZammadReactionConfig(
+        zammad_url=ZAMMAD_URL,
+        zammad_admin_token=ZAMMAD_ADMIN_TOKEN,
+        principal_email=PRINCIPAL_EMAIL,
+        litellm_url=LITELLM_URL,
+        litellm_api_key=LITELLM_API_KEY,
+        model="heavy",
+    )
+    wiki_principal_id = 0
+    if any(row["source_type"] == "wiki" for row in rows):
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            wiki_principal_id = int(await _resolve_principal_wiki_id(http) or 0)
+    wiki_config = WikiReactionConfig(
+        wikijs_url=WIKIJS_URL,
+        wikijs_admin_token=WIKIJS_ADMIN_TOKEN,
+        principal_wiki_user_id=wiki_principal_id,
+        litellm_url=LITELLM_URL,
+        litellm_api_key=LITELLM_API_KEY,
+        model="heavy",
+    )
 
     results: list[dict] = []
     for row in rows:
@@ -1252,8 +1276,18 @@ async def _process_pending_reactions_once(pool: asyncpg.Pool) -> dict:
                         result = await process_chat_reaction(
                             conn, row["id"], chat_config, sim_time=sim_time
                         )
-                else:
+                elif row["source_type"] == "email":
                     result = await email_worker.process_pending_reaction(conn, row)
+                elif row["source_type"] == "ticket":
+                    async with conn.transaction():
+                        result = await process_zammad_reaction(
+                            conn, row["id"], zammad_config
+                        )
+                else:
+                    async with conn.transaction():
+                        result = await process_wikijs_reaction(
+                            conn, row["id"], wiki_config, sim_time=sim_time
+                        )
                 reason = getattr(result, "reason", None)
                 if result.status in {"pending", "deferred", "deferred_pto"}:
                     if (reason and "litellm" in reason.lower()) or reason == "provider_unavailable":
@@ -1261,7 +1295,9 @@ async def _process_pending_reactions_once(pool: asyncpg.Pool) -> dict:
                             "status": "paused", "reason": "litellm_unavailable",
                             "processed": len(results), "results": results,
                         }
-                    if result.status in {"deferred", "deferred_pto"}:
+                    if result.status in {"deferred", "deferred_pto"} or reason in {
+                        "employee_on_pto", "employee_unavailable", "already_processing"
+                    }:
                         await conn.execute("""
                             UPDATE pending_reactions
                             SET next_retry_at = NOW() + INTERVAL '5 minutes'
@@ -1451,7 +1487,7 @@ async def detection_poll_now(pool: PoolDep):
 
 @app.post("/action/reactions/poll-now")
 async def action_poll_reactions_now(pool: PoolDep):
-    """Run one chat/email Principal-reaction pass immediately."""
+    """Run one Principal-reaction pass across all supported channels."""
     return await _process_pending_reactions_once(pool)
 
 
