@@ -155,6 +155,20 @@ class AkauntingClient:
         r.raise_for_status()
         return r.json().get("data", [])
 
+    async def get_accounts(self) -> list:
+        """Phase 34 Accounting tab cash-balance widget: Akaunting's own /accounts
+        endpoint returns each bank account's current_balance (opening_balance +
+        net of posted transactions, computed by Akaunting itself) — summing
+        these is the real cash balance without re-deriving Phase 31's raw MySQL
+        query in a second place."""
+        r = await self._client.get(
+            f"{self.base}/accounts",
+            params={"company_id": self.company_id},
+            auth=self.auth,
+        )
+        r.raise_for_status()
+        return r.json().get("data", [])
+
 
 # ---------------------------------------------------------------------------
 # Zammad client (for expense_request tickets)
@@ -811,6 +825,12 @@ class ApproveExpenseRequest(BaseModel):
     note: str = ""
 
 
+class RejectExpenseRequest(BaseModel):
+    approval_id: int
+    rejected_by: str
+    note: str = ""
+
+
 # --- API endpoints ---
 @app.get("/health")
 async def health():
@@ -838,6 +858,49 @@ async def approve_expense_endpoint(req: ApproveExpenseRequest, pool: PoolDep):
     akaunting = get_akaunting()
     try:
         return await approve_expense(pool, akaunting, req.approval_id, req.approved_by, req.note)
+    finally:
+        await akaunting.close()
+
+
+@app.post("/expense/reject")
+async def reject_expense_endpoint(req: RejectExpenseRequest, pool: PoolDep):
+    """
+    Phase 34 Accounting tab's expense-approval queue needs a Reject counterpart
+    to the existing /expense/approve — this didn't exist before Phase 33/34
+    (no dashboard UI needed it yet). No Akaunting post happens on reject; the
+    pending_approvals row simply moves to 'rejected' (a status the schema
+    already supports) with an audit trail entry.
+    """
+    async with pool.acquire() as conn:
+        approval = await conn.fetchrow(
+            "SELECT id FROM pending_approvals WHERE id = $1 AND status = 'pending'",
+            req.approval_id,
+        )
+        if not approval:
+            raise HTTPException(status_code=404, detail=f"Pending approval {req.approval_id} not found")
+        await conn.execute("""
+            UPDATE pending_approvals SET status = 'rejected', updated_at = NOW() WHERE id = $1
+        """, req.approval_id)
+        await audit_log(conn, req.rejected_by, "expense_rejected", {
+            "approval_id": req.approval_id, "note": req.note,
+        })
+    log.info("Expense rejected: approval %d by %s", req.approval_id, req.rejected_by)
+    return {"status": "rejected", "approval_id": req.approval_id}
+
+
+@app.get("/accounting/cash-balance")
+async def cash_balance_endpoint():
+    akaunting = get_akaunting()
+    try:
+        accounts = await akaunting.get_accounts()
+        total = sum(Decimal(str(a.get("current_balance", a.get("opening_balance", 0)) or 0)) for a in accounts)
+        return {
+            "cash_balance": float(total),
+            "accounts": [
+                {"name": a.get("name"), "balance": float(a.get("current_balance", a.get("opening_balance", 0)) or 0)}
+                for a in accounts
+            ],
+        }
     finally:
         await akaunting.close()
 

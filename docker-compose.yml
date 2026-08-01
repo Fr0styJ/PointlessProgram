@@ -1172,12 +1172,25 @@ services:
       context: ./provisioning
       dockerfile: Dockerfile
     container_name: fakeco-provisioning
-    restart: "no"   # CLI tool — run manually; supervisor can set to unless-stopped
+    # Phase 14 default (bulk/manual runs): `docker compose run --rm provisioning
+    # python main.py provision --all` etc., still works unchanged — restart/command
+    # below only affect the always-on compose-managed instance of this service.
+    # Phase 34: dashboard's HR tab needs a live Fire/Hire endpoint, so the
+    # compose-managed container now runs in "serve" (FastAPI) mode instead of
+    # exiting after one CLI invocation — see provisioning/main.py's `serve` arg.
+    command: ["python", "main.py", "serve"]
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
       narrative-db-migrate:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     environment:
       DATABASE_URL: "postgresql://${POSTGRES_USER:-fakeco}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-fakeco}"
       MAILSERVER_CONTAINER: "fakeco-mailserver"
@@ -1206,6 +1219,7 @@ services:
       fakeco.managed: "true"
     profiles:
       - phase14
+      - phase34   # Phase 34: dashboard HR tab's Fire/Hire calls this service's HTTP endpoints
 
   # ---------------------------------------------------------------------------
   # PHASE 15: accounting-engine — deterministic financial logic
@@ -1256,6 +1270,7 @@ services:
       fakeco.managed: "true"
     profiles:
       - phase15
+      - phase34   # Phase 34: dashboard Payroll/Accounting tabs call this service's endpoints
 
   # ---------------------------------------------------------------------------
   # PHASE 23: kpi-engine — deterministic KPI rollups + performance-review formula
@@ -1687,6 +1702,14 @@ services:
       LITELLM_CONFIG_PATH: "/litellm-config/config.yaml"
       DASHBOARD_AUTH_USER: "${DASHBOARD_AUTH_USER:?DASHBOARD_AUTH_USER required}"
       DASHBOARD_AUTH_PASSWORD: "${DASHBOARD_AUTH_PASSWORD:?DASHBOARD_AUTH_PASSWORD required}"
+      # Phase 34: HR tab's Fire/Hire (provisioning) + Payroll/Accounting tabs
+      # (accounting-engine's raise/cash-balance/approve/reject endpoints).
+      # Both already share net_clients/net_data with this container — no new
+      # network needed.
+      PROVISIONING_URL: "http://provisioning:8000"
+      ACCOUNTING_ENGINE_URL: "http://accounting-engine:8000"
+      AKAUNTING_COMPANY_ID: "${AKAUNTING_COMPANY_ID:-1}"
+      AKAUNTING_PUBLIC_URL: "${AKAUNTING_PUBLIC_URL:-http://accounting.fakecorp.internal}"
     volumes:
       - ./litellm/config.yaml:/litellm-config/config.yaml:ro
     networks:
@@ -1708,6 +1731,7 @@ services:
     profiles:
       - phase13
       - phase33
+      - phase34   # Phase 34: HR/Payroll/Accounting tabs live in this same service/container
 
   # ---------------------------------------------------------------------------
   # PHASES 34+: Custom services — added as their phases execute.

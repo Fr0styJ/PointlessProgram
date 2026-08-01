@@ -26,11 +26,15 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import asyncpg
 import httpx
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 logging.basicConfig(
     level=logging.INFO,
@@ -613,6 +617,117 @@ async def reassign_pending_reactions(conn: asyncpg.Connection, employee: asyncpg
 
 
 # ---------------------------------------------------------------------------
+# Phase 34: FastAPI HTTP service mode ("serve") — dashboard's HR tab needs a
+# live Fire/Hire endpoint to call; provisioning was CLI-only through Phase 14.
+# This is additive: `python main.py serve` runs the app below; every other
+# invocation (`provision --all`, `fire --employee-id N`, `provision-principal`)
+# still goes through the original argparse CLI in main() further down,
+# unchanged, so first-boot scripts/manual runs keep working exactly as before.
+# ---------------------------------------------------------------------------
+_svc_pool: Optional[asyncpg.Pool] = None
+_svc_mm: Optional[MattermostClient] = None
+_svc_zammad: Optional[ZammadClient] = None
+_svc_wiki: Optional[WikiJSClient] = None
+_svc_mail: Optional[MailserverClient] = None
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global _svc_pool, _svc_mm, _svc_zammad, _svc_wiki, _svc_mail
+    _svc_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
+    _svc_mm = MattermostClient(MATTERMOST_URL, MATTERMOST_ADMIN_TOKEN, MATTERMOST_TEAM_ID)
+    _svc_zammad = ZammadClient(ZAMMAD_URL, ZAMMAD_ADMIN_TOKEN)
+    _svc_wiki = WikiJSClient(WIKIJS_URL, WIKIJS_ADMIN_TOKEN)
+    _svc_mail = MailserverClient(MAILSERVER_CONTAINER, MAILSERVER_DOMAIN)
+    log.info("provisioning: HTTP service ready")
+    yield
+    await _svc_mm.close()
+    await _svc_zammad.close()
+    await _svc_wiki.close()
+    await _svc_pool.close()
+
+
+app = FastAPI(
+    title="FakeCo Provisioning Service",
+    description="Phase 14 CLI + Phase 34 HTTP wrapper: Fire/Hire for the dashboard HR tab.",
+    version="1.0.0",
+    lifespan=_lifespan,
+)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "provisioning"}
+
+
+class HireRequest(BaseModel):
+    name: str
+    department: str
+    title: str
+    role_tier: str = "ic"  # 'ic' or 'lead'
+
+
+class FireRequest(BaseModel):
+    employee_id: int
+
+
+def _slugify_email(name: str) -> str:
+    parts = re.sub(r"[^A-Za-z ]", "", name).strip().split()
+    if not parts:
+        parts = ["new", "hire"]
+    local = ".".join(p.lower() for p in parts)
+    return f"{local}@{MAILSERVER_DOMAIN}"
+
+
+@app.post("/hire")
+async def hire_employee_endpoint(req: HireRequest):
+    """
+    Phase 34 HR tab "Hire" form: department + title (+ name, needed since
+    employees.name/email are NOT NULL/UNIQUE — the dashboard form collects
+    all three). Inserts a real employees row (pay_rate defaulted from
+    market_benchmark for the department/tier, falling back to 0 if no
+    benchmark row exists), then runs the exact same provision_employee()
+    flow the Phase 14 CLI uses — no duplicated account-creation logic.
+    """
+    if req.role_tier not in ("ic", "lead"):
+        raise HTTPException(status_code=422, detail="role_tier must be 'ic' or 'lead'")
+    email = _slugify_email(req.name)
+    async with _svc_pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT id FROM employees WHERE email = $1", email)
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Employee with email {email} already exists (id={existing['id']})")
+
+        benchmark = await conn.fetchval(
+            "SELECT benchmark_pay FROM market_benchmark WHERE department = $1 AND role_tier = $2",
+            req.department, req.role_tier,
+        )
+        pay_rate = benchmark or 0
+
+        emp = await conn.fetchrow("""
+            INSERT INTO employees (name, email, department, role, role_tier, status, hired_at, pay_rate, pay_frequency)
+            VALUES ($1, $2, $3, $4, $5, 'active', NOW(), $6, 'biweekly')
+            RETURNING *
+        """, req.name, email, req.department, req.title, req.role_tier, pay_rate)
+
+        await provision_employee(conn, emp, _svc_mm, _svc_zammad, _svc_wiki, _svc_mail)
+
+    log.info("HTTP /hire: provisioned new employee %d (%s, %s / %s)", emp["id"], req.name, req.department, req.title)
+    return {"status": "hired", "employee_id": emp["id"], "email": email, "pay_rate": float(pay_rate)}
+
+
+@app.post("/fire")
+async def fire_employee_endpoint(req: FireRequest):
+    async with _svc_pool.acquire() as conn:
+        emp = await conn.fetchrow("SELECT * FROM employees WHERE id = $1", req.employee_id)
+        if not emp:
+            raise HTTPException(status_code=404, detail=f"Employee {req.employee_id} not found")
+        if emp["status"] == "terminated":
+            return {"status": "already_terminated", "employee_id": req.employee_id}
+        await fire_employee(conn, emp, _svc_mm, _svc_zammad, _svc_wiki, _svc_mail)
+    return {"status": "terminated", "employee_id": req.employee_id}
+
+
+# ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
 async def main() -> None:
@@ -717,4 +832,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        asyncio.run(main())

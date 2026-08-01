@@ -1,5 +1,17 @@
-import { useEffect, useState } from "react";
-import { api, LlmSpend, LlmStatus, NarrativeSummary, SimulationStatus } from "./api";
+import { useEffect, useMemo, useState } from "react";
+import ForceGraph2D from "react-force-graph-2d";
+import {
+  api,
+  AccountingSummary,
+  EmployeeRosterRow,
+  HrRelationships,
+  LlmSpend,
+  LlmStatus,
+  NarrativeSummary,
+  PayrollEmployeeRow,
+  PayrollHistory,
+  SimulationStatus,
+} from "./api";
 
 // Phase 33 dashboard shell. Nav is a plain array of {key,label} entries so
 // Phases 34-37 can extend it by adding entries — no router library needed at
@@ -8,9 +20,12 @@ const NAV_ITEMS = [
   { key: "simulation", label: "Simulation" },
   { key: "llm", label: "LLM Status" },
   { key: "narrative", label: "Narrative" },
+  { key: "hr", label: "HR / Org Chart" },
+  { key: "payroll", label: "Payroll" },
+  { key: "accounting", label: "Accounting" },
   { key: "settings", label: "Settings" },
-  // Future phases plug in here: HR, Payroll, Accounting, External World,
-  // KPI/Performance, Company Direction, Chaos, Data Management, Branding, TV...
+  // Future phases plug in here: External World, KPI/Performance, Company
+  // Direction, Chaos, Data Management, Branding, TV...
 ] as const;
 
 type TabKey = (typeof NAV_ITEMS)[number]["key"];
@@ -38,6 +53,9 @@ export default function App() {
         {tab === "simulation" && <SimulationTab />}
         {tab === "llm" && <LlmStatusTab />}
         {tab === "narrative" && <NarrativeTab />}
+        {tab === "hr" && <HrTab />}
+        {tab === "payroll" && <PayrollTab />}
+        {tab === "accounting" && <AccountingTab />}
         {tab === "settings" && <SettingsTab />}
       </main>
     </div>
@@ -419,6 +437,499 @@ function NarrativeTab() {
                     <td>{p.status}</td>
                     <td>{p.attempts}</td>
                     <td>{p.next_retry_at ? new Date(p.next_retry_at).toLocaleString() : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 34: HR / Org Chart tab
+//
+// Graph-viz library choice: react-force-graph-2d over reactflow. reactflow is
+// built for manually-laid-out flowcharts (you own node x/y); this view is a
+// pure "node=employee, edge=relationship, weight=affinity" graph with no
+// natural manual layout, so a force-directed auto-layout library is the
+// better fit and needs far less wiring code (no node-position state to own).
+// ---------------------------------------------------------------------------
+function HrTab() {
+  const [roster, setRoster] = useState<EmployeeRosterRow[] | null>(null);
+  const [rel, setRel] = useState<HrRelationships | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [fireTarget, setFireTarget] = useState<EmployeeRosterRow | null>(null);
+  const [hireOpen, setHireOpen] = useState(false);
+  const [hireForm, setHireForm] = useState({ name: "", department: "", title: "", role_tier: "ic" });
+  const [busy, setBusy] = useState(false);
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState<number | null>(null);
+
+  const load = () => {
+    api.hrRoster().then((d) => setRoster(d.employees)).catch((e) => setErr(String(e)));
+    api.hrRelationships().then(setRel).catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, []);
+
+  const doFire = async () => {
+    if (!fireTarget) return;
+    setBusy(true);
+    try {
+      await api.hrFire(fireTarget.id);
+      setFireTarget(null);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doHire = async () => {
+    setBusy(true);
+    try {
+      await api.hrHire(hireForm);
+      setHireOpen(false);
+      setHireForm({ name: "", department: "", title: "", role_tier: "ic" });
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const graphData = useMemo(() => {
+    if (!rel) return { nodes: [], links: [] };
+    const visible = selectedEmployeeId
+      ? rel.edges.filter(
+          (e) => e.employee_a_id === selectedEmployeeId || e.employee_b_id === selectedEmployeeId
+        )
+      : rel.edges;
+    const nodeIds = selectedEmployeeId
+      ? new Set<number>([selectedEmployeeId, ...visible.flatMap((e) => [e.employee_a_id, e.employee_b_id])])
+      : new Set(rel.nodes.map((n) => n.id));
+    return {
+      nodes: rel.nodes.filter((n) => nodeIds.has(n.id)).map((n) => ({ id: n.id, name: n.name, department: n.department })),
+      links: visible.map((e) => ({
+        source: e.employee_a_id,
+        target: e.employee_b_id,
+        affinity: e.affinity_score,
+        type: e.relationship_type,
+      })),
+    };
+  }, [rel, selectedEmployeeId]);
+
+  return (
+    <section>
+      <h1>HR / Org Chart</h1>
+      {err && <ErrorBanner message={err} />}
+
+      <div className="card">
+        <div className="card-header-row">
+          <h2>Roster ({roster?.length ?? 0})</h2>
+          <button className="action-btn" onClick={() => setHireOpen(true)}>
+            + Hire
+          </button>
+        </div>
+        {roster && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Department</th>
+                <th>Title</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {roster.map((e) => (
+                <tr key={e.id} className={e.display_status === "on-PTO" ? "row-pto" : ""}>
+                  <td>{e.name}</td>
+                  <td>{e.department}</td>
+                  <td>{e.role}</td>
+                  <td>
+                    <span className={`badge badge-status-${e.display_status.replace(/[^a-z-]/gi, "").toLowerCase()}`}>
+                      {e.display_status}
+                    </span>
+                  </td>
+                  <td>
+                    {e.status === "active" && (
+                      <button className="danger-btn-small" onClick={() => setFireTarget(e)}>
+                        Fire
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Relationship Graph</h2>
+        <p className="hint">
+          Node = employee, edge = relationship (color/weight = affinity score). Click a node to
+          filter to that employee's edges; click empty space to clear.
+        </p>
+        {selectedEmployeeId && (
+          <button className="action-btn" onClick={() => setSelectedEmployeeId(null)}>
+            Clear filter
+          </button>
+        )}
+        <div style={{ height: 420, background: "#0f1115", borderRadius: 8, marginTop: 8 }}>
+          {rel && (
+            <ForceGraph2D
+              graphData={graphData}
+              nodeLabel={(n: any) => `${n.name} (${n.department})`}
+              nodeAutoColorBy="department"
+              linkWidth={(l: any) => Math.max(0.5, Math.abs(l.affinity) / 20)}
+              linkColor={(l: any) => (l.affinity >= 0 ? "rgba(80,180,255,0.6)" : "rgba(220,80,80,0.6)")}
+              onNodeClick={(n: any) => setSelectedEmployeeId(n.id)}
+              width={1100}
+              height={420}
+            />
+          )}
+        </div>
+      </div>
+
+      {fireTarget && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Fire {fireTarget.name}?</h3>
+            <p>
+              This deactivates {fireTarget.name}'s Mattermost, Zammad, Wiki.js accounts and
+              restricts their mailbox (nothing is deleted). Status becomes "terminated".
+            </p>
+            <div className="modal-actions">
+              <button className="action-btn" onClick={() => setFireTarget(null)} disabled={busy}>
+                Cancel
+              </button>
+              <button className="danger-btn" onClick={doFire} disabled={busy}>
+                {busy ? "Firing..." : "Confirm Fire"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {hireOpen && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h3>Hire New Employee</h3>
+            <label className="form-label">
+              Name
+              <input
+                className="form-input"
+                value={hireForm.name}
+                onChange={(e) => setHireForm({ ...hireForm, name: e.target.value })}
+              />
+            </label>
+            <label className="form-label">
+              Department
+              <input
+                className="form-input"
+                value={hireForm.department}
+                onChange={(e) => setHireForm({ ...hireForm, department: e.target.value })}
+              />
+            </label>
+            <label className="form-label">
+              Title
+              <input
+                className="form-input"
+                value={hireForm.title}
+                onChange={(e) => setHireForm({ ...hireForm, title: e.target.value })}
+              />
+            </label>
+            <label className="form-label">
+              Role tier
+              <select
+                className="form-input"
+                value={hireForm.role_tier}
+                onChange={(e) => setHireForm({ ...hireForm, role_tier: e.target.value })}
+              >
+                <option value="ic">IC</option>
+                <option value="lead">Lead</option>
+              </select>
+            </label>
+            <div className="modal-actions">
+              <button className="action-btn" onClick={() => setHireOpen(false)} disabled={busy}>
+                Cancel
+              </button>
+              <button
+                className="action-btn"
+                onClick={doHire}
+                disabled={busy || !hireForm.name || !hireForm.department || !hireForm.title}
+              >
+                {busy ? "Hiring..." : "Hire"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 34: Payroll tab
+// ---------------------------------------------------------------------------
+function PayrollTab() {
+  const [roster, setRoster] = useState<PayrollEmployeeRow[] | null>(null);
+  const [history, setHistory] = useState<PayrollHistory | null>(null);
+  const [proposals, setProposals] = useState<Record<number, string>>({});
+  const [err, setErr] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
+
+  const load = () => {
+    api.payrollRoster().then((d) => setRoster(d.employees)).catch((e) => setErr(String(e)));
+    api.payrollHistory().then(setHistory).catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const applyRaise = async (emp: PayrollEmployeeRow) => {
+    const proposedStr = proposals[emp.id];
+    const proposed = Number(proposedStr);
+    if (!proposedStr || Number.isNaN(proposed) || proposed <= emp.pay_rate) return;
+    setBusyId(emp.id);
+    try {
+      await api.payrollRaise({ employee_id: emp.id, new_pay: proposed, reason: "manual raise via dashboard" });
+      setToast(`Raise applied for ${emp.name}: $${emp.pay_rate.toFixed(2)} → $${proposed.toFixed(2)}`);
+      setProposals((p) => ({ ...p, [emp.id]: "" }));
+      load();
+      setTimeout(() => setToast(null), 4000);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <section>
+      <h1>Payroll</h1>
+      {err && <ErrorBanner message={err} />}
+      {toast && <div className="toast">{toast}</div>}
+
+      <div className="card">
+        <h2>Per-Employee Pay Editor</h2>
+        {roster && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Department</th>
+                <th>Current pay ({roster[0]?.pay_frequency ?? "biweekly"})</th>
+                <th>Proposed new pay</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {roster.map((emp) => {
+                const proposedStr = proposals[emp.id] ?? "";
+                const proposed = Number(proposedStr);
+                const isDecrease = proposedStr !== "" && !Number.isNaN(proposed) && proposed < emp.pay_rate;
+                const isValidRaise = proposedStr !== "" && !Number.isNaN(proposed) && proposed > emp.pay_rate;
+                return (
+                  <tr key={emp.id}>
+                    <td>{emp.name}</td>
+                    <td>{emp.department}</td>
+                    <td>${emp.pay_rate.toFixed(2)}</td>
+                    <td>
+                      <input
+                        className="form-input form-input-small"
+                        type="number"
+                        step="0.01"
+                        placeholder={emp.pay_rate.toFixed(2)}
+                        value={proposedStr}
+                        onChange={(e) => setProposals((p) => ({ ...p, [emp.id]: e.target.value }))}
+                      />
+                    </td>
+                    <td>
+                      <button
+                        className="action-btn"
+                        disabled={!isValidRaise || busyId === emp.id}
+                        title={
+                          isDecrease
+                            ? "Pay cuts require Phase 24 (pay negotiation meetings) — not yet built."
+                            : undefined
+                        }
+                        onClick={() => applyRaise(emp)}
+                      >
+                        {busyId === emp.id ? "Saving..." : "Save"}
+                      </button>
+                      {isDecrease && (
+                        <p className="hint hint-inline">
+                          Pay cuts require Phase 24 (pay negotiation meetings) — not yet built.
+                        </p>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Payroll History</h2>
+        {history && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Action</th>
+                <th>Actor</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.history.map((h) => (
+                <tr key={h.id}>
+                  <td>{new Date(h.created_at).toLocaleString()}</td>
+                  <td>{h.action}</td>
+                  <td>{h.actor}</td>
+                  <td>
+                    {h.detail.employee_name ? `${h.detail.employee_name}: ` : ""}
+                    {h.detail.old_pay !== undefined ? `$${h.detail.old_pay} → ` : ""}
+                    {h.detail.new_pay !== undefined ? `$${h.detail.new_pay}` : ""}
+                    {h.detail.proposed_pay !== undefined ? `proposed $${h.detail.proposed_pay}` : ""}
+                    {h.detail.reason ? ` (${h.detail.reason})` : ""}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 34: Accounting tab
+// ---------------------------------------------------------------------------
+function AccountingTab() {
+  const [data, setData] = useState<AccountingSummary | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
+
+  const load = () => api.accountingSummary().then(setData).catch((e) => setErr(String(e)));
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 15000);
+    return () => clearInterval(id);
+  }, []);
+
+  const decide = async (approvalId: number, action: "approve" | "reject") => {
+    setBusyId(approvalId);
+    try {
+      if (action === "approve") await api.accountingApprove(approvalId);
+      else await api.accountingReject(approvalId);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <section>
+      <h1>Accounting</h1>
+      {err && <ErrorBanner message={err} />}
+      {data && (
+        <>
+          <div className="card">
+            <h2>Cash Balance</h2>
+            {data.cash.error && <ErrorBanner message={data.cash.error} />}
+            {data.cash.cash_balance !== null && (
+              <div className="stat-row">
+                <div className="stat">
+                  <div className="stat-label">Cash balance</div>
+                  <div className="stat-value">${data.cash.cash_balance.toFixed(2)}</div>
+                </div>
+              </div>
+            )}
+            <a className="action-btn action-btn-link" href={data.akaunting_deep_link} target="_blank" rel="noreferrer">
+              Open in Akaunting
+            </a>
+          </div>
+
+          <div className="card">
+            <h2>Expense Approval Queue ({data.pending_approvals.length})</h2>
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Ref</th>
+                  <th>Requester</th>
+                  <th>Amount</th>
+                  <th>Created</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.pending_approvals.map((p) => (
+                  <tr key={p.id}>
+                    <td>{p.expense_request_ref}</td>
+                    <td>{p.requester_employee_id}</td>
+                    <td>${Number(p.amount).toFixed(2)}</td>
+                    <td>{new Date(p.created_at).toLocaleString()}</td>
+                    <td>
+                      <button
+                        className="action-btn"
+                        disabled={busyId === p.id}
+                        onClick={() => decide(p.id, "approve")}
+                      >
+                        Approve
+                      </button>{" "}
+                      <button
+                        className="danger-btn-small"
+                        disabled={busyId === p.id}
+                        onClick={() => decide(p.id, "reject")}
+                      >
+                        Reject
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="card">
+            <h2>Audit-Correction Log</h2>
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Action</th>
+                  <th>Actor</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.audit_log.map((a) => (
+                  <tr key={a.id}>
+                    <td>{new Date(a.created_at).toLocaleString()}</td>
+                    <td>{a.action}</td>
+                    <td>{a.actor}</td>
+                    <td>{JSON.stringify(a.detail)}</td>
                   </tr>
                 ))}
               </tbody>

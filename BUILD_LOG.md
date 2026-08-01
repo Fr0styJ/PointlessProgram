@@ -47,6 +47,101 @@
 
 ---
 
+### 2026-08-01T01:15 — Phase 34 built and runtime-verified: HR / Payroll / Accounting dashboard tabs
+
+Built per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 34 feature list, adding three tabs to the
+Phase 33 dashboard shell (no new service directory — same `dashboard/` container per the plan's
+own "no new service needed" expectation, confirmed).
+
+- **Backend gap found and fixed**: `provisioning/main.py` was CLI-only through Phase 14 (`restart:
+  "no"`, one-shot `python main.py provision --all`/`fire`/`provision-principal`) — there was no
+  HTTP endpoint the dashboard could call for Fire/Hire. Added a FastAPI "serve" mode
+  (`python main.py serve`, new `POST /hire` and `POST /fire`) reusing the exact same
+  `provision_employee()`/`fire_employee()` functions the CLI already calls — no duplicated
+  account-creation/deactivation logic. The CLI path is completely unchanged and still works for
+  manual/first-boot bulk provisioning. `docker-compose.yml`'s `provisioning` service now runs
+  `command: ["python", "main.py", "serve"]`, `restart: unless-stopped`, with a healthcheck, and
+  gained a `phase34` profile alongside its existing `phase14` one.
+- **HR / Org Chart tab**: roster table (`GET /api/hr/roster`, direct SQL — no owning microservice
+  for reads, matching Phase 33's established pattern) with department/title/status, including
+  Phase 19's `pto_calendar` surfaced as a distinct "on-PTO" badge (approximated with wall-clock
+  `NOW()` against sim-time columns — good enough for an at-a-glance badge, not used for any
+  functional gating). Fire button per active row opens a confirmation modal, then
+  `POST /api/hr/employees/{id}/fire` → provisioning's new `/fire`. Hire opens a small form (name,
+  department, title, role tier — name was added beyond the plan's literal "department, title"
+  since `employees.name`/`email` are `NOT NULL`/`UNIQUE`) → `POST /api/hr/employees/hire` →
+  provisioning's new `/hire`, which inserts the roster row (pay defaulted from
+  `market_benchmark`) and runs the same provisioning flow as any other new hire.
+  **Relationship graph**: node = employee (colored by department), edge = `employee_relationships`
+  row, edge width/color = `affinity_score` (blue = positive, red = negative). Library choice:
+  `react-force-graph-2d` over `reactflow` — this view has no natural manual layout (pure
+  node/edge/weight data), so a force-directed auto-layout library needs far less wiring than a
+  flowchart-oriented library that expects you to own node positions. Clicking a node filters the
+  graph to that employee's edges only; a "Clear filter" button resets it.
+- **Payroll tab**: per-employee pay editor (`GET /api/payroll/roster`) with a proposed-new-pay
+  input per row. Raise path (`POST /api/payroll/raise` → accounting-engine's existing
+  `/payroll/raise`) applies immediately and shows a toast. **Cut path is genuinely blocked, not
+  just hidden**: the Save button is `disabled` client-side the moment the proposed figure is below
+  current pay, with the tooltip/inline text "Pay cuts require Phase 24 (pay negotiation meetings)
+  — not yet built." — verified live by typing a decrease into the UI and confirming Save stays
+  disabled and no network request fires. Also verified server-side: a direct `curl` to
+  `/api/payroll/raise` with a decrease gets a `400` from accounting-engine's own guard (belt and
+  suspenders — the BFF adds no cut-applying endpoint at all). Payroll history
+  (`GET /api/payroll/history`) reads `system_audit_log` directly, filtered to
+  `raise_applied`/`pay_cut_proposed_stub` — no dedicated payroll-history table exists; the audit
+  log is already the durable record accounting-engine writes to.
+- **Accounting tab**: cash balance (`GET /api/accounting/summary` → new accounting-engine endpoint
+  `GET /accounting/cash-balance`, which sums Akaunting's own `/accounts` `current_balance` field
+  via the existing `AkauntingClient` — deliberately NOT a second raw-MySQL query duplicating Phase
+  31's Grafana panel logic, and no new network needed since accounting-engine already reaches
+  Akaunting's REST API over `net_office`). "Open in Akaunting" deep link to
+  `{AKAUNTING_PUBLIC_URL}/{AKAUNTING_COMPANY_ID}/reports/profit-loss` (both now in
+  `.env.example`). Expense-approval queue reads `pending_approvals` directly (same pattern as
+  Phase 33's Narrative tab) with Approve/Reject buttons — Approve proxies the existing
+  `POST /expense/approve`; **Reject required a new accounting-engine endpoint**
+  (`POST /expense/reject`) since only Approve existed before Phase 34 — no dashboard UI had needed
+  it yet. Audit-correction log reads `system_audit_log` filtered to
+  `audit_correction`/`audit_run_complete`/`payroll_no_akaunting_ref` (Books Auditor's own output,
+  Phase 15/28).
+- **docker-compose.yml**: no new service. `dashboard` gained `PROVISIONING_URL`,
+  `ACCOUNTING_ENGINE_URL`, `AKAUNTING_COMPANY_ID`, `AKAUNTING_PUBLIC_URL` env vars and a `phase34`
+  profile; `provisioning` and `accounting-engine` both gained a `phase34` profile. No new networks
+  needed — dashboard already shares `net_clients`/`net_data` with both services.
+
+**Runtime verification** (against the live shared stack, rebuilt `provisioning`, `accounting-engine`,
+`dashboard` from an isolated worktree per this session's constraints):
+- All three containers rebuilt and came up healthy.
+- HR roster: real data (`GET /api/hr/roster` returned the actual live roster, including a
+  previously-terminated employee showing `status: terminated`).
+- Hire → Fire round-trip: hired a throwaway "Zoe Testuser" (Engineering/ic) — real accounts
+  provisioned, roster row created (`employee_id: 22`) — then fired the same employee immediately
+  to avoid polluting the primary roster. Both calls returned success.
+- Relationship graph: confirmed rendering with real nodes/edges in the browser (force-directed
+  layout, department-colored nodes, weighted edges).
+- Raise: applied a real raise to employee 2 (Bob Martinez, $3269.23 → $3400.00) via the API;
+  confirmed it appeared in `/api/payroll/history` immediately.
+- Cut-path block: confirmed in the browser UI (Save button disables + tooltip appears the instant
+  a lower figure is typed) AND via direct API call (accounting-engine's own `/payroll/raise`
+  returns 400 for a decrease).
+- Accounting: cash balance from `/api/accounting/summary` (-$46,821.73) cross-checked directly
+  against Akaunting's own `GET /api/accounts` — matched exactly. Found one real pending approval
+  (id 2, $2500, Principal-level) — Reject tested end-to-end (row moved to `rejected`, disappeared
+  from the queue). Approve hit a **pre-existing, unrelated bug**: accounting-engine's
+  `AkauntingClient.post_transaction()` hardcodes `payment_method: "offline-payments.cash.1"`,
+  which Akaunting now rejects with a 422 ("The payment method is invalid") — reproduced with a
+  raw `curl`-equivalent call bypassing the dashboard entirely, confirming this is a bug in
+  Phase 15's existing `accounting-engine` code (affects `/expense/approve`, `/expense/submit`'s
+  auto-approve path, and `/payroll/run`), not something Phase 34 introduced. Flagged as a
+  separate follow-up task rather than fixed inline (out of scope for this dashboard-wiring
+  phase).
+
+**Bugs found (not fixed, flagged separately)**:
+1. `accounting-engine`'s hardcoded Akaunting `payment_method` key is stale/invalid, breaking every
+   code path that posts a real transaction (expense approve, payroll run, revenue post). Raises
+   are unaffected (no Akaunting post involved).
+
+---
+
 ### 2026-08-01T01:00 — Phase 33 built and runtime-verified: Control Dashboard shell + Simulation / LLM Status / Narrative tabs
 
 Built per `PLAN_PHASES_33_38_DASHBOARD.md` (signed off 2026-08-01) and its recorded user

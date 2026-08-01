@@ -196,3 +196,137 @@ h1 {
   border-radius: 6px;
   margin-bottom: 12px;
 }
+
+/* Phase 34: HR / Payroll / Accounting additions */
+.card-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.row-pto {
+  background: rgba(230, 180, 30, 0.1);
+}
+
+.badge-status-active {
+  background: #2f6f4f;
+  color: #d7ffe9;
+}
+
+.badge-status-on-pto {
+  background: #6f5c2f;
+  color: #ffe9c2;
+}
+
+.badge-status-vacant {
+  background: #4a4f5c;
+  color: #e6e6e6;
+}
+
+.badge-status-terminated,
+.badge-status-resigned {
+  background: #4a2f2f;
+  color: #ffb3ac;
+}
+
+.danger-btn {
+  padding: 8px 18px;
+  border-radius: 6px;
+  border: 1px solid #c0392b;
+  background: #c0392b;
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.danger-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.danger-btn-small {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid #c0392b;
+  background: transparent;
+  color: #ff9d95;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.danger-btn-small:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.action-btn-link {
+  display: inline-block;
+  text-decoration: none;
+  margin-top: 8px;
+}
+
+.hint-inline {
+  margin: 4px 0 0;
+}
+
+.form-label {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 0.85rem;
+  color: #b7bdc9;
+}
+
+.form-input {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid #2a2e37;
+  background: #0f1115;
+  color: #e6e6e6;
+}
+
+.form-input-small {
+  width: 120px;
+  display: inline-block;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #171a21;
+  border: 1px solid #2a2e37;
+  border-radius: 10px;
+  padding: 24px;
+  width: 400px;
+  max-width: 90vw;
+}
+
+.danger-modal {
+  border-color: #c0392b;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+.toast {
+  background: rgba(47, 111, 237, 0.2);
+  border: 1px solid #2f6fed;
+  color: #cfe0ff;
+  padding: 8px 14px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}

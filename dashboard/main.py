@@ -13,6 +13,7 @@ DASHBOARD_AUTH_USER / DASHBOARD_AUTH_PASSWORD (no default — required to be set
 matching this repo's existing convention for other required secrets, e.g.
 LITELLM_MASTER_KEY's `:?` compose syntax).
 """
+import json
 import logging
 import os
 import secrets
@@ -29,6 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from decimal import Decimal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +52,18 @@ DATABASE_URL = os.environ.get(
 SIM_CLOCK_URL = os.environ.get("SIM_CLOCK_URL", "http://sim-clock:8000")
 ORCHESTRATOR_URL = os.environ.get("ORCHESTRATOR_URL", "http://orchestrator:8000")
 LITELLM_CONFIG_PATH = os.environ.get("LITELLM_CONFIG_PATH", "/litellm-config/config.yaml")
+# Phase 34: HR tab's Fire/Hire proxies to provisioning's new HTTP endpoints
+# (provisioning was CLI-only through Phase 14 — see provisioning/main.py's
+# "serve" mode). Payroll/Accounting tabs proxy to accounting-engine's existing
+# (and two new Phase 34) endpoints. Both services already share net_clients/
+# net_data with this container, so no new network/compose wiring was needed.
+PROVISIONING_URL = os.environ.get("PROVISIONING_URL", "http://provisioning:8000")
+ACCOUNTING_ENGINE_URL = os.environ.get("ACCOUNTING_ENGINE_URL", "http://accounting-engine:8000")
+# Static deep link — Akaunting's own SPA routes reports under /{company_id}/reports/...;
+# resolved via the browser's own DNS (Technitium, already configured for other appliances)
+# against the Traefik-routed hostname, matching every other deep-link pattern in this repo.
+AKAUNTING_COMPANY_ID = os.environ.get("AKAUNTING_COMPANY_ID", "1")
+AKAUNTING_PUBLIC_URL = os.environ.get("AKAUNTING_PUBLIC_URL", "http://accounting.fakecorp.internal")
 
 DASHBOARD_AUTH_USER = os.environ.get("DASHBOARD_AUTH_USER")
 DASHBOARD_AUTH_PASSWORD = os.environ.get("DASHBOARD_AUTH_PASSWORD")
@@ -332,6 +346,271 @@ async def narrative_summary(_user: str = Depends(require_basic_auth), pool: asyn
             "recent": [row_to_dict(r) for r in pending_actions_recent],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 34: HR / Org Chart tab
+#
+# Roster + relationships have no dedicated owning microservice for *reads*
+# (same pattern as narrative_threads etc. in Phase 33) — direct SQL. Fire/Hire
+# are real side-effecting actions across 4 appliances, so those proxy to
+# provisioning's new HTTP endpoints rather than duplicating that logic here.
+# ---------------------------------------------------------------------------
+@app.get("/api/hr/roster")
+async def hr_roster(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT e.id, e.name, e.department, e.role, e.role_tier, e.status,
+                   e.hired_at, e.terminated_at, e.pay_rate, e.pay_frequency,
+                   EXISTS (
+                       SELECT 1 FROM pto_calendar p
+                       WHERE p.employee_id = e.id
+                         AND p.start_sim_time <= NOW() AND p.end_sim_time > NOW()
+                   ) AS on_pto
+            FROM employees e
+            ORDER BY e.department, e.role_tier DESC, e.hired_at
+        """)
+
+    def to_dict(r):
+        d = dict(r)
+        # Phase 19's pto_calendar is sim-time keyed; NOW() above is wall-clock,
+        # which is an approximation — good enough for an at-a-glance dashboard
+        # badge, not used for any functional gating.
+        display_status = d["status"]
+        if d["status"] == "active" and d["on_pto"]:
+            display_status = "on-PTO"
+        d["display_status"] = display_status
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = v.isoformat()
+            elif isinstance(v, Decimal):
+                d[k] = float(v)
+        return d
+
+    return {"employees": [to_dict(r) for r in rows]}
+
+
+@app.get("/api/hr/relationships")
+async def hr_relationships(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        edges = await conn.fetch("""
+            SELECT r.employee_a_id, r.employee_b_id, r.relationship_type, r.affinity_score,
+                   ea.name AS a_name, eb.name AS b_name
+            FROM employee_relationships r
+            JOIN employees ea ON ea.id = r.employee_a_id
+            JOIN employees eb ON eb.id = r.employee_b_id
+        """)
+        nodes = await conn.fetch("SELECT id, name, department, status FROM employees")
+
+    return {
+        "nodes": [dict(n) for n in nodes],
+        "edges": [dict(e) for e in edges],
+    }
+
+
+class HireBody(BaseModel):
+    name: str
+    department: str
+    title: str
+    role_tier: str = "ic"
+
+
+@app.post("/api/hr/employees/hire")
+async def hr_hire(body: HireBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(f"{PROVISIONING_URL}/hire", json=body.model_dump(), timeout=60.0)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"provisioning unreachable: {exc}")
+
+
+@app.post("/api/hr/employees/{employee_id}/fire")
+async def hr_fire(employee_id: int, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(f"{PROVISIONING_URL}/fire", json={"employee_id": employee_id}, timeout=60.0)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"provisioning unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 34: Payroll tab
+#
+# Raise path: proxies accounting-engine's existing /payroll/raise (applies
+# immediately, spec §10.3). Cut path: Phase 24 (pay negotiation meetings)
+# doesn't exist yet — accounting-engine's own /payroll/propose-cut is a STUB
+# that only logs and queues, per that file's own header comment. Per the
+# 2026-08-01 sign-off and PHASES.md line 735 ("never applying directly"), the
+# dashboard does NOT call any cut-applying path from the Save button at all —
+# it's disabled client-side, and this BFF exposes no endpoint that would let a
+# cut bypass that. Payroll history reads system_audit_log directly (no
+# dedicated payroll_history table exists — raise/cut events are already
+# durably logged there by accounting-engine, same pattern as Phase 33's
+# narrative tab reusing tables with no owning service for reads).
+# ---------------------------------------------------------------------------
+@app.get("/api/payroll/roster")
+async def payroll_roster(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, name, department, role, role_tier, status, pay_rate, pay_frequency,
+                   pay_last_changed_at, pay_last_change_reason
+            FROM employees
+            WHERE status = 'active'
+            ORDER BY department, role_tier DESC, name
+        """)
+
+    def to_dict(r):
+        d = dict(r)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = v.isoformat()
+            elif isinstance(v, Decimal):
+                d[k] = float(v)
+        return d
+
+    return {"employees": [to_dict(r) for r in rows]}
+
+
+@app.get("/api/payroll/history")
+async def payroll_history(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, actor, action, detail, created_at
+            FROM system_audit_log
+            WHERE action IN ('raise_applied', 'pay_cut_proposed_stub')
+            ORDER BY created_at DESC
+            LIMIT 200
+        """)
+
+    def to_dict(r):
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat()
+        detail = d["detail"]
+        d["detail"] = json.loads(detail) if isinstance(detail, str) else dict(detail)
+        return d
+
+    return {"history": [to_dict(r) for r in rows]}
+
+
+class RaiseBody(BaseModel):
+    employee_id: int
+    new_pay: float
+    reason: str = "manual raise via dashboard"
+
+
+@app.post("/api/payroll/raise")
+async def payroll_raise(body: RaiseBody, _user: str = Depends(require_basic_auth)):
+    """Increase-only — accounting-engine's /payroll/raise itself 400s on a
+    decrease (belt-and-suspenders; the frontend Save button is also disabled
+    client-side for a decrease so this rejection should never normally fire)."""
+    try:
+        r = await _http.post(
+            f"{ACCOUNTING_ENGINE_URL}/payroll/raise",
+            params={"employee_id": body.employee_id, "new_pay": body.new_pay, "reason": body.reason},
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"accounting-engine unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 34: Accounting tab
+# ---------------------------------------------------------------------------
+@app.get("/api/accounting/summary")
+async def accounting_summary(_user: str = Depends(require_basic_auth), pool: asyncpg.Pool = Depends(get_pool)):
+    cash = {"cash_balance": None, "accounts": [], "error": None}
+    try:
+        r = await _http.get(f"{ACCOUNTING_ENGINE_URL}/accounting/cash-balance", timeout=15.0)
+        r.raise_for_status()
+        cash = {**r.json(), "error": None}
+    except Exception as exc:
+        cash["error"] = str(exc)
+
+    async with pool.acquire() as conn:
+        approvals = await conn.fetch("""
+            SELECT id, expense_request_ref, requester_employee_id, approver_employee_id,
+                   approver_is_principal, amount, status, created_at
+            FROM pending_approvals
+            WHERE status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 100
+        """)
+        audit_entries = await conn.fetch("""
+            SELECT id, actor, action, detail, created_at
+            FROM system_audit_log
+            WHERE action IN ('audit_correction', 'audit_run_complete', 'payroll_no_akaunting_ref')
+            ORDER BY created_at DESC
+            LIMIT 100
+        """)
+
+    def row_to_dict(r):
+        d = dict(r)
+        for k, v in d.items():
+            if isinstance(v, datetime):
+                d[k] = v.isoformat()
+        if "detail" in d:
+            d["detail"] = json.loads(d["detail"]) if isinstance(d["detail"], str) else dict(d["detail"])
+        return d
+
+    return {
+        "cash": cash,
+        "akaunting_deep_link": f"{AKAUNTING_PUBLIC_URL}/{AKAUNTING_COMPANY_ID}/reports/profit-loss",
+        "pending_approvals": [row_to_dict(r) for r in approvals],
+        "audit_log": [row_to_dict(r) for r in audit_entries],
+    }
+
+
+@app.post("/api/accounting/audit/run")
+async def accounting_run_audit(_user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(f"{ACCOUNTING_ENGINE_URL}/audit/run", timeout=60.0)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"accounting-engine unreachable: {exc}")
+
+
+class ApprovalBody(BaseModel):
+    approval_id: int
+    actor: str = "principal"
+    note: str = ""
+
+
+@app.post("/api/accounting/expense/approve")
+async def accounting_approve(body: ApprovalBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(
+            f"{ACCOUNTING_ENGINE_URL}/expense/approve",
+            json={"approval_id": body.approval_id, "approved_by": body.actor, "note": body.note},
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"accounting-engine unreachable: {exc}")
+
+
+@app.post("/api/accounting/expense/reject")
+async def accounting_reject(body: ApprovalBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(
+            f"{ACCOUNTING_ENGINE_URL}/expense/reject",
+            json={"approval_id": body.approval_id, "rejected_by": body.actor, "note": body.note},
+            timeout=30.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"accounting-engine unreachable: {exc}")
 
 
 # ---------------------------------------------------------------------------
