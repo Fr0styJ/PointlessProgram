@@ -1736,6 +1736,42 @@ services:
       PURGE_MANAGER_URL: "http://purge-manager:8000"
       SNAPSHOT_MANAGER_URL: "http://snapshot-manager:8000"
       BRANDING_MANAGER_URL: "http://branding-manager:8000"
+      # Phase 37: TV wall (chat/ticket feeds), Errors panel + log tail (Loki),
+      # Deep Links panel (static list + real Principal credentials).
+      # Loki is already reachable on net_mgmt (shared with grafana/promtail) —
+      # no new network needed for that. Mattermost/Zammad ARE new reachability
+      # needs for this container (their APIs, not just their Traefik-routed
+      # hostnames which the browser hits directly) — hence net_office, added
+      # below, matching human-bridge's own multi-homing for the identical
+      # "read recent posts/tickets via admin token" pattern (see human-bridge/
+      # main.py's _poll_mattermost_once / _poll_zammad_once, reused verbatim
+      # here rather than re-derived).
+      LOKI_URL: "http://loki:3100"
+      MATTERMOST_URL: "http://mattermost:8065"
+      MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      MATTERMOST_TEAM_ID: "${MATTERMOST_TEAM_ID:-}"
+      ZAMMAD_URL: "http://zammad-nginx:8080"
+      ZAMMAD_ADMIN_TOKEN: "${ZAMMAD_ADMIN_TOKEN:-}"
+      # Deep Links panel (2026-08-01 sign-off, amended — no iframe, direct
+      # links + visible Principal credentials read from .env, reusing the
+      # exact same env vars every other phase already uses for these
+      # appliances — no new secrets minted for this panel).
+      PRINCIPAL_EMAIL: "${PRINCIPAL_EMAIL:-principal@fakecorp.internal}"
+      MATTERMOST_ADMIN_USER: "${MATTERMOST_ADMIN_USER:-}"
+      MATTERMOST_ADMIN_PASSWORD: "${MATTERMOST_ADMIN_PASSWORD:-}"
+      ZAMMAD_ADMIN_EMAIL: "${ZAMMAD_ADMIN_EMAIL:-}"
+      ZAMMAD_ADMIN_PASSWORD: "${ZAMMAD_ADMIN_PASSWORD:-}"
+      WIKIJS_ADMIN_EMAIL: "${WIKIJS_ADMIN_EMAIL:-}"
+      WIKIJS_ADMIN_PASSWORD: "${WIKIJS_ADMIN_PASSWORD:-}"
+      NEXTCLOUD_ADMIN_USER: "${NEXTCLOUD_ADMIN_USER:-admin}"
+      NEXTCLOUD_ADMIN_PASSWORD: "${NEXTCLOUD_ADMIN_PASSWORD:-}"
+      WORDPRESS_ADMIN_USER: "${WORDPRESS_ADMIN_USER:-}"
+      WORDPRESS_ADMIN_PASSWORD: "${WORDPRESS_ADMIN_PASSWORD:-}"
+      AKAUNTING_ADMIN_EMAIL: "${AKAUNTING_ADMIN_EMAIL:-}"
+      AKAUNTING_ADMIN_PASSWORD: "${AKAUNTING_ADMIN_PASSWORD:-}"
+      GRAFANA_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GRAFANA_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-}"
+      MAILSERVER_BOT_SECRET: "${MAILSERVER_BOT_SECRET:-fakeco-bot-mail-secret-change-me}"
     volumes:
       - ./litellm/config.yaml:/litellm-config/config.yaml:ro
     networks:
@@ -1743,6 +1779,7 @@ services:
       - net_clients
       - net_data
       - net_dmz
+      - net_office
     ports:
       - "8090:8000"   # host-published on net_mgmt, per this file's own network comment block
     healthcheck:

@@ -47,6 +47,131 @@
 
 ---
 
+### 2026-08-01T03:45 — Phase 37: TV wall, Errors panel, deep links, log tail — runtime-verified against the live stack
+
+Per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 37 section, including the 2026-08-01 sign-off
+amendment to the Deep Links panel (no iframe embedding, direct links + visible Principal
+credentials only). Built entirely inside worktree `agent-adbc0e1357593f9c2` (no edits to the
+primary checkout); all verification below ran against the shared live `pointlessprogram` compose
+project by rebuilding/recreating only the `dashboard` service from this worktree's
+`docker-compose.yml` (`docker compose -p pointlessprogram --env-file <main>/.env -f
+docker-compose.yml build/up --no-deps dashboard`).
+
+**What was built** (`dashboard/main.py`, `dashboard/frontend/src/{App.tsx,TvWall.tsx,api.ts,
+main.tsx,styles.css}`, `docker-compose.yml`'s `dashboard` service):
+
+- **`/tv` route**: new no-nav-chrome spectator view (`TvWall.tsx`), still gated by the same
+  dashboard-wide HTTP Basic Auth as every other route (the static-file catch-all in `main.py`
+  auths every path, `/tv` included — `main.tsx` just branches on `window.location.pathname`
+  instead of adding a router dependency, since one extra top-level route doesn't justify one).
+  Auto-cycles every 18s through 5 panels: live chat feed, live ticket feed, financial snapshot
+  (cash balance / pending approvals / retry-queue depth), KPI highlights (top movers), and
+  sim-time/speed/tick-loop state. A "weekly digest" panel from the plan's feature list was
+  **deliberately skipped** — confirmed Phase 25 (the weekly-digest generator) is not built
+  anywhere in this codebase (no digest-selection code in `kpi-engine`, `PHASES.md`'s own Phase 25
+  section confirms not-started) — per the plan's explicit instruction not to invent one.
+- **Live chat/ticket feeds**: new `GET /api/tv/chat-feed` and `GET /api/tv/ticket-feed` on the
+  BFF. Reuses the exact Mattermost/Zammad admin-token read pattern already proven in
+  `human-bridge/main.py`'s `_poll_mattermost_once`/`_poll_zammad_once` (team channels → recent
+  posts per channel; ticket list → sorted by `created_at`) rather than re-deriving a new approach.
+  Required adding `net_office` to the `dashboard` service (previously only had
+  `net_mgmt`/`net_clients`/`net_data`/`net_dmz`) so it can reach Mattermost/Zammad's APIs directly,
+  plus `MATTERMOST_URL`/`MATTERMOST_ADMIN_TOKEN`/`MATTERMOST_TEAM_ID`/`ZAMMAD_URL`/
+  `ZAMMAD_ADMIN_TOKEN` env vars (same vars/values every earlier phase already uses).
+- **Errors panel**: new `GET /api/errors/recent` (optional `?service=` filter) and
+  `GET /api/errors/services`, proxying a Loki `query_range` call scoped to
+  `{container=~"<service-list>", level="ERROR"}` — `level` is a real Loki stream label already
+  promoted by `monitoring/promtail-config.yaml`'s own `pipeline_stages` (JSON `level` field →
+  label), so this is a cheap label-matched query, not a full-text scan. Covers exactly the 9
+  services spec §25 names: accounting-engine, meeting-simulator, human-bridge, orchestrator,
+  external-world, kpi-engine, branding-manager, snapshot-manager, purge-manager. `LOKI_URL` env var
+  added; no new network needed (Loki is already on `net_mgmt`, shared with `dashboard`).
+- **Log tail**: new `GET /api/logs/tail`, a Server-Sent Events stream (FastAPI `StreamingResponse`,
+  no new dependency) polling Loki every 3s with **the exact LogQL query from Phase 31's
+  `monitoring/grafana/dashboards/traffic-and-activity.json` panel #5**
+  (`{container=~"fakeco-traefik|fakeco-dns"}`), verbatim — not re-derived. Frontend uses a plain
+  `EventSource` (browser replays cached HTTP Basic Auth credentials for same-origin SSE requests,
+  confirmed working in testing).
+- **Deep Links panel** (2026-08-01 sign-off, amended — no iframe, direct links + visible
+  credentials): new `GET /api/deep-links`, static list of the 8 named appliances, each with its
+  real Traefik-routed hostname's own login page and the Principal's real username/password read
+  from `.env`. Credential env var per appliance (confirmed by reading actual `.env`/`.env.example`
+  and each appliance's own login flow, not guessed): Mattermost → `MATTERMOST_ADMIN_EMAIL`/
+  `MATTERMOST_ADMIN_USER`/`MATTERMOST_ADMIN_PASSWORD`; Zammad → `ZAMMAD_ADMIN_EMAIL`/
+  `ZAMMAD_ADMIN_PASSWORD`; Wiki.js → `WIKIJS_ADMIN_EMAIL`/`WIKIJS_ADMIN_PASSWORD` (this one IS
+  literally the Principal's own account — `WIKIJS_ADMIN_EMAIL` equals `PRINCIPAL_EMAIL` per
+  `provisioning/main.py`'s `provision-principal` command); Nextcloud →
+  `NEXTCLOUD_ADMIN_USER`/`NEXTCLOUD_ADMIN_PASSWORD`; WordPress →
+  `WORDPRESS_ADMIN_USER`/`WORDPRESS_ADMIN_PASSWORD`; Akaunting →
+  `AKAUNTING_ADMIN_EMAIL`/`AKAUNTING_ADMIN_PASSWORD` (added to the `dashboard` service's env block —
+  previously only had `AKAUNTING_DB_PASSWORD`); Grafana → `GRAFANA_ADMIN_USER`/
+  `GRAFANA_ADMIN_PASSWORD`; Roundcube → `PRINCIPAL_EMAIL` + a password **derived**, not stored —
+  reproduces `provisioning/main.py`'s `MailClient._derive_password()` algorithm exactly
+  (`sha256(f"{MAILSERVER_BOT_SECRET}:{email}")[:24]`) since the Principal's real mailbox password
+  is never persisted anywhere, only re-derivable from `MAILSERVER_BOT_SECRET` (already in `.env`).
+  No new secrets were minted anywhere in this panel.
+
+**Runtime verification** (all against the live stack, real data, not mocks):
+- `/tv` loads (200) under Basic Auth and 401s without it; confirmed via curl that panels pull real
+  data from the same live endpoints Phases 33-35 already expose.
+- **Errors panel**: initially found ZERO real ERROR-level lines existed yet in this dev
+  environment. Generated one for real rather than accepting a placeholder test: stopped
+  `fakeco-wikijs` via the Chaos tab's own `/api/chaos/appliances/fakeco-wikijs/stop`, called
+  `POST /api/company-direction/save` (which triggers human-bridge's Wiki.js pinned-page sync),
+  confirmed the write succeeded but reported `"wiki_sync_error"`, restarted Wiki.js, then confirmed
+  two real `level="ERROR"` JSON log lines appeared in `fakeco-human-bridge`'s logs
+  ("Wiki.js sync failed for directive v5: ...", "detection poller _poll_wikijs_once failed: ...")
+  and that `GET /api/errors/recent` (and `?service=fakeco-human-bridge`) returned them correctly,
+  while `?service=fakeco-orchestrator` correctly returned zero for the same window. **Bug found
+  along the way (not fixed, flagged only)**: uncaught 500s at the ASGI/Starlette level (e.g.
+  hitting `accounting-engine`'s `/accounting/cash-balance` while Akaunting was down for this same
+  test) log via uvicorn's own plaintext `ERROR: Exception in ASGI application` line, which is
+  **not** valid JSON, so promtail's `level` label extraction never fires for those — the Errors
+  panel only surfaces application-level `log.error(...)` calls (which do use this repo's JSON
+  logging format), not framework-level uncaught-exception tracebacks. Real, working as designed
+  for the former; a genuine blind spot for the latter, worth a follow-up if uncaught-exception
+  visibility matters later.
+- **Deep Links panel**: all 8 appliances render with a link + username/password. Cross-checked
+  two directly against the real `.env`: Wiki.js (`principal@fakecorp.internal` /
+  `placeholder_Aa1!`) and Akaunting (`admin@fakecorp.internal` / `placeholder`) — both matched
+  exactly, confirming real values are flowing through, not placeholders invented by this code.
+  Link-resolution spot-check via `curl -H "Host: <hostname>"` against Traefik (port 80) / Grafana
+  (port 3000) directly: Mattermost login (200), Zammad tickets root (200), Wiki.js `/login` (200),
+  Nextcloud `/login` (200), WordPress `/wp-login.php` (302, expected — WP redirects when no active
+  session), Grafana `/login` (200). **Bug found and fixed during this verification**: Akaunting's
+  real login route is `/auth/login`, not `/login` (`/login` 500s; root `/` 302-redirects to
+  `/auth/login`) — the panel's link was corrected to point at the real route. **Pre-existing
+  environment bug found, NOT caused by this phase's changes, flagged not fixed**: Roundcube
+  (`mail.fakecorp.internal`) times out (504/connection timeout) — its own container logs show
+  `ERROR: SQLSTATE[08006] ... database "roundcube" does not exist / Failed to initialize/update
+  the database`, a dev-environment provisioning gap unrelated to the dashboard. `Zammad` and
+  `WordPress` deep-link usernames/passwords render empty in this dev `.env` — confirmed this is
+  because `ZAMMAD_ADMIN_EMAIL`/`ZAMMAD_ADMIN_PASSWORD`/`WORDPRESS_ADMIN_USER`/
+  `WORDPRESS_ADMIN_PASSWORD` are genuinely unset in this dev environment's `.env` (present in
+  `.env.example`'s key list, just never filled in for this dev box) — not a code bug, the panel
+  correctly shows whatever `.env` actually has.
+- **Log tail**: confirmed empty initially (no fresh Traefik/Technitium traffic in the poll
+  window), then generated real traffic via `curl -H "Host: chat.fakecorp.internal"`/
+  `wiki.fakecorp.internal` directly against Traefik's host-published port 80, and confirmed the SSE
+  stream emitted real, live Traefik access-log JSON lines (full `RequestHost`/`RouterName`/
+  `DownstreamStatus`/etc. fields) within the same `curl --no-buffer` session, matching Phase 31's
+  panel query exactly.
+- **TV chat/ticket feeds**: confirmed both return real live data — Mattermost feed showed actual
+  crisis-response meeting bot posts and real user join events across multiple channels; Zammad
+  feed showed real expense-request tickets in `created_at` order, including the "surprise audit"/
+  "viral complaint" crisis-scenario tickets seeded during Phase 36's chaos verification.
+
+**docker-compose.yml changes**: `dashboard` service gained `net_office` (to reach
+Mattermost/Zammad directly) and a block of new env vars (`LOKI_URL`, `MATTERMOST_URL`,
+`MATTERMOST_ADMIN_TOKEN`, `MATTERMOST_TEAM_ID`, `ZAMMAD_URL`, `ZAMMAD_ADMIN_TOKEN`,
+`PRINCIPAL_EMAIL`, `MATTERMOST_ADMIN_USER`, `MATTERMOST_ADMIN_PASSWORD`, `ZAMMAD_ADMIN_EMAIL`,
+`ZAMMAD_ADMIN_PASSWORD`, `WIKIJS_ADMIN_EMAIL`, `WIKIJS_ADMIN_PASSWORD`, `NEXTCLOUD_ADMIN_USER`,
+`NEXTCLOUD_ADMIN_PASSWORD`, `WORDPRESS_ADMIN_USER`, `WORDPRESS_ADMIN_PASSWORD`,
+`AKAUNTING_ADMIN_EMAIL`, `AKAUNTING_ADMIN_PASSWORD`, `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD`,
+`MAILSERVER_BOT_SECRET`). No new service/container was needed — `dashboard` already existed.
+
+---
+
 ### 2026-08-01T03:15 — Phase 36: Chaos / Data Management / Branding dashboard tabs + Settings' "nuclear launch" full-purge control — runtime-verified against the live stack
 
 Per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 36 section and the 2026-08-01 sign-off amendment

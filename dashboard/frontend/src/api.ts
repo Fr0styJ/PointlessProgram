@@ -394,6 +394,55 @@ export interface LastSnapshotInfo {
   error: string | null;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 37: TV wall / Errors panel / Deep links / Log tail types
+// ---------------------------------------------------------------------------
+export interface TvChatPost {
+  id: string;
+  channel: string;
+  username: string;
+  message: string;
+  create_at: number;
+}
+
+export interface TvChatFeed {
+  posts: TvChatPost[];
+}
+
+export interface TvTicket {
+  id: number;
+  number: string;
+  title: string;
+  state_id: number;
+  created_at: string;
+}
+
+export interface TvTicketFeed {
+  tickets: TvTicket[];
+}
+
+export interface ErrorLogRow {
+  container: string;
+  timestamp: string;
+  line: string;
+}
+
+export interface ErrorsRecent {
+  errors: ErrorLogRow[];
+  query: string;
+}
+
+export interface DeepLink {
+  name: string;
+  url: string;
+  username: string;
+  password: string;
+}
+
+export interface DeepLinksResponse {
+  links: DeepLink[];
+}
+
 export const api = {
   simulationStatus: () => apiFetch<SimulationStatus>("/api/simulation/status"),
   tickPause: () => apiFetch("/api/simulation/tick/pause", { method: "POST" }),
@@ -525,4 +574,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ confirm }),
     }),
+
+  // Phase 37
+  tvChatFeed: () => apiFetch<TvChatFeed>("/api/tv/chat-feed"),
+  tvTicketFeed: () => apiFetch<TvTicketFeed>("/api/tv/ticket-feed"),
+  errorsServices: () => apiFetch<{ services: string[] }>("/api/errors/services"),
+  errorsRecent: (service?: string) =>
+    apiFetch<ErrorsRecent>(`/api/errors/recent${service ? `?service=${encodeURIComponent(service)}` : ""}`),
+  deepLinks: () => apiFetch<DeepLinksResponse>("/api/deep-links"),
 };

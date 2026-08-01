@@ -10,7 +10,9 @@ import {
   CompanyDirectiveCurrent,
   CompanyDirectiveHistory,
   DataManagementScope,
+  DeepLink,
   EmployeeRosterRow,
+  ErrorLogRow,
   ExternalWorldCustomers,
   ExternalWorldNews,
   HrRelationships,
@@ -45,8 +47,9 @@ const NAV_ITEMS = [
   { key: "chaos", label: "Chaos" },
   { key: "data-management", label: "Data Management" },
   { key: "branding", label: "Branding" },
+  { key: "errors", label: "Errors & Log Tail" },
+  { key: "deep-links", label: "Deep Links" },
   { key: "settings", label: "Settings" },
-  // Future phase plugs in here: TV...
 ] as const;
 
 type TabKey = (typeof NAV_ITEMS)[number]["key"];
@@ -68,6 +71,11 @@ export default function App() {
               {item.label}
             </button>
           ))}
+          {/* Phase 37: /tv is a separate spectator route with no nav chrome —
+              linked here, not rendered as an in-shell tab. */}
+          <a className="tab" href="/tv" target="_blank" rel="noreferrer">
+            TV Wall ↗
+          </a>
         </nav>
       </header>
       <main className="content">
@@ -83,6 +91,8 @@ export default function App() {
         {tab === "chaos" && <ChaosTab />}
         {tab === "data-management" && <DataManagementTab />}
         {tab === "branding" && <BrandingTab />}
+        {tab === "errors" && <ErrorsTab />}
+        {tab === "deep-links" && <DeepLinksTab />}
         {tab === "settings" && <SettingsTab />}
       </main>
     </div>
@@ -2067,6 +2077,200 @@ function BrandingTab() {
         <button className="action-btn" disabled={busy || bulkSelected.size === 0} onClick={doBulkApply}>
           {busy ? "Applying..." : `Apply to ${bulkSelected.size} selected`}
         </button>
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 37: Errors & Log Tail tab
+//
+// Errors panel: Loki query proxied through the BFF's /api/errors/recent
+// (level="ERROR" across every custom service container, filterable by
+// service). Log tail: live SSE stream of Traefik + Technitium logs, reusing
+// the exact LogQL query from Phase 31's traffic-and-activity.json panel #5
+// (see dashboard/main.py's LOG_TAIL_QUERY constant).
+// ---------------------------------------------------------------------------
+function ErrorsTab() {
+  const [services, setServices] = useState<string[]>([]);
+  const [selectedService, setSelectedService] = useState<string>("");
+  const [errors, setErrors] = useState<ErrorLogRow[]>([]);
+  const [query, setQuery] = useState<string>("");
+  const [err, setErr] = useState<string | null>(null);
+  const [tailLines, setTailLines] = useState<{ container: string; timestamp: string; line: string }[]>([]);
+  const [tailErr, setTailErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.errorsServices().then((d) => setServices(d.services)).catch((e) => setErr(String(e)));
+  }, []);
+
+  const loadErrors = () => {
+    api
+      .errorsRecent(selectedService || undefined)
+      .then((d) => {
+        setErrors(d.errors);
+        setQuery(d.query);
+      })
+      .catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    loadErrors();
+    const id = setInterval(loadErrors, 15000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedService]);
+
+  useEffect(() => {
+    const es = new EventSource("/api/logs/tail");
+    es.onmessage = (evt) => {
+      try {
+        const parsed = JSON.parse(evt.data);
+        if (parsed.error) {
+          setTailErr(parsed.error);
+          return;
+        }
+        setTailErr(null);
+        setTailLines((prev) => [...prev.slice(-199), parsed]);
+      } catch {
+        /* ignore malformed frame */
+      }
+    };
+    es.onerror = () => setTailErr("Log tail stream disconnected (will auto-retry).");
+    return () => es.close();
+  }, []);
+
+  return (
+    <section>
+      <h1>Errors &amp; Log Tail</h1>
+      {err && <ErrorBanner message={err} />}
+
+      <div className="card">
+        <div className="card-header-row">
+          <h2>Recent Errors ({errors.length})</h2>
+          <select
+            className="form-input form-input-small"
+            value={selectedService}
+            onChange={(e) => setSelectedService(e.target.value)}
+          >
+            <option value="">All services</option>
+            {services.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        </div>
+        <p className="hint">Loki query: <code>{query}</code></p>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Container</th>
+              <th>Log line</th>
+            </tr>
+          </thead>
+          <tbody>
+            {errors.map((e, i) => (
+              <tr key={i} className="row-crisis">
+                <td>{new Date(e.timestamp).toLocaleString()}</td>
+                <td>{e.container}</td>
+                <td style={{ fontFamily: "monospace", fontSize: "0.8rem" }}>{e.line}</td>
+              </tr>
+            ))}
+            {errors.length === 0 && (
+              <tr>
+                <td colSpan={3}>No ERROR-level log lines found for this filter.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <h2>Live Log Tail — Traefik + Technitium (DNS)</h2>
+        {tailErr && <ErrorBanner message={tailErr} />}
+        <div className="log-tail">
+          {tailLines.map((l, i) => (
+            <div key={i} className="log-tail-line">
+              <span className="log-tail-ts">{new Date(l.timestamp).toLocaleTimeString()}</span>{" "}
+              <span className="log-tail-container">[{l.container}]</span> {l.line}
+            </div>
+          ))}
+          {tailLines.length === 0 && <p className="hint">Waiting for log activity...</p>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 37: Deep Links panel (2026-08-01 sign-off, amended — no iframe
+// embedding, direct links only). Each appliance's real Traefik-routed
+// hostname + the Principal's actual username/password, read from .env via
+// the BFF's /api/deep-links — displayed in plain text next to the link.
+// Gated by the SAME dashboard-wide HTTP Basic Auth as every other tab
+// (2026-08-01 sign-off explicitly accepts this trade-off — see
+// PLAN_PHASES_33_38_DASHBOARD.md §4 item 7).
+// ---------------------------------------------------------------------------
+function DeepLinksTab() {
+  const [links, setLinks] = useState<DeepLink[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [revealed, setRevealed] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    api.deepLinks().then((d) => setLinks(d.links)).catch((e) => setErr(String(e)));
+  }, []);
+
+  const toggleReveal = (name: string) => {
+    setRevealed((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  return (
+    <section>
+      <h1>Deep Links</h1>
+      {err && <ErrorBanner message={err} />}
+      <div className="card">
+        <p className="hint">
+          Direct links to each appliance's own login page, with the Principal's real credentials
+          shown next to it — no iframe embedding (2026-08-01 sign-off: most appliances block
+          framing by default, and embedding wouldn't remove each app's own separate login anyway).
+          This panel is gated by the same dashboard-wide Basic Auth as everything else.
+        </p>
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Appliance</th>
+              <th>Link</th>
+              <th>Username</th>
+              <th>Password</th>
+            </tr>
+          </thead>
+          <tbody>
+            {links?.map((l) => (
+              <tr key={l.name}>
+                <td>{l.name}</td>
+                <td>
+                  <a className="action-btn action-btn-link" href={l.url} target="_blank" rel="noreferrer">
+                    Open {l.name}
+                  </a>
+                </td>
+                <td style={{ fontFamily: "monospace" }}>{l.username || "—"}</td>
+                <td style={{ fontFamily: "monospace" }}>
+                  {revealed.has(l.name) ? l.password || "(not set in .env)" : "••••••••"}{" "}
+                  <button className="action-btn" style={{ marginTop: 0, padding: "2px 8px" }} onClick={() => toggleReveal(l.name)}>
+                    {revealed.has(l.name) ? "Hide" : "Show"}
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </section>
   );

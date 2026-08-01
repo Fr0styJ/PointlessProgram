@@ -13,6 +13,7 @@ DASHBOARD_AUTH_USER / DASHBOARD_AUTH_PASSWORD (no default — required to be set
 matching this repo's existing convention for other required secrets, e.g.
 LITELLM_MASTER_KEY's `:?` compose syntax).
 """
+import asyncio
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ import httpx
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi import Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -107,6 +108,96 @@ AKAUNTING_DB_PASSWORD = os.environ.get("AKAUNTING_DB_PASSWORD", "")
 
 DASHBOARD_AUTH_USER = os.environ.get("DASHBOARD_AUTH_USER")
 DASHBOARD_AUTH_PASSWORD = os.environ.get("DASHBOARD_AUTH_PASSWORD")
+
+# Phase 37: TV wall (chat/ticket feeds), Errors panel + log tail (Loki proxy),
+# Deep Links panel.
+LOKI_URL = os.environ.get("LOKI_URL", "http://loki:3100")
+MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://mattermost:8065")
+MATTERMOST_ADMIN_TOKEN = os.environ.get("MATTERMOST_ADMIN_TOKEN", "")
+MATTERMOST_TEAM_ID = os.environ.get("MATTERMOST_TEAM_ID", "")
+ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad-nginx:8080")
+ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
+
+# Every custom service container the Errors panel covers (spec §25's
+# Errors-panel line, verbatim list).
+ERROR_PANEL_SERVICES = [
+    "fakeco-accounting-engine", "fakeco-meeting-simulator", "fakeco-human-bridge",
+    "fakeco-orchestrator", "fakeco-external-world", "fakeco-kpi-engine",
+    "fakeco-branding-manager", "fakeco-snapshot-manager", "fakeco-purge-manager",
+]
+
+# Deep Links panel (2026-08-01 sign-off, amended — no iframe embedding, direct
+# links + visible Principal credentials only). Each entry's user/password is
+# read from .env at boot, reusing exactly the same env vars every earlier
+# phase already uses for that appliance's Principal/admin credential — no new
+# secrets minted here. Wiki.js's admin account IS the Principal's own account
+# (WIKIJS_ADMIN_EMAIL == PRINCIPAL_EMAIL, per provisioning/main.py's
+# provision-principal command). Roundcube has no stored password in .env at
+# all — its mailbox password is deterministically derived from
+# MAILSERVER_BOT_SECRET, the exact same derivation
+# provisioning/main.py's MailClient._derive_password() already uses to create
+# the Principal's own mailbox — reproduced here (not a new secret) so the
+# panel can show the real, working password rather than a placeholder.
+PRINCIPAL_EMAIL = os.environ.get("PRINCIPAL_EMAIL", "principal@fakecorp.internal")
+MAILSERVER_BOT_SECRET = os.environ.get("MAILSERVER_BOT_SECRET", "fakeco-bot-mail-secret-change-me")
+
+
+def _derive_mailbox_password(email: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{MAILSERVER_BOT_SECRET}:{email}".encode()).hexdigest()[:24]
+
+
+def _build_deep_links() -> list[dict]:
+    return [
+        {
+            "name": "Mattermost",
+            "url": "http://chat.fakecorp.internal/login",
+            "username": os.environ.get("MATTERMOST_ADMIN_EMAIL") or os.environ.get("MATTERMOST_ADMIN_USER", ""),
+            "password": os.environ.get("MATTERMOST_ADMIN_PASSWORD", ""),
+        },
+        {
+            "name": "Zammad",
+            "url": "http://tickets.fakecorp.internal/#login",
+            "username": os.environ.get("ZAMMAD_ADMIN_EMAIL", ""),
+            "password": os.environ.get("ZAMMAD_ADMIN_PASSWORD", ""),
+        },
+        {
+            "name": "Wiki.js",
+            "url": "http://wiki.fakecorp.internal/login",
+            "username": os.environ.get("WIKIJS_ADMIN_EMAIL", PRINCIPAL_EMAIL),
+            "password": os.environ.get("WIKIJS_ADMIN_PASSWORD", ""),
+        },
+        {
+            "name": "Nextcloud",
+            "url": "http://portal.fakecorp.internal/login",
+            "username": os.environ.get("NEXTCLOUD_ADMIN_USER", "admin"),
+            "password": os.environ.get("NEXTCLOUD_ADMIN_PASSWORD", ""),
+        },
+        {
+            "name": "WordPress",
+            "url": "http://www.fakecorp.internal/wp-login.php",
+            "username": os.environ.get("WORDPRESS_ADMIN_USER", ""),
+            "password": os.environ.get("WORDPRESS_ADMIN_PASSWORD", ""),
+        },
+        {
+            "name": "Akaunting",
+            "url": "http://accounting.fakecorp.internal/auth/login",
+            "username": os.environ.get("AKAUNTING_ADMIN_EMAIL", ""),
+            "password": os.environ.get("AKAUNTING_ADMIN_PASSWORD", ""),
+        },
+        {
+            "name": "Roundcube",
+            "url": "http://mail.fakecorp.internal",
+            "username": PRINCIPAL_EMAIL,
+            "password": _derive_mailbox_password(PRINCIPAL_EMAIL),
+        },
+        {
+            "name": "Grafana",
+            "url": "http://grafana.fakecorp.internal:3000/login",
+            "username": os.environ.get("GRAFANA_ADMIN_USER", "admin"),
+            "password": os.environ.get("GRAFANA_ADMIN_PASSWORD", ""),
+        },
+    ]
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -1247,6 +1338,196 @@ async def settings_full_purge(body: FullPurgeBody, _user: str = Depends(require_
         return r.json()
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"purge-manager unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: TV wall — live chat/ticket feeds
+#
+# Reuses the exact same Mattermost/Zammad admin-token read pattern already
+# proven in human-bridge/main.py's _poll_mattermost_once / _poll_zammad_once
+# (team channels -> per-channel recent posts; ticket list -> per-ticket
+# articles) rather than re-deriving a new approach. This is read-only and has
+# no cursor/state (unlike human-bridge's polling, which tracks "already
+# reacted to" state) — the TV wall just wants "what's recent right now".
+# ---------------------------------------------------------------------------
+@app.get("/api/tv/chat-feed")
+async def tv_chat_feed(_user: str = Depends(require_basic_auth)):
+    if not MATTERMOST_ADMIN_TOKEN:
+        raise HTTPException(status_code=502, detail="MATTERMOST_ADMIN_TOKEN not configured")
+    headers = {"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"}
+    team_id = MATTERMOST_TEAM_ID
+    try:
+        if not team_id:
+            tr = await _http.get(f"{MATTERMOST_URL}/api/v4/teams", headers=headers, timeout=10.0)
+            tr.raise_for_status()
+            teams = tr.json()
+            if not teams:
+                return {"posts": []}
+            team_id = teams[0]["id"]
+
+        cr = await _http.get(f"{MATTERMOST_URL}/api/v4/teams/{team_id}/channels", headers=headers, timeout=10.0)
+        cr.raise_for_status()
+        channels = {c["id"]: c["display_name"] for c in cr.json()}
+
+        posts: list[dict] = []
+        user_cache: dict[str, str] = {}
+        for channel_id, channel_name in channels.items():
+            pr = await _http.get(
+                f"{MATTERMOST_URL}/api/v4/channels/{channel_id}/posts",
+                headers=headers, params={"page": 0, "per_page": 5}, timeout=10.0,
+            )
+            if pr.status_code != 200:
+                continue
+            posts_data = pr.json().get("posts", {})
+            for post_id, post in posts_data.items():
+                user_id = post.get("user_id", "")
+                if user_id not in user_cache:
+                    ur = await _http.get(f"{MATTERMOST_URL}/api/v4/users/{user_id}", headers=headers, timeout=10.0)
+                    user_cache[user_id] = ur.json().get("username", user_id) if ur.status_code == 200 else user_id
+                posts.append({
+                    "id": post_id,
+                    "channel": channel_name,
+                    "username": user_cache[user_id],
+                    "message": (post.get("message") or "")[:280],
+                    "create_at": post.get("create_at"),
+                })
+        posts.sort(key=lambda p: p["create_at"] or 0, reverse=True)
+        return {"posts": posts[:20]}
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"mattermost unreachable: {exc}")
+
+
+@app.get("/api/tv/ticket-feed")
+async def tv_ticket_feed(_user: str = Depends(require_basic_auth)):
+    if not ZAMMAD_ADMIN_TOKEN:
+        raise HTTPException(status_code=502, detail="ZAMMAD_ADMIN_TOKEN not configured")
+    headers = {"Authorization": f"Token token={ZAMMAD_ADMIN_TOKEN}"}
+    try:
+        r = await _http.get(f"{ZAMMAD_URL}/api/v1/tickets", headers=headers, timeout=15.0)
+        r.raise_for_status()
+        tickets = r.json()
+        tickets.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+        return {
+            "tickets": [
+                {
+                    "id": t.get("id"),
+                    "number": t.get("number"),
+                    "title": t.get("title"),
+                    "state_id": t.get("state_id"),
+                    "created_at": t.get("created_at"),
+                }
+                for t in tickets[:20]
+            ]
+        }
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"zammad unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: Errors panel — Loki query proxy
+#
+# No dedicated exceptions table/endpoint exists anywhere (per the plan's own
+# framing) — Loki already aggregates every fakeco-* container's stdout
+# (Phase 11) with `level` promoted to a real stream label by promtail's own
+# pipeline_stages (see monitoring/promtail-config.yaml), so `{level="ERROR"}`
+# is a real, cheap label-matched query, not a full-text scan.
+# ---------------------------------------------------------------------------
+@app.get("/api/errors/services")
+async def errors_services(_user: str = Depends(require_basic_auth)):
+    return {"services": ERROR_PANEL_SERVICES}
+
+
+@app.get("/api/errors/recent")
+async def errors_recent(
+    service: Optional[str] = None,
+    limit: int = 200,
+    _user: str = Depends(require_basic_auth),
+):
+    if service and service not in ERROR_PANEL_SERVICES:
+        raise HTTPException(status_code=400, detail=f"unknown service '{service}'")
+    container_match = service if service else "|".join(ERROR_PANEL_SERVICES)
+    query = f'{{container=~"{container_match}", level="ERROR"}}'
+    try:
+        r = await _http.get(
+            f"{LOKI_URL}/loki/api/v1/query_range",
+            params={"query": query, "limit": limit, "direction": "backward"},
+            timeout=15.0,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"loki unreachable: {exc}")
+
+    rows = []
+    for stream in data.get("data", {}).get("result", []):
+        container = stream.get("stream", {}).get("container", "unknown")
+        for ts_ns, line in stream.get("values", []):
+            rows.append({
+                "container": container,
+                "timestamp": datetime.fromtimestamp(int(ts_ns) / 1e9, tz=timezone.utc).isoformat(),
+                "line": line,
+            })
+    rows.sort(key=lambda r: r["timestamp"], reverse=True)
+    return {"errors": rows[:limit], "query": query}
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: Deep Links panel (2026-08-01 sign-off, amended — no iframe, direct
+# links + visible Principal credentials only). See _build_deep_links() above
+# for the credential-sourcing rationale per appliance.
+# ---------------------------------------------------------------------------
+@app.get("/api/deep-links")
+async def deep_links(_user: str = Depends(require_basic_auth)):
+    return {"links": _build_deep_links()}
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: Log tail — live SSE stream of Traefik + Technitium logs via Loki.
+# Reuses the EXACT LogQL query from Phase 31's traffic-and-activity.json
+# panel #5 ("Live Traefik + Technitium Log Tail"), verbatim, not re-derived.
+# ---------------------------------------------------------------------------
+LOG_TAIL_QUERY = '{container=~"fakeco-traefik|fakeco-dns"}'
+
+
+@app.get("/api/logs/tail")
+async def logs_tail(_user: str = Depends(require_basic_auth)):
+    async def event_stream():
+        last_ns = int(datetime.now(timezone.utc).timestamp() * 1e9) - 30_000_000_000  # start 30s back
+        while True:
+            try:
+                r = await _http.get(
+                    f"{LOKI_URL}/loki/api/v1/query_range",
+                    params={
+                        "query": LOG_TAIL_QUERY,
+                        "start": last_ns,
+                        "limit": 200,
+                        "direction": "forward",
+                    },
+                    timeout=15.0,
+                )
+                r.raise_for_status()
+                data = r.json()
+                lines = []
+                for stream in data.get("data", {}).get("result", []):
+                    container = stream.get("stream", {}).get("container", "unknown")
+                    for ts_ns, line in stream.get("values", []):
+                        ts_ns_int = int(ts_ns)
+                        if ts_ns_int <= last_ns:
+                            continue
+                        lines.append({
+                            "container": container,
+                            "timestamp": datetime.fromtimestamp(ts_ns_int / 1e9, tz=timezone.utc).isoformat(),
+                            "line": line,
+                        })
+                        last_ns = max(last_ns, ts_ns_int)
+                lines.sort(key=lambda l: l["timestamp"])
+                for line in lines:
+                    yield f"data: {json.dumps(line)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            await asyncio.sleep(3)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------------------

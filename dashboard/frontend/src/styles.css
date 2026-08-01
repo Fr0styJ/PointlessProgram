@@ -352,6 +352,135 @@ h1 {
   letter-spacing: 0.02em;
 }
 
+/* Phase 37: Errors & Log Tail tab's live tail box */
+.log-tail {
+  background: #0f1115;
+  border: 1px solid #2a2e37;
+  border-radius: 8px;
+  padding: 10px;
+  height: 320px;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 0.78rem;
+  margin-top: 8px;
+}
+
+.log-tail-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding: 2px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.log-tail-ts {
+  color: #8a90a0;
+}
+
+.log-tail-container {
+  color: #66c0ff;
+}
+
+/* Phase 37: /tv spectator wall — deliberately NO nav chrome, full-bleed,
+   high-contrast for across-the-room readability. */
+.tv-wall {
+  min-height: 100vh;
+  background: #05070a;
+  color: #f0f2f5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px;
+  font-size: 1.15rem;
+}
+
+.tv-dots {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+}
+
+.tv-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #2a2e37;
+}
+
+.tv-dot-active {
+  background: #2f6fed;
+}
+
+.tv-error {
+  position: fixed;
+  bottom: 16px;
+  color: #ff9d95;
+}
+
+.tv-panel {
+  width: 100%;
+  max-width: 1100px;
+  text-align: left;
+}
+
+.tv-panel h1 {
+  font-size: 2.4rem;
+  margin-bottom: 24px;
+  text-align: center;
+}
+
+.tv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.tv-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-bottom: 1px solid #232733;
+  padding-bottom: 10px;
+}
+
+.tv-row-meta {
+  color: #8a90a0;
+  font-size: 0.9rem;
+}
+
+.tv-row-body {
+  font-size: 1.2rem;
+}
+
+.tv-stat-row {
+  display: flex;
+  justify-content: center;
+  gap: 60px;
+  margin-top: 24px;
+}
+
+.tv-stat {
+  text-align: center;
+}
+
+.tv-stat-label {
+  color: #8a90a0;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.9rem;
+}
+
+.tv-stat-value {
+  font-size: 2.4rem;
+  font-weight: 700;
+  margin-top: 6px;
+}
+
 .toast {
   background: rgba(47, 111, 237, 0.2);
   border: 1px solid #2f6fed;
