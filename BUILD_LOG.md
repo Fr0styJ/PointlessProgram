@@ -49,6 +49,63 @@
 
 ---
 
+### 2026-08-01T04:53 — Fixed: Roundcube gateway timeout (missing `roundcube` Postgres database)
+
+Root cause: `docker logs fakeco-roundcube` showed `database "roundcube" does not exist` — the
+`roundcube` database on the shared `fakeco-postgres` instance was never created, so every request
+gateway-timed out.
+
+Fix (live environment only, no tracked files changed):
+- Created the database live: `CREATE DATABASE roundcube OWNER fakeco;` on `fakeco-postgres`,
+  matching the `ROUNDCUBEMAIL_DB_NAME`/`ROUNDCUBEMAIL_DB_USER` env vars in the `roundcube` service
+  block of `docker-compose.yml`.
+- The container's own auto-migration on restart tried to run its *incremental* update path against
+  the fresh empty DB and failed (`relation "user_ids" does not exist`, from
+  `2013042700` update step) — a bug in that entrypoint's empty-DB detection. Worked around by
+  dropping the DB, recreating it, and loading `/var/www/html/SQL/postgres.initial.sql` directly via
+  `docker exec -i fakeco-postgres psql -U fakeco -d roundcube < postgres.initial.sql` (extracted from
+  the roundcube container's own image, no internet fetch involved). That script creates the full
+  schema and stamps `system.roundcube-version = 2025092300` in one shot.
+- Restarted `fakeco-roundcube`; logs now show a clean boot with no DB errors.
+
+Verified: `GET /` via `Host: mail.fakecorp.internal` routed to `roundcube:80` returns `200` and the
+response body contains the login form (confirmed by string-matching "login" in the HTML, len 5400
+bytes). No tracked files touched — this was pure live DB/container state.
+
+---
+
+### 2026-08-01T04:52 — Fixed: Zammad "prompts for login then does nothing" (websocket rejected browser's origin, fqdn mismatch)
+
+Confirmed the prior diagnostic pass's finding that raw HTTP signin (`POST /api/v1/signin` with CSRF
+token + fingerprint) works and returns `201` — so the break is specifically in what only a real
+browser session triggers next: the ActionCable/websocket handshake used to finish initializing the
+SPA shell after login.
+
+Root cause found via `rails runner` against `fakeco-zammad-railsserver`: Zammad's `fqdn` Setting was
+still `zammad.example.com` (an install-time default), while `http_type` was correctly `http`. Because
+`fqdn` feeds ActionCable's allowed-origin check, the websocket server logged
+`ActionCable is configured to accept requests from ...http://zammad.example.com` — it would reject
+(silently, no visible error) any real-browser websocket connection whose `Origin` header was
+`http://tickets.fakecorp.internal` (the actual routed hostname), leaving the SPA stuck after a
+technically-successful login. `zammad-nginx`'s own `location /ws` block was checked and is correctly
+configured (`proxy_pass http://zammad-websocket:6042` with upgrade headers) — not the problem.
+
+Fix: `Setting.set('fqdn', 'tickets.fakecorp.internal')` via `rails runner` against
+`fakeco-zammad-railsserver` (same live-environment technique as the earlier admin-password fix), then
+restarted `fakeco-zammad-websocket` to pick it up. Also confirmed `system_online_service` is `false`
+(update-checking is already disabled, so it isn't a separate hang source) — no internet access was
+added anywhere.
+
+Verified: post-fix `fakeco-zammad-websocket` logs now read
+`ActionCable is configured to accept requests from ...http://tickets.fakecorp.internal`. Re-ran the
+same cookie-jar+CSRF Python technique end-to-end and signin still returns `201` after the restart.
+**Limitation**: could not drive an actual browser through the full login+websocket handshake to see
+the app shell render — confidence is high (the allowed-origin log line now matches the real routed
+hostname exactly, which is the documented ActionCable rejection mechanism) but this is config/log
+verification, not a rendered-browser confirmation.
+
+---
+
 ### 2026-08-01T04:30 — Fixed: Zammad/WordPress `.env` credential gap closed; both admin accounts now real, working, and populated in `.env`
 
 Root-caused the two blank Deep Links rows from the 04:00 entry by checking each appliance's actual
