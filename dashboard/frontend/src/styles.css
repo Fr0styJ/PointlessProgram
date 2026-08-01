@@ -338,6 +338,20 @@ h1 {
   margin-top: 16px;
 }
 
+/* Phase 36: Settings tab's "nuclear launch" full-purge danger zone —
+   deliberately isolated and unmistakably alarming, per the 2026-08-01
+   sign-off ("scary and clear what it does"). */
+.danger-zone {
+  border: 2px solid #ff2b2b;
+  background: radial-gradient(circle at top left, rgba(255, 43, 43, 0.12), rgba(23, 26, 33, 1) 70%);
+  box-shadow: 0 0 24px rgba(255, 43, 43, 0.25);
+}
+
+.danger-zone-title {
+  color: #ff5c5c;
+  letter-spacing: 0.02em;
+}
+
 .toast {
   background: rgba(47, 111, 237, 0.2);
   border: 1px solid #2f6fed;

@@ -4,8 +4,12 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import {
   api,
   AccountingSummary,
+  BrandingAssets,
+  ChaosOutages,
+  ChaosStatus,
   CompanyDirectiveCurrent,
   CompanyDirectiveHistory,
+  DataManagementScope,
   EmployeeRosterRow,
   ExternalWorldCustomers,
   ExternalWorldNews,
@@ -13,6 +17,7 @@ import {
   KpiDepartmentScoreboard,
   KpiEmployeeScoreboard,
   KpiReviewLog,
+  LastSnapshotInfo,
   LlmSpend,
   LlmStatus,
   NarrativeSummary,
@@ -20,6 +25,8 @@ import {
   PayrollHistory,
   RevenueByCustomer,
   SimulationStatus,
+  SnapshotList,
+  SnapshotManifest,
 } from "./api";
 
 // Phase 33 dashboard shell. Nav is a plain array of {key,label} entries so
@@ -35,8 +42,11 @@ const NAV_ITEMS = [
   { key: "external-world", label: "External World" },
   { key: "kpi", label: "KPI / Performance" },
   { key: "company-direction", label: "Company Direction" },
+  { key: "chaos", label: "Chaos" },
+  { key: "data-management", label: "Data Management" },
+  { key: "branding", label: "Branding" },
   { key: "settings", label: "Settings" },
-  // Future phases plug in here: Chaos, Data Management, Branding, TV...
+  // Future phase plugs in here: TV...
 ] as const;
 
 type TabKey = (typeof NAV_ITEMS)[number]["key"];
@@ -70,6 +80,9 @@ export default function App() {
         {tab === "external-world" && <ExternalWorldTab />}
         {tab === "kpi" && <KpiTab />}
         {tab === "company-direction" && <CompanyDirectionTab />}
+        {tab === "chaos" && <ChaosTab />}
+        {tab === "data-management" && <DataManagementTab />}
+        {tab === "branding" && <BrandingTab />}
         {tab === "settings" && <SettingsTab />}
       </main>
     </div>
@@ -1390,16 +1403,864 @@ function CompanyDirectionTab() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Phase 36: Chaos tab
+// ---------------------------------------------------------------------------
+const CRISIS_SCENARIOS = [
+  { value: "data_breach", label: "Data Breach" },
+  { value: "surprise_audit", label: "Surprise Audit" },
+  { value: "viral_complaint", label: "Viral Public Complaint" },
+  { value: "custom", label: "Custom..." },
+];
+
+function ChaosTab() {
+  const [status, setStatus] = useState<ChaosStatus | null>(null);
+  const [outages, setOutages] = useState<ChaosOutages | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busyName, setBusyName] = useState<string | null>(null);
+  const [stopTarget, setStopTarget] = useState<string | null>(null);
+  const [scenario, setScenario] = useState("data_breach");
+  const [customText, setCustomText] = useState("");
+  const [triggering, setTriggering] = useState(false);
+  const [triggerResult, setTriggerResult] = useState<any>(null);
+
+  const load = () => {
+    api.chaosStatus().then(setStatus).catch((e) => setErr(String(e)));
+    api.chaosOutages().then(setOutages).catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  const doAction = async (name: string, action: "stop" | "start" | "restart") => {
+    setBusyName(name);
+    try {
+      await api.chaosApplianceAction(name, action);
+      setStopTarget(null);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusyName(null);
+    }
+  };
+
+  const doTrigger = async () => {
+    setTriggering(true);
+    setErr(null);
+    try {
+      const result = await api.chaosTriggerEvent({
+        scenario,
+        custom_text: scenario === "custom" ? customText : undefined,
+      });
+      setTriggerResult(result);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setTriggering(false);
+    }
+  };
+
+  return (
+    <section>
+      <h1>Chaos</h1>
+      {err && <ErrorBanner message={err} />}
+
+      <div className="card">
+        <h2>Appliance Status</h2>
+        {status && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Container</th>
+                <th>State</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {status.containers.map((c) => (
+                <tr key={c.name} className={c.state !== "running" ? "row-crisis" : ""}>
+                  <td>{c.name}</td>
+                  <td>
+                    <span className={`badge badge-status-${c.state === "running" ? "active" : "terminated"}`}>
+                      {c.state}
+                    </span>
+                  </td>
+                  <td>{c.status}</td>
+                  <td>
+                    <button
+                      className="danger-btn-small"
+                      disabled={busyName === c.name || c.state !== "running"}
+                      onClick={() => setStopTarget(c.name)}
+                    >
+                      Stop
+                    </button>{" "}
+                    <button
+                      className="action-btn"
+                      disabled={busyName === c.name}
+                      onClick={() => doAction(c.name, "start")}
+                    >
+                      Start
+                    </button>{" "}
+                    <button
+                      className="action-btn"
+                      disabled={busyName === c.name}
+                      onClick={() => doAction(c.name, "restart")}
+                    >
+                      Restart
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Trigger Event</h2>
+        <p className="hint">
+          Opens a crisis narrative thread, convenes a crisis_response meeting with forced
+          attendees, and (for scenarios with a real cost) submits a normal expense request through
+          the usual approval flow.
+        </p>
+        <select
+          className="form-input form-input-small"
+          value={scenario}
+          onChange={(e) => setScenario(e.target.value)}
+        >
+          {CRISIS_SCENARIOS.map((s) => (
+            <option key={s.value} value={s.value}>
+              {s.label}
+            </option>
+          ))}
+        </select>
+        {scenario === "custom" && (
+          <input
+            className="form-input"
+            style={{ marginTop: 8 }}
+            placeholder="Describe the custom crisis scenario..."
+            value={customText}
+            onChange={(e) => setCustomText(e.target.value)}
+          />
+        )}
+        <button
+          className="action-btn"
+          disabled={triggering || (scenario === "custom" && !customText.trim())}
+          onClick={doTrigger}
+        >
+          {triggering ? "Triggering..." : "Trigger Event"}
+        </button>
+
+        {triggerResult && (
+          <div style={{ marginTop: 12 }}>
+            <p className="hint">
+              Crisis thread #{triggerResult.thread_id} opened, forced attendees:{" "}
+              {triggerResult.forced_attendee_ids?.join(", ") || "none"}
+            </p>
+            {triggerResult.audit_result && (
+              <p className="hint">Audit result: {JSON.stringify(triggerResult.audit_result)}</p>
+            )}
+            {triggerResult.meeting_result && (
+              <p className="hint">Meeting: {JSON.stringify(triggerResult.meeting_result).slice(0, 300)}</p>
+            )}
+            {triggerResult.expense_result && (
+              <p className="hint">Expense: {JSON.stringify(triggerResult.expense_result).slice(0, 300)}</p>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="card">
+        <h2>Outage Log ({outages?.outages.length ?? 0})</h2>
+        {outages && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Summary</th>
+              </tr>
+            </thead>
+            <tbody>
+              {outages.outages.map((o) => (
+                <tr key={o.id}>
+                  <td>{new Date(o.created_at).toLocaleString()}</td>
+                  <td>{o.short_summary}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {stopTarget && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Stop {stopTarget}?</h3>
+            <p>This container will go down immediately — reversible via Start, but disruptive while down.</p>
+            <div className="modal-actions">
+              <button className="action-btn" onClick={() => setStopTarget(null)}>
+                Cancel
+              </button>
+              <button className="danger-btn" onClick={() => doAction(stopTarget, "stop")} disabled={busyName === stopTarget}>
+                {busyName === stopTarget ? "Stopping..." : "Confirm Stop"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 36: Data Management tab — SCOPED purge + snapshots ONLY. Full purge
+// is deliberately NOT here — see the Settings tab below.
+// ---------------------------------------------------------------------------
+function DataManagementTab() {
+  const [scopes, setScopes] = useState<DataManagementScope[] | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [snapshots, setSnapshots] = useState<SnapshotList | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [purgeModalOpen, setPurgeModalOpen] = useState(false);
+  const [purgeConfirmText, setPurgeConfirmText] = useState("");
+  const [restoreTarget, setRestoreTarget] = useState<SnapshotManifest | null>(null);
+  const [restoreConfirmText, setRestoreConfirmText] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<SnapshotManifest | null>(null);
+
+  const load = () => {
+    api.dataManagementScopes().then((d) => setScopes(d.scopes)).catch((e) => setErr(String(e)));
+    api.dataManagementSnapshots().then(setSnapshots).catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const toggleScope = (scope: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(scope)) next.delete(scope);
+      else next.add(scope);
+      return next;
+    });
+  };
+
+  // Multiple scopes selected -> multiple distinct required phrases; the gate
+  // requires typing them all, joined, so there's no ambiguity about which
+  // scope(s) are about to be wiped.
+  const requiredPhrase = useMemo(() => {
+    if (!scopes) return "";
+    return scopes
+      .filter((s) => selected.has(s.scope))
+      .map((s) => s.confirm_phrase)
+      .join(" + ");
+  }, [scopes, selected]);
+
+  const doPurgeSelected = async () => {
+    if (!scopes || purgeConfirmText !== requiredPhrase) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      for (const s of scopes.filter((s) => selected.has(s.scope))) {
+        await api.dataManagementPurgeScope(s.scope, s.confirm_phrase);
+      }
+      setMsg(`Purged: ${Array.from(selected).join(", ")}`);
+      setSelected(new Set());
+      setPurgeModalOpen(false);
+      setPurgeConfirmText("");
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doSaveSnapshot = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const r = await api.dataManagementSnapshotSave();
+      setMsg(`Snapshot saved: ${r.snapshot_name}`);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doRestore = async () => {
+    if (!restoreTarget || restoreConfirmText !== "RESTORE SNAPSHOT") return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.dataManagementSnapshotRestore(restoreTarget.snapshot_name, "RESTORE SNAPSHOT");
+      setMsg(`Restored from ${restoreTarget.snapshot_name}`);
+      setRestoreTarget(null);
+      setRestoreConfirmText("");
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doDelete = async () => {
+    if (!deleteTarget) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.dataManagementSnapshotDelete(deleteTarget.snapshot_name);
+      setMsg(`Deleted snapshot ${deleteTarget.snapshot_name}`);
+      setDeleteTarget(null);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const fmtBytes = (n: number) => {
+    if (n > 1e9) return `${(n / 1e9).toFixed(2)} GB`;
+    if (n > 1e6) return `${(n / 1e6).toFixed(2)} MB`;
+    if (n > 1e3) return `${(n / 1e3).toFixed(1)} KB`;
+    return `${n} B`;
+  };
+
+  return (
+    <section>
+      <h1>Data Management</h1>
+      {err && <ErrorBanner message={err} />}
+      {msg && <div className="toast">{msg}</div>}
+
+      <div className="card">
+        <h2>Scoped Purge</h2>
+        <p className="hint">
+          Full data purge does NOT live here — see the Settings tab's dedicated, extra-hardened
+          "nuclear launch" control.
+        </p>
+        {scopes && (
+          <>
+            {scopes.map((s) => (
+              <label key={s.scope} className="form-label" style={{ display: "inline-block", width: "45%" }}>
+                <input
+                  type="checkbox"
+                  checked={selected.has(s.scope)}
+                  onChange={() => toggleScope(s.scope)}
+                />{" "}
+                {s.label}
+              </label>
+            ))}
+            <div>
+              <button
+                className="danger-btn"
+                disabled={selected.size === 0}
+                onClick={() => setPurgeModalOpen(true)}
+              >
+                Purge Selected ({selected.size})
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-header-row">
+          <h2>Snapshots ({snapshots?.snapshots.length ?? 0})</h2>
+          <button className="action-btn" disabled={busy} onClick={doSaveSnapshot}>
+            {busy ? "Working..." : "Save Snapshot Now"}
+          </button>
+        </div>
+        {snapshots && (
+          <table className="table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Sim time</th>
+                <th>Captured</th>
+                <th>Size</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...snapshots.snapshots].reverse().map((s) => (
+                <tr key={s.snapshot_name}>
+                  <td>{s.snapshot_name}</td>
+                  <td>{String((s.sim_state as any)?.sim_time ?? "—")}</td>
+                  <td>{new Date(s.wall_clock_captured_at).toLocaleString()}</td>
+                  <td>{fmtBytes(s.total_size_bytes ?? 0)}</td>
+                  <td>
+                    <button className="action-btn" onClick={() => setRestoreTarget(s)}>
+                      Restore
+                    </button>{" "}
+                    <button className="danger-btn-small" onClick={() => setDeleteTarget(s)}>
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {purgeModalOpen && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Purge selected scopes?</h3>
+            <p>
+              This will destroy: <strong>{Array.from(selected).join(", ")}</strong>. A pre-purge
+              snapshot is taken automatically before anything is deleted.
+            </p>
+            <p>
+              Type <code>{requiredPhrase}</code> to confirm:
+            </p>
+            <input
+              className="form-input"
+              value={purgeConfirmText}
+              onChange={(e) => setPurgeConfirmText(e.target.value)}
+            />
+            <div className="modal-actions">
+              <button className="action-btn" onClick={() => setPurgeModalOpen(false)} disabled={busy}>
+                Cancel
+              </button>
+              <button
+                className="danger-btn"
+                disabled={busy || purgeConfirmText !== requiredPhrase}
+                onClick={doPurgeSelected}
+              >
+                {busy ? "Purging..." : "Confirm Purge"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {restoreTarget && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Restore {restoreTarget.snapshot_name}?</h3>
+            <p>
+              This discards everything since this snapshot was taken, across every appliance.
+              Type <code>RESTORE SNAPSHOT</code> to confirm:
+            </p>
+            <input
+              className="form-input"
+              value={restoreConfirmText}
+              onChange={(e) => setRestoreConfirmText(e.target.value)}
+            />
+            <div className="modal-actions">
+              <button
+                className="action-btn"
+                onClick={() => {
+                  setRestoreTarget(null);
+                  setRestoreConfirmText("");
+                }}
+                disabled={busy}
+              >
+                Cancel
+              </button>
+              <button
+                className="danger-btn"
+                disabled={busy || restoreConfirmText !== "RESTORE SNAPSHOT"}
+                onClick={doRestore}
+              >
+                {busy ? "Restoring..." : "Confirm Restore"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Delete snapshot {deleteTarget.snapshot_name}?</h3>
+            <p>This only removes stored backup files — it does not touch any live data.</p>
+            <div className="modal-actions">
+              <button className="action-btn" onClick={() => setDeleteTarget(null)} disabled={busy}>
+                Cancel
+              </button>
+              <button className="danger-btn" onClick={doDelete} disabled={busy}>
+                {busy ? "Deleting..." : "Confirm Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 36: Branding tab
+// ---------------------------------------------------------------------------
+function BrandingTab() {
+  const [assets, setAssets] = useState<BrandingAssets | null>(null);
+  const [roster, setRoster] = useState<EmployeeRosterRow[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [pickerEmployeeId, setPickerEmployeeId] = useState<number | "">("");
+  const [pickerAssetId, setPickerAssetId] = useState<string>("");
+  const [bulkSelected, setBulkSelected] = useState<Set<number>>(new Set());
+  const [bulkMode, setBulkMode] = useState<"randomize" | "apply-one-to-all" | "reset-to-default">("randomize");
+  const [bulkAssetId, setBulkAssetId] = useState("");
+
+  useEffect(() => {
+    api.brandingAssets().then(setAssets).catch((e) => setErr(String(e)));
+    api.hrRoster().then((d) => setRoster(d.employees)).catch((e) => setErr(String(e)));
+  }, []);
+
+  const applyOne = async () => {
+    if (!pickerEmployeeId || !pickerAssetId) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.brandingApply(Number(pickerEmployeeId), pickerAssetId);
+      setMsg(`Avatar applied to employee ${pickerEmployeeId}`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleBulk = (id: number) => {
+    setBulkSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const doBulkApply = async () => {
+    if (bulkSelected.size === 0) return;
+    if (bulkMode === "apply-one-to-all" && !bulkAssetId) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const r: any = await api.brandingBulkApply({
+        employee_ids: Array.from(bulkSelected),
+        mode: bulkMode,
+        asset_id: bulkMode === "apply-one-to-all" ? bulkAssetId : undefined,
+      });
+      setMsg(`Bulk apply (${bulkMode}) completed for ${r.count} employee(s)`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section>
+      <h1>Branding</h1>
+      {err && <ErrorBanner message={err} />}
+      {msg && <div className="toast">{msg}</div>}
+
+      <div className="card">
+        <h2>Asset Library</h2>
+        <h3 style={{ fontSize: "0.9rem", color: "#8a90a0" }}>Avatars ({assets?.avatars.length ?? 0})</h3>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {assets?.avatars.map((a) => (
+            <img
+              key={a}
+              src={`/api/branding/asset-proxy/avatars/${a}.png`}
+              alt={a}
+              title={a}
+              style={{ width: 48, height: 48, borderRadius: 6, background: "#232733" }}
+            />
+          ))}
+        </div>
+        <h3 style={{ fontSize: "0.9rem", color: "#8a90a0", marginTop: 16 }}>
+          Emoji Pack ({assets?.emoji.length ?? 0})
+        </h3>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+          {assets?.emoji.map((e) => (
+            <img
+              key={e}
+              src={`/api/branding/asset-proxy/emoji/${e}.png`}
+              alt={e}
+              title={`:${e}:`}
+              style={{ width: 32, height: 32, borderRadius: 4, background: "#232733" }}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>Per-Employee Avatar Picker</h2>
+        <select
+          className="form-input form-input-small"
+          value={pickerEmployeeId}
+          onChange={(e) => setPickerEmployeeId(e.target.value ? Number(e.target.value) : "")}
+        >
+          <option value="">Select employee...</option>
+          {roster?.map((e) => (
+            <option key={e.id} value={e.id}>
+              {e.name} ({e.department})
+            </option>
+          ))}
+        </select>{" "}
+        <select
+          className="form-input form-input-small"
+          value={pickerAssetId}
+          onChange={(e) => setPickerAssetId(e.target.value)}
+        >
+          <option value="">Select avatar...</option>
+          {assets?.avatars.map((a) => (
+            <option key={a} value={a}>
+              {a}
+            </option>
+          ))}
+        </select>{" "}
+        <button className="action-btn" disabled={busy || !pickerEmployeeId || !pickerAssetId} onClick={applyOne}>
+          {busy ? "Applying..." : "Apply"}
+        </button>
+      </div>
+
+      <div className="card">
+        <h2>Bulk Apply</h2>
+        <div style={{ maxHeight: 200, overflowY: "auto", marginBottom: 8 }}>
+          {roster?.map((e) => (
+            <label key={e.id} className="form-label" style={{ display: "inline-block", width: "45%" }}>
+              <input type="checkbox" checked={bulkSelected.has(e.id)} onChange={() => toggleBulk(e.id)} />{" "}
+              {e.name}
+            </label>
+          ))}
+        </div>
+        <select
+          className="form-input form-input-small"
+          value={bulkMode}
+          onChange={(e) => setBulkMode(e.target.value as any)}
+        >
+          <option value="randomize">Randomize</option>
+          <option value="apply-one-to-all">Apply one to all</option>
+          <option value="reset-to-default">Reset to default</option>
+        </select>{" "}
+        {bulkMode === "apply-one-to-all" && (
+          <select
+            className="form-input form-input-small"
+            value={bulkAssetId}
+            onChange={(e) => setBulkAssetId(e.target.value)}
+          >
+            <option value="">Select avatar...</option>
+            {assets?.avatars.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
+        )}{" "}
+        <button className="action-btn" disabled={busy || bulkSelected.size === 0} onClick={doBulkApply}>
+          {busy ? "Applying..." : `Apply to ${bulkSelected.size} selected`}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Settings tab — Phase 36/38: the "nuclear launch" full-purge control.
+//
+// 2026-08-01 sign-off (PLAN_PHASES_33_38_DASHBOARD.md): the full-purge control
+// is NOT on the Data Management tab — it lives here, alone, visually isolated,
+// styled as unmistakably dangerous, and gated behind FOUR distinct affirmative
+// user actions (one more than the required minimum of 3):
+//   1. "I want to purge all data" button (arms the flow)
+//   2. A modal restating exactly what gets destroyed -> "I understand, continue"
+//   3. A typed-confirmation-phrase step (exact phrase "PURGE EVERYTHING", not
+//      a simple yes/no click)
+//   4. A final "This is irreversible — Execute Full Purge" button
+// Only after step 4 does the BFF's /api/settings/full-purge call ever fire.
+// ---------------------------------------------------------------------------
+type PurgeStep = "idle" | "modal" | "typed" | "final" | "done";
+
 function SettingsTab() {
+  const [lastSnapshot, setLastSnapshot] = useState<LastSnapshotInfo | null>(null);
+  const [step, setStep] = useState<PurgeStep>("idle");
+  const [typedPhrase, setTypedPhrase] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [result, setResult] = useState<any>(null);
+
+  const REQUIRED_PHRASE = "PURGE EVERYTHING";
+
+  const load = () => {
+    api.settingsLastSnapshot().then(setLastSnapshot).catch((e) => setErr(String(e)));
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const reset = () => {
+    setStep("idle");
+    setTypedPhrase("");
+    setErr(null);
+  };
+
+  const executeFullPurge = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const r = await api.settingsFullPurge(REQUIRED_PHRASE);
+      setResult(r);
+      setStep("done");
+      load();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section>
       <h1>Settings</h1>
+
       <div className="card">
-        <p>
-          This is a reserved navigation slot. The full-purge "nuclear launch" control (danger-red,
-          multi-step confirmation) lands here in Phase 36/38 — nothing destructive is wired up yet.
-        </p>
+        <p className="hint">Routine dashboard settings will accumulate here over time.</p>
       </div>
+
+      <div className="card danger-zone">
+        <h2 className="danger-zone-title">☢ Full Data Purge — Danger Zone</h2>
+        <p>
+          This destroys <strong>everything</strong> this simulation has accumulated: all employees
+          and their roster history, every Mattermost message and channel, every Zammad ticket,
+          every Wiki.js page, every meeting/action-item/narrative thread, the entire Akaunting
+          accounting ledger (all transactions and documents), all external-world customer/revenue
+          history, all KPI history, and all Company Direction history. There is no partial
+          full-purge — it is all scopes, at once.
+        </p>
+        <div className="stat-row">
+          <div className="stat">
+            <div className="stat-label">Last snapshot taken</div>
+            <div className="stat-value">
+              {lastSnapshot?.error
+                ? "Unknown (snapshot-manager unreachable)"
+                : lastSnapshot?.last_snapshot
+                ? new Date(lastSnapshot.last_snapshot.wall_clock_captured_at).toLocaleString()
+                : "No snapshot has ever been taken"}
+            </div>
+          </div>
+        </div>
+        <p className="hint">
+          A fresh pre-purge snapshot is taken automatically as part of the purge itself regardless
+          of the above — this is just so you know whether an older safety net exists right now.
+        </p>
+
+        {err && <ErrorBanner message={err} />}
+
+        {step === "idle" && (
+          <button className="danger-btn" onClick={() => setStep("modal")}>
+            I want to purge all data
+          </button>
+        )}
+
+        {step !== "idle" && step !== "done" && (
+          <p className="hint hint-inline">
+            Confirmation step {step === "modal" ? "1" : step === "typed" ? "2" : "3"} of 3 in progress —{" "}
+            <button className="action-btn" onClick={reset} style={{ marginTop: 0 }}>
+              Cancel entirely
+            </button>
+          </p>
+        )}
+
+        {step === "done" && result && (
+          <div className="toast">
+            Full purge completed — status: {result.status}. Pre-purge snapshot:{" "}
+            {result.pre_purge_snapshot}.{" "}
+            <button className="action-btn" onClick={reset} style={{ marginTop: 4 }}>
+              Close
+            </button>
+          </div>
+        )}
+      </div>
+
+      {step === "modal" && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Step 1 of 3: Are you absolutely sure?</h3>
+            <p>
+              You are about to permanently destroy every employee, message, ticket, wiki page,
+              meeting, accounting transaction, and history record this simulation has ever
+              produced. This cannot be undone from within the dashboard — only a snapshot restore
+              (a separate, also-gated action) could bring any of it back.
+            </p>
+            <div className="modal-actions">
+              <button className="action-btn" onClick={reset}>
+                Cancel
+              </button>
+              <button className="danger-btn" onClick={() => setStep("typed")}>
+                I understand, continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {step === "typed" && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Step 2 of 3: Type the confirmation phrase</h3>
+            <p>
+              Type <code>{REQUIRED_PHRASE}</code> exactly, to prove this isn't an accidental click:
+            </p>
+            <input
+              className="form-input"
+              autoFocus
+              value={typedPhrase}
+              onChange={(e) => setTypedPhrase(e.target.value)}
+              placeholder={REQUIRED_PHRASE}
+            />
+            <div className="modal-actions">
+              <button className="action-btn" onClick={reset}>
+                Cancel
+              </button>
+              <button
+                className="danger-btn"
+                disabled={typedPhrase !== REQUIRED_PHRASE}
+                onClick={() => setStep("final")}
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {step === "final" && (
+        <div className="modal-overlay">
+          <div className="modal danger-modal">
+            <h3>Step 3 of 3: This is your last chance</h3>
+            <p>
+              Clicking the button below fires the actual purge immediately. There is no further
+              confirmation after this. Everything described above will be gone.
+            </p>
+            <div className="modal-actions">
+              <button className="action-btn" onClick={reset} disabled={busy}>
+                Cancel — do NOT purge
+              </button>
+              <button className="danger-btn" disabled={busy} onClick={executeFullPurge}>
+                {busy ? "Purging everything..." : "Execute Full Purge"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

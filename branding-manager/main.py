@@ -528,6 +528,23 @@ async def get_avatar_asset(asset_id: str):
     return FileResponse(avatar_path(asset_id), media_type="image/png")
 
 
+def emoji_path(asset_id: str) -> Path:
+    safe = os.path.basename(asset_id)
+    path = EMOJI_DIR / f"{safe}.png"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"unknown emoji asset '{asset_id}'")
+    return path
+
+
+@app.get("/assets/emoji/{asset_id}.png")
+async def get_emoji_asset(asset_id: str):
+    """Phase 36: dashboard Branding tab's asset library browser needs to render
+    the emoji pack grid, not just list names — same guarded-path pattern as
+    the avatar asset route above."""
+    from fastapi.responses import FileResponse
+    return FileResponse(emoji_path(asset_id), media_type="image/png")
+
+
 class ApplyAvatarRequest(BaseModel):
     employee_id: int
     asset_id: str

@@ -339,8 +339,29 @@ async def snapshot_list():
     for d in sorted(SNAPSHOT_ROOT.iterdir()):
         manifest_path = d / "manifest.json"
         if manifest_path.exists():
-            out.append(json.loads(manifest_path.read_text()))
+            manifest = json.loads(manifest_path.read_text())
+            manifest["total_size_bytes"] = sum(
+                a.get("size_bytes", 0) for a in manifest.get("artifacts", {}).values()
+            )
+            out.append(manifest)
     return {"snapshots": out}
+
+
+@app.delete("/snapshot/{snapshot_name}")
+async def snapshot_delete(snapshot_name: str, pool: PoolDep):
+    """Phase 36: Data Management tab's per-snapshot Delete button. Only ever
+    removes the named snapshot's own directory under SNAPSHOT_ROOT — never
+    touches any appliance's live data (this is purely storage cleanup, not a
+    purge). Guards against path traversal by requiring the resolved path stay
+    a direct child of SNAPSHOT_ROOT."""
+    safe_name = os.path.basename(snapshot_name)
+    snap_dir = SNAPSHOT_ROOT / safe_name
+    if not snap_dir.is_dir() or not (snap_dir / "manifest.json").exists():
+        raise HTTPException(status_code=404, detail=f"snapshot {snapshot_name} not found")
+    import shutil
+    shutil.rmtree(snap_dir)
+    await log_op(pool, "snapshot_delete", None, safe_name, "succeeded", {})
+    return {"status": "deleted", "snapshot_name": safe_name}
 
 
 # ---------------------------------------------------------------------------

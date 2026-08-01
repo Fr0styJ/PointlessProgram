@@ -1365,6 +1365,7 @@ services:
       fakeco.managed: "true"
     profiles:
       - phase30
+      - phase36   # Phase 36: dashboard Branding tab proxies this service
 
   # ---------------------------------------------------------------------------
   # PHASE 16: meeting-simulator — all 5 meeting types, LLM heavy tier
@@ -1625,6 +1626,7 @@ services:
     profiles:
       - phase13
       - phase29
+      - phase36   # Phase 36: dashboard Data Management tab's Snapshots section
 
   # ---------------------------------------------------------------------------
   # PHASE 29: purge-manager — scoped + full data purge, gated by mandatory
@@ -1672,6 +1674,7 @@ services:
     profiles:
       - phase13
       - phase29
+      - phase36   # Phase 36: dashboard Data Management tab's scoped purge + Settings full-purge
 
   # ---------------------------------------------------------------------------
   # PHASE 33: dashboard — React/Vite SPA served by a thin FastAPI BFF.
@@ -1726,6 +1729,13 @@ services:
       AKAUNTING_DB_NAME: "akaunting"
       AKAUNTING_DB_USER: "akaunting"
       AKAUNTING_DB_PASSWORD: "${AKAUNTING_DB_PASSWORD}"
+      # Phase 36: Chaos / Data Management / Branding tabs + Settings' full-purge
+      # flow. purge-manager/branding-manager share net_clients with this
+      # container already; snapshot-manager shares net_mgmt — no new networks
+      # needed for this container.
+      PURGE_MANAGER_URL: "http://purge-manager:8000"
+      SNAPSHOT_MANAGER_URL: "http://snapshot-manager:8000"
+      BRANDING_MANAGER_URL: "http://branding-manager:8000"
     volumes:
       - ./litellm/config.yaml:/litellm-config/config.yaml:ro
     networks:
@@ -1749,6 +1759,8 @@ services:
       - phase13
       - phase33
       - phase34   # Phase 34: HR/Payroll/Accounting tabs live in this same service/container
+      - phase35   # Phase 35: External World/KPI/Company Direction tabs, same service/container
+      - phase36   # Phase 36: Chaos/Data Management/Branding tabs + Settings full-purge
 
   # ---------------------------------------------------------------------------
   # PHASES 34+: Custom services — added as their phases execute.

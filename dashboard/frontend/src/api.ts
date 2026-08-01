@@ -322,6 +322,78 @@ export interface CompanyDirectiveHistory {
   history: CompanyDirectiveHistoryEntry[];
 }
 
+// ---------------------------------------------------------------------------
+// Phase 36: Chaos / Data Management / Branding + Settings full-purge types
+// ---------------------------------------------------------------------------
+export interface ChaosContainerStatus {
+  name: string;
+  state: string;
+  status: string;
+}
+
+export interface ChaosStatus {
+  containers: ChaosContainerStatus[];
+}
+
+export interface ChaosOutageEntry {
+  id: number;
+  source_ref: string;
+  short_summary: string;
+  created_at: string;
+}
+
+export interface ChaosOutages {
+  outages: ChaosOutageEntry[];
+}
+
+export interface TriggerEventResult {
+  status: string;
+  scenario: string;
+  thread_id: number;
+  forced_attendee_ids: number[];
+  audit_result: Record<string, unknown> | null;
+  meeting_result: Record<string, unknown> | null;
+  expense_result: Record<string, unknown> | null;
+}
+
+export interface DataManagementScope {
+  scope: string;
+  label: string;
+  confirm_phrase: string;
+}
+
+export interface DataManagementScopes {
+  scopes: DataManagementScope[];
+}
+
+export interface SnapshotManifest {
+  snapshot_name: string;
+  wall_clock_captured_at: string;
+  sim_state: Record<string, unknown>;
+  artifacts: Record<string, { size_bytes: number; sha256: string }>;
+  total_size_bytes: number;
+}
+
+export interface SnapshotList {
+  snapshots: SnapshotManifest[];
+}
+
+export interface BrandingAssets {
+  avatars: string[];
+  emoji: string[];
+}
+
+export interface EmployeeBranding {
+  employee_id: number;
+  avatar_asset_id: string | null;
+  updated_at: string | null;
+}
+
+export interface LastSnapshotInfo {
+  last_snapshot: SnapshotManifest | null;
+  error: string | null;
+}
+
 export const api = {
   simulationStatus: () => apiFetch<SimulationStatus>("/api/simulation/status"),
   tickPause: () => apiFetch("/api/simulation/tick/pause", { method: "POST" }),
@@ -389,5 +461,68 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content }),
+    }),
+
+  // Phase 36: Chaos tab
+  chaosStatus: () => apiFetch<ChaosStatus>("/api/chaos/status"),
+  chaosOutages: () => apiFetch<ChaosOutages>("/api/chaos/outages"),
+  chaosApplianceAction: (name: string, action: "stop" | "start" | "restart") =>
+    apiFetch(`/api/chaos/appliances/${name}/${action}`, { method: "POST" }),
+  chaosTriggerEvent: (body: { scenario: string; custom_text?: string }) =>
+    apiFetch<TriggerEventResult>("/api/chaos/trigger-event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  // Phase 36: Data Management tab (scoped purge + snapshots — full purge lives
+  // under Settings, see below)
+  dataManagementScopes: () => apiFetch<DataManagementScopes>("/api/data-management/scopes"),
+  dataManagementPurgeScope: (scope: string, confirm: string) =>
+    apiFetch("/api/data-management/purge-scope", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope, confirm }),
+    }),
+  dataManagementSnapshots: () => apiFetch<SnapshotList>("/api/data-management/snapshots"),
+  dataManagementSnapshotSave: (label?: string) =>
+    apiFetch<SnapshotManifest>("/api/data-management/snapshots/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: label ?? null }),
+    }),
+  dataManagementSnapshotRestore: (snapshot_name: string, confirm: string) =>
+    apiFetch("/api/data-management/snapshots/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ snapshot_name, confirm }),
+    }),
+  dataManagementSnapshotDelete: (snapshot_name: string) =>
+    apiFetch(`/api/data-management/snapshots/${snapshot_name}`, { method: "DELETE" }),
+
+  // Phase 36: Branding tab
+  brandingAssets: () => apiFetch<BrandingAssets>("/api/branding/assets"),
+  brandingEmployee: (employeeId: number) =>
+    apiFetch<EmployeeBranding>(`/api/branding/employee/${employeeId}`),
+  brandingApply: (employee_id: number, asset_id: string) =>
+    apiFetch("/api/branding/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ employee_id, asset_id }),
+    }),
+  brandingBulkApply: (body: { employee_ids: number[]; mode: string; asset_id?: string }) =>
+    apiFetch("/api/branding/bulk-apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  // Phase 36/38: Settings' "nuclear launch" full-purge control.
+  settingsLastSnapshot: () => apiFetch<LastSnapshotInfo>("/api/settings/full-purge/last-snapshot"),
+  settingsFullPurge: (confirm: string) =>
+    apiFetch("/api/settings/full-purge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm }),
     }),
 };

@@ -27,6 +27,7 @@ import aiomysql
 import httpx
 import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -70,6 +71,32 @@ AKAUNTING_PUBLIC_URL = os.environ.get("AKAUNTING_PUBLIC_URL", "http://accounting
 EXTERNAL_WORLD_URL = os.environ.get("EXTERNAL_WORLD_URL", "http://external-world:8000")
 KPI_ENGINE_URL = os.environ.get("KPI_ENGINE_URL", "http://kpi-engine:8000")
 HUMAN_BRIDGE_URL = os.environ.get("HUMAN_BRIDGE_URL", "http://human-bridge:8000")
+
+# Phase 36: Chaos / Data Management / Branding tabs + Settings' full-purge
+# "nuclear launch" flow. All three owning services already exist (Phases
+# 27/28/29/30) — this BFF only proxies to their existing endpoints, per the
+# plan's "reuse, don't duplicate" pattern used everywhere else in this file.
+PURGE_MANAGER_URL = os.environ.get("PURGE_MANAGER_URL", "http://purge-manager:8000")
+SNAPSHOT_MANAGER_URL = os.environ.get("SNAPSHOT_MANAGER_URL", "http://snapshot-manager:8000")
+BRANDING_MANAGER_URL = os.environ.get("BRANDING_MANAGER_URL", "http://branding-manager:8000")
+# The exact typed-confirmation phrases live server-side in purge-manager
+# (SCOPE_PHRASES / FULL_PURGE_PHRASE) — mirrored here ONLY for the UI to show
+# the user what to type; the BFF and purge-manager both still validate the
+# real value server-side, this is not a client-trusted shortcut.
+DATA_MANAGEMENT_SCOPES = [
+    {"scope": "emails", "label": "Emails", "confirm_phrase": "PURGE EMAILS"},
+    {"scope": "chat", "label": "Chat", "confirm_phrase": "PURGE CHAT"},
+    {"scope": "tickets", "label": "Tickets", "confirm_phrase": "PURGE TICKETS"},
+    {"scope": "wiki", "label": "Wiki", "confirm_phrase": "PURGE WIKI"},
+    {"scope": "meetings_narrative", "label": "Meetings & narrative memory",
+     "confirm_phrase": "PURGE MEETINGS AND NARRATIVE MEMORY"},
+    {"scope": "accounting", "label": "Accounting ledger", "confirm_phrase": "PURGE ACCOUNTING LEDGER"},
+    {"scope": "external_world", "label": "External world", "confirm_phrase": "PURGE EXTERNAL WORLD"},
+    {"scope": "kpi_history", "label": "KPI history", "confirm_phrase": "PURGE KPI HISTORY"},
+    {"scope": "roster", "label": "Roster", "confirm_phrase": "PURGE ROSTER"},
+    {"scope": "company_direction", "label": "Company direction", "confirm_phrase": "PURGE COMPANY DIRECTION"},
+]
+FULL_PURGE_CONFIRM_PHRASE = "PURGE EVERYTHING"
 
 # Revenue-by-customer chart reads Akaunting's MariaDB directly, same
 # credentials/host purge-manager and snapshot-manager already use.
@@ -940,17 +967,286 @@ async def company_direction_save(body: SaveDirectiveBody, _user: str = Depends(r
 
 
 # ---------------------------------------------------------------------------
-# Settings tab — Phase 33 reserves the nav slot + an empty page shell only.
-# The full-purge "nuclear launch" control is Phase 36/38's job (2026-08-01
-# sign-off) — nothing destructive is wired up here.
+# Phase 36: Chaos tab
+#
+# Per-appliance status/outages/trigger-event all proxy orchestrator's existing
+# Phase 27/28 endpoints — no duplicated logic here.
 # ---------------------------------------------------------------------------
-@app.get("/api/settings/placeholder")
-async def settings_placeholder(_user: str = Depends(require_basic_auth)):
-    return {
-        "status": "reserved",
-        "message": "Settings tab is a navigation placeholder as of Phase 33. "
-                    "The full-purge control lands in Phase 36/38.",
-    }
+@app.get("/api/chaos/status")
+async def chaos_status(_user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.get(f"{ORCHESTRATOR_URL}/chaos/appliances/status", timeout=15.0)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"orchestrator unreachable: {exc}")
+
+
+@app.get("/api/chaos/outages")
+async def chaos_outages(_user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.get(f"{ORCHESTRATOR_URL}/chaos/outages", timeout=15.0)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"orchestrator unreachable: {exc}")
+
+
+@app.post("/api/chaos/appliances/{name}/{action}")
+async def chaos_appliance_action(name: str, action: str, _user: str = Depends(require_basic_auth)):
+    if action not in ("stop", "start", "restart"):
+        raise HTTPException(status_code=400, detail="action must be stop, start, or restart")
+    try:
+        r = await _http.post(f"{ORCHESTRATOR_URL}/chaos/appliances/{name}/{action}", timeout=30.0)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"orchestrator unreachable: {exc}")
+
+
+class TriggerEventBody(BaseModel):
+    scenario: str
+    custom_text: Optional[str] = None
+
+
+@app.post("/api/chaos/trigger-event")
+async def chaos_trigger_event(body: TriggerEventBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(
+            f"{ORCHESTRATOR_URL}/chaos/trigger-event",
+            json=body.model_dump(),
+            timeout=120.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"orchestrator unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 36: Data Management tab — SCOPED purge + snapshots only. Full purge
+# is deliberately NOT here (2026-08-01 sign-off moved it to Settings, below).
+# ---------------------------------------------------------------------------
+@app.get("/api/data-management/scopes")
+async def data_management_scopes(_user: str = Depends(require_basic_auth)):
+    return {"scopes": DATA_MANAGEMENT_SCOPES}
+
+
+class ScopePurgeBody(BaseModel):
+    scope: str
+    confirm: str
+
+
+@app.post("/api/data-management/purge-scope")
+async def data_management_purge_scope(body: ScopePurgeBody, _user: str = Depends(require_basic_auth)):
+    valid_scopes = {s["scope"] for s in DATA_MANAGEMENT_SCOPES}
+    if body.scope not in valid_scopes:
+        raise HTTPException(status_code=400, detail=f"unknown scope '{body.scope}'")
+    try:
+        r = await _http.post(
+            f"{PURGE_MANAGER_URL}/purge/{body.scope}",
+            json={"confirm": body.confirm},
+            timeout=180.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"purge-manager unreachable: {exc}")
+
+
+@app.get("/api/data-management/snapshots")
+async def data_management_snapshots(_user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.get(f"{SNAPSHOT_MANAGER_URL}/snapshot/list", timeout=15.0)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"snapshot-manager unreachable: {exc}")
+
+
+class SnapshotSaveBody(BaseModel):
+    label: Optional[str] = None
+
+
+@app.post("/api/data-management/snapshots/save")
+async def data_management_snapshot_save(body: SnapshotSaveBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(
+            f"{SNAPSHOT_MANAGER_URL}/snapshot/save",
+            json={"label": body.label},
+            timeout=180.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"snapshot-manager unreachable: {exc}")
+
+
+class SnapshotRestoreBody(BaseModel):
+    snapshot_name: str
+    confirm: str
+
+
+@app.post("/api/data-management/snapshots/restore")
+async def data_management_snapshot_restore(body: SnapshotRestoreBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(
+            f"{SNAPSHOT_MANAGER_URL}/snapshot/restore",
+            json=body.model_dump(),
+            timeout=300.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"snapshot-manager unreachable: {exc}")
+
+
+@app.delete("/api/data-management/snapshots/{snapshot_name}")
+async def data_management_snapshot_delete(snapshot_name: str, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.delete(f"{SNAPSHOT_MANAGER_URL}/snapshot/{snapshot_name}", timeout=30.0)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"snapshot-manager unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 36: Branding tab
+# ---------------------------------------------------------------------------
+@app.get("/api/branding/asset-proxy/avatars/{asset_id}.png")
+async def branding_asset_proxy_avatar(asset_id: str, _user: str = Depends(require_basic_auth)):
+    """branding-manager isn't on net_mgmt (no browser-reachable network) — this
+    streams its image bytes through the BFF so the asset library grid can
+    actually render, rather than duplicating the asset files here."""
+    try:
+        r = await _http.get(f"{BRANDING_MANAGER_URL}/assets/avatars/{asset_id}.png", timeout=15.0)
+        r.raise_for_status()
+        return Response(content=r.content, media_type="image/png")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"branding-manager unreachable: {exc}")
+
+
+@app.get("/api/branding/asset-proxy/emoji/{asset_id}.png")
+async def branding_asset_proxy_emoji(asset_id: str, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.get(f"{BRANDING_MANAGER_URL}/assets/emoji/{asset_id}.png", timeout=15.0)
+        r.raise_for_status()
+        return Response(content=r.content, media_type="image/png")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"branding-manager unreachable: {exc}")
+
+
+@app.get("/api/branding/assets")
+async def branding_assets(_user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.get(f"{BRANDING_MANAGER_URL}/assets", timeout=15.0)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"branding-manager unreachable: {exc}")
+
+
+@app.get("/api/branding/employee/{employee_id}")
+async def branding_employee(employee_id: int, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.get(f"{BRANDING_MANAGER_URL}/branding/employee/{employee_id}", timeout=15.0)
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"branding-manager unreachable: {exc}")
+
+
+class ApplyAvatarBody(BaseModel):
+    employee_id: int
+    asset_id: str
+
+
+@app.post("/api/branding/apply")
+async def branding_apply(body: ApplyAvatarBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(f"{BRANDING_MANAGER_URL}/branding/apply", json=body.model_dump(), timeout=60.0)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"branding-manager unreachable: {exc}")
+
+
+class BulkApplyBody(BaseModel):
+    employee_ids: list[int]
+    mode: str
+    asset_id: Optional[str] = None
+
+
+@app.post("/api/branding/bulk-apply")
+async def branding_bulk_apply(body: BulkApplyBody, _user: str = Depends(require_basic_auth)):
+    try:
+        r = await _http.post(f"{BRANDING_MANAGER_URL}/branding/bulk-apply", json=body.model_dump(), timeout=180.0)
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"branding-manager unreachable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Settings tab — Phase 36/38: the "nuclear launch" full-purge control.
+#
+# 2026-08-01 sign-off (PLAN_PHASES_33_38_DASHBOARD.md §Decisions #3): this is
+# the ONLY place in the whole dashboard the full-purge control lives — it is
+# NOT on the Data Management tab. Requires the user to confirm no fewer than
+# 3 separate times (enforced client-side by the SPA's step sequence; this BFF
+# is the last of those steps, and purge-manager's own confirm-phrase check is
+# an entirely separate, additional server-side gate — see purge-manager's own
+# module docstring on the mandatory pre-purge snapshot + phrase match).
+# ---------------------------------------------------------------------------
+@app.get("/api/settings/full-purge/last-snapshot")
+async def settings_last_snapshot(_user: str = Depends(require_basic_auth)):
+    """So the 'nuclear launch' control can show 'Last snapshot taken: ...'
+    prominently next to itself, per the sign-off — the user should be able to
+    see whether a safety net exists before ever clicking step 1."""
+    try:
+        r = await _http.get(f"{SNAPSHOT_MANAGER_URL}/snapshot/list", timeout=15.0)
+        r.raise_for_status()
+        snapshots = r.json().get("snapshots", [])
+    except Exception as exc:
+        return {"last_snapshot": None, "error": f"snapshot-manager unreachable: {exc}"}
+    if not snapshots:
+        return {"last_snapshot": None, "error": None}
+    latest = max(snapshots, key=lambda s: s.get("wall_clock_captured_at", ""))
+    return {"last_snapshot": latest, "error": None}
+
+
+class FullPurgeBody(BaseModel):
+    confirm: str
+
+
+@app.post("/api/settings/full-purge")
+async def settings_full_purge(body: FullPurgeBody, _user: str = Depends(require_basic_auth)):
+    """The actual destructive call. The SPA only ever reaches this after its
+    own full multi-step confirmation sequence completes — this endpoint does
+    not know or care about that client-side sequence, it simply forwards to
+    purge-manager's own /purge/full, which re-validates the typed phrase and
+    performs its own mandatory pre-purge snapshot regardless of what the
+    client already did. Two independent gates, not one gate trusted twice."""
+    try:
+        r = await _http.post(
+            f"{PURGE_MANAGER_URL}/purge/full",
+            json={"confirm": body.confirm},
+            timeout=600.0,
+        )
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        return r.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"purge-manager unreachable: {exc}")
 
 
 # ---------------------------------------------------------------------------

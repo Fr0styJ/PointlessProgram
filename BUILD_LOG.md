@@ -47,6 +47,121 @@
 
 ---
 
+### 2026-08-01T03:15 — Phase 36: Chaos / Data Management / Branding dashboard tabs + Settings' "nuclear launch" full-purge control — runtime-verified against the live stack
+
+Per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 36 section and the 2026-08-01 sign-off amendment
+that moved full-purge out of Data Management and into a dedicated Settings item. Built entirely
+inside worktree `agent-a0c6f08ce612cc262` (no edits to the primary checkout); all verification
+below ran against the shared live `pointlessprogram` compose project by rebuilding/recreating
+just the affected containers from the worktree's code.
+
+**Backend additions (all thin proxies to already-existing Phase 27/28/29/30 endpoints, plus two
+small, scoped new endpoints where a real gap existed):**
+- `orchestrator/main.py`: added `SocketProxyClient.list_containers()` (GET
+  `/containers/json?all=true` through docker-socket-proxy — allowed today since `CONTAINERS=1`,
+  distinct from the POST-only start/stop/restart verbs already used), `GET
+  /chaos/appliances/status` (live per-container state for the Chaos tab's grid), and `GET
+  /chaos/outages` (reads `narrative_events WHERE source_type='outage'`, displayed verbatim).
+- `snapshot-manager/main.py`: added `DELETE /snapshot/{snapshot_name}` (no delete endpoint existed
+  before this — Data Management's per-snapshot Delete button needed one; guards against path
+  traversal, only ever removes that snapshot's own directory, never touches live appliance data).
+  Also added `total_size_bytes` to `/snapshot/list`'s response (sum of each manifest's artifact
+  sizes) so the UI can show snapshot size without a second round-trip.
+- `branding-manager/main.py`: added `GET /assets/emoji/{asset_id}.png` (existing `/assets` only
+  listed emoji names; the Branding tab's asset-library grid needed to actually render them).
+- `purge-manager/main.py`: NO changes needed — its 10 scoped-purge endpoints and `/purge/full`
+  (both already gated by mandatory pre-purge snapshot + server-side typed confirmation phrase,
+  Phase 29) were reused as-is.
+- `dashboard/main.py`: new `/api/chaos/*`, `/api/data-management/*`, `/api/branding/*`, and
+  `/api/settings/full-purge*` aggregation/proxy endpoints, following the exact same pattern as
+  every prior dashboard phase. Two image-proxy routes
+  (`/api/branding/asset-proxy/{avatars,emoji}/{id}.png`) stream branding-manager's asset bytes
+  through the BFF since branding-manager isn't on `net_mgmt` (not browser-reachable directly).
+  `DATA_MANAGEMENT_SCOPES` / `FULL_PURGE_CONFIRM_PHRASE` constants mirror purge-manager's own
+  phrases for UI display only — the BFF and purge-manager both still independently validate the
+  real value server-side (not a client-trusted shortcut).
+
+**Frontend additions** (`dashboard/frontend/src/{App.tsx,api.ts,styles.css}`):
+- **Chaos tab**: live per-appliance status grid (Stop/Start/Restart, confirmation dialog before
+  Stop), Trigger Event control (scenario dropdown + custom free-text + result summary showing the
+  real thread/meeting/expense created), outage log table.
+- **Data Management tab**: 10-scope checkbox list + "Purge Selected" with its own typed-phrase
+  modal (scoped purge only); Snapshots section (list with size, Save Snapshot Now, per-snapshot
+  Restore with its own typed-phrase gate, per-snapshot Delete with its own confirm modal). Full
+  purge is explicitly NOT here — a note in the card says so.
+- **Branding tab**: asset library grid (avatar images + emoji images, both rendered via the new
+  BFF image-proxy routes), per-employee avatar picker, bulk-apply (multi-select + randomize /
+  apply-one-to-all / reset-to-default).
+- **Settings tab — the "nuclear launch" full-purge control** (2026-08-01 sign-off, verbatim):
+  a visually isolated `.danger-zone` card (red border/glow, distinct from every other card style),
+  explicit copy naming exactly what full purge destroys (employees/roster, Mattermost, Zammad,
+  Wiki.js, meetings/narrative memory, the entire Akaunting ledger, external-world/customer data,
+  KPI history, Company Direction history), and "Last snapshot taken: [timestamp]" queried live from
+  snapshot-manager so the user can see whether a safety net exists before starting. The actual
+  confirmation sequence is **4 distinct affirmative steps** (one more than the required minimum of
+  3): (1) "I want to purge all data" button arms the flow; (2) a modal restating the full
+  consequences, requiring "I understand, continue"; (3) a typed-exact-phrase step ("PURGE
+  EVERYTHING", verified live to reject a near-miss like lowercase before accepting the exact
+  phrase); (4) a final "This is your last chance" modal with "Execute Full Purge" as the only
+  button that actually fires the BFF call. Only step 4 calls `/api/settings/full-purge`, which
+  itself forwards to purge-manager's `/purge/full` — a second, fully independent server-side gate
+  (own confirm-phrase check + own mandatory pre-purge snapshot), not a single gate trusted twice.
+
+**docker-compose.yml**: no new services. Added `PURGE_MANAGER_URL` / `SNAPSHOT_MANAGER_URL` /
+`BRANDING_MANAGER_URL` env vars to the `dashboard` service (all three targets already reachable —
+purge-manager/branding-manager share `net_clients` with dashboard, snapshot-manager shares
+`net_mgmt` — no new networks needed anywhere), and added a `phase36` profile entry to `dashboard`,
+`purge-manager`, `snapshot-manager`, and `branding-manager` (also backfilled the missing `phase35`
+profile entry on `dashboard`, which had been omitted despite Phase 35 already living in that same
+container/service).
+
+**Runtime verification (against the live `pointlessprogram` stack, from within the worktree —
+rebuilt+recreated `dashboard`, `orchestrator`, `purge-manager`, `snapshot-manager`,
+`branding-manager` in place; every other container untouched):**
+- Chaos: `GET /api/chaos/status` returns live state for every allow-listed container. Stopped
+  `fakeco-wikijs` for real via the dashboard's Stop button-equivalent API call, confirmed via
+  `docker ps` it actually exited, then Started it back up via the API and confirmed it came back —
+  full real stop/start round-trip, not just a 200 response. Restart button exists and proxies the
+  same way (not separately fire-tested to avoid unnecessary churn once stop/start were proven).
+  Trigger Event: fired a real `viral_complaint` scenario — created crisis thread #57, a real
+  `crisis_response` meeting (2 real attendees, 2 action items), and a real pending expense-approval
+  request (id 15) through the normal accounting-engine approval path. **Found (pre-existing, not
+  introduced by this phase): `CHAOS_ALLOWED_CONTAINERS` in `orchestrator/main.py` still lists
+  `fakeco-zammad`, but the real running container is `fakeco-zammad-nginx` (Zammad decomposed into
+  multiple containers back in its own phase) — the status/stop/start/restart calls for "zammad"
+  silently no-op / report "not found" rather than acting on any real container. Pre-existing gap
+  from Phase 27, surfaced by this phase's live status-grid test; not fixed here since it's outside
+  Phase 36's scope and risks touching Phase 27's own container-naming assumptions.**
+- Data Management: scoped-purge gate verified to reject a wrong confirm phrase (400, no purge
+  ran). Snapshot Save tested for real — produced a real multi-GB snapshot with all 9 artifacts
+  `ok: true` (narrative/mattermost/zammad/wikijs/nextcloud/wordpress/akaunting DB dumps +
+  mailserver Maildir + Nextcloud files tar). Snapshot Restore's gate verified to reject a wrong
+  confirm phrase; **found and fixed a real bug**: the frontend's restore modal required typing
+  `RESTORE`, but snapshot-manager's actual `RESTORE_CONFIRM_PHRASE` is `"RESTORE SNAPSHOT"` — the
+  gate would have silently never been satisfiable by anyone reading the on-screen instructions
+  correctly. Fixed in `App.tsx` to require the real phrase; rebuilt/redeployed dashboard, re-tested
+  the (still-rejecting) gate afterward. The test snapshot was deleted afterward via the new Delete
+  endpoint (verified working) rather than left as clutter.
+- Branding: asset library confirmed rendering real avatar/emoji images through the new BFF proxy
+  routes (10 avatars, 5 emoji, both fetched as real image bytes, not just names). Applied a real
+  avatar (`avatar-03`) to a real throwaway roster employee (`Zoe Testuser`, id 22) via the
+  Per-Employee Avatar Picker; confirmed via `GET /api/branding/employee/22` that the change
+  persisted (`avatar_asset_id: "avatar-03"`).
+- Settings full-purge gate: walked the entire 4-step UI sequence live in-browser up through step
+  3/4 ("Execute Full Purge"), confirmed each step's Continue/confirm control is genuinely disabled
+  until its own condition is met (wrong-case phrase at step 3 correctly did not advance), then
+  **cancelled at the final step instead of executing it**. Confirmed via the browser's own network
+  log AND `docker logs fakeco-purge-manager` that `/api/settings/full-purge` /
+  `POST /purge/full` never received a real (200-status) call during any of this session's testing —
+  the only `/purge/full` hit in the logs is the single deliberate wrong-phrase probe (400 Bad
+  Request), run specifically to prove the gate rejects bad input server-side too. **No full purge
+  was executed against the primary stack at any point.**
+
+Files: `orchestrator/main.py`, `snapshot-manager/main.py`, `branding-manager/main.py`,
+`dashboard/main.py`, `dashboard/frontend/src/{App.tsx,api.ts,styles.css}`, `docker-compose.yml`.
+
+---
+
 ### 2026-08-01T02:10 — Fixed accounting-engine: Akaunting `payment_method` now resolved dynamically, `X-Company` header added to client defaults — every real transaction post (expense approve, payroll, revenue) was silently 422ing until this landed
 
 Root cause found live while verifying Phase 34's Accounting tab Approve button: `AkauntingClient`

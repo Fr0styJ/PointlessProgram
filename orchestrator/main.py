@@ -175,6 +175,26 @@ class SocketProxyClient:
     async def restart(self, container_name: str) -> dict:
         return await self._post_action(container_name, "restart")
 
+    async def list_containers(self, names: list[str]) -> list[dict]:
+        """Phase 36: GET /containers/json?all=true — CONTAINERS=1 on the proxy
+        allows this list/inspect verb (only POST=1's start/stop/restart are
+        additionally gated), so this is a real, allowed call, not a workaround.
+        Filters client-side to just the chaos allow-listed names so callers never
+        see (or can infer state about) any other container on the host."""
+        r = await self._http.get(f"{self._base_url}/containers/json", params={"all": "true"}, timeout=15.0)
+        r.raise_for_status()
+        by_name = {}
+        for c in r.json():
+            for raw_name in c.get("Names", []):
+                clean = raw_name.lstrip("/")
+                if clean in names:
+                    by_name[clean] = {
+                        "name": clean,
+                        "state": c.get("State"),
+                        "status": c.get("Status"),
+                    }
+        return [by_name.get(n, {"name": n, "state": "unknown", "status": "not found"}) for n in names]
+
 
 _socket_proxy: Optional[SocketProxyClient] = None
 
@@ -1005,6 +1025,33 @@ def _validate_chaos_container(name: str) -> str:
     if candidate not in CHAOS_ALLOWED_CONTAINERS:
         return ""
     return candidate
+
+
+@app.get("/chaos/appliances/status")
+async def chaos_status():
+    """Phase 36 dashboard Chaos tab: live up/down/starting state for every
+    chaos allow-listed container, via docker-socket-proxy's list verb."""
+    try:
+        containers = await get_socket_proxy().list_containers(sorted(CHAOS_ALLOWED_CONTAINERS))
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+    return {"containers": containers}
+
+
+@app.get("/chaos/outages")
+async def chaos_outages(pool: PoolDep, limit: int = 50):
+    """Phase 36 dashboard Chaos tab's outage log — narrative_events rows this
+    file itself already logs (source_type='outage') in sim-time phrasing,
+    displayed verbatim rather than re-derived."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, source_ref, short_summary, created_at
+            FROM narrative_events
+            WHERE source_type = 'outage'
+            ORDER BY created_at DESC
+            LIMIT $1
+        """, limit)
+    return {"outages": [dict(r) | {"created_at": r["created_at"].isoformat()} for r in rows]}
 
 
 @app.post("/chaos/appliances/{name}/stop")
