@@ -769,7 +769,9 @@ services:
       - phase7
 
   wikijs:
-    image: requarks/wiki:2
+    build:
+      context: ./wikijs-init
+    image: fakeco-wikijs:2.5.314-offline-locale
     container_name: fakeco-wikijs
     restart: unless-stopped
     depends_on:
@@ -1431,6 +1433,16 @@ services:
       MAILSERVER_BOT_SECRET: "${MAILSERVER_BOT_SECRET:?MAILSERVER_BOT_SECRET required}"
       MATTERMOST_URL: "http://mattermost:8065"
       MATTERMOST_ADMIN_TOKEN: "${MATTERMOST_ADMIN_TOKEN:-}"
+      # Mattermost's REST channel listings omit teamless direct/group channels;
+      # human-bridge uses this only for read-only membership discovery.
+      MATTERMOST_DB_HOST: "mattermost-db"
+      MATTERMOST_DB_NAME: "mattermost"
+      MATTERMOST_DB_USER: "mattermost"
+      MATTERMOST_DB_PASSWORD: "${MATTERMOST_DB_PASSWORD:?MATTERMOST_DB_PASSWORD required}"
+      MATTERMOST_ADMIN_EMAIL: "${MATTERMOST_ADMIN_EMAIL:-}"
+      # Mattermost UI login whose actions count as human activity. The service
+      # defaults this to MATTERMOST_ADMIN_EMAIL, never cross-appliance PRINCIPAL_EMAIL.
+      MATTERMOST_HUMAN_EMAIL: "${MATTERMOST_HUMAN_EMAIL:-}"
       MATTERMOST_TEAM_ID: "${MATTERMOST_TEAM_ID:-}"
       MAILSERVER_IMAP_PORT: "143"
       ZAMMAD_URL: "http://zammad-nginx:8080"

@@ -10,6 +10,7 @@ COPY reaction_chat.py .
 COPY reaction_email.py .
 COPY reaction_wikijs.py .
 COPY reaction_zammad.py .
+COPY reaction_mattermost.py .
 
 EXPOSE 8000
 

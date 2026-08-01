@@ -1,0 +1,27 @@
+{
+  "common": {
+    "actions": {
+      "add": "Add", "apply": "Apply", "back": "Back", "cancel": "Cancel",
+      "close": "Close", "confirm": "Confirm", "create": "Create", "delete": "Delete",
+      "discard": "Discard", "download": "Download", "edit": "Edit", "exit": "Exit",
+      "move": "Move", "new": "New", "next": "Next", "open": "Open",
+      "refresh": "Refresh", "remove": "Remove", "rename": "Rename", "reset": "Reset",
+      "save": "Save", "search": "Search", "select": "Select", "submit": "Submit",
+      "update": "Update", "upload": "Upload", "view": "View"
+    },
+    "comments": {
+      "title": "Comments", "add": "Add Comment", "edit": "Edit Comment",
+      "delete": "Delete Comment", "reply": "Reply", "save": "Save Comment",
+      "cancel": "Cancel", "none": "No comments yet", "loading": "Loading comments..."
+    },
+    "search": {
+      "title": "Search", "placeholder": "Search the wiki", "results": "Search Results",
+      "noResults": "No results found", "suggestions": "Suggestions", "loading": "Searching..."
+    },
+    "dashboard": {
+      "title": "Dashboard", "welcome": "Welcome", "recentPages": "Recent Pages",
+      "newPage": "New Page", "pages": "Pages", "users": "Users",
+      "groups": "Groups", "settings": "Settings"
+    }
+  }
+}

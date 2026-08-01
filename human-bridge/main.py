@@ -24,6 +24,7 @@ import os
 import smtplib
 import traceback
 from datetime import datetime, timezone
+from urllib.parse import quote
 from decimal import Decimal
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
@@ -31,6 +32,13 @@ from typing import Optional
 
 import asyncpg
 import httpx
+from reaction_mattermost import (
+    configured_human_email,
+    first_poll_params,
+    is_principal_post,
+    merge_channels,
+    target_employee_id,
+)
 from reaction_chat import ChatReactionConfig, process_chat_reaction
 from reaction_email import EmailReactionConfig, EmailReactionWorker
 from reaction_wikijs import WikiReactionConfig, process_wikijs_reaction
@@ -62,6 +70,14 @@ MAILSERVER_HOST = os.environ.get("MAILSERVER_HOST", "mailserver")
 MAILSERVER_PORT = int(os.environ.get("MAILSERVER_SMTP_PORT", "587"))
 MATTERMOST_URL = os.environ.get("MATTERMOST_URL", "http://mattermost:8065")
 MATTERMOST_ADMIN_TOKEN = os.environ.get("MATTERMOST_ADMIN_TOKEN", "")
+MATTERMOST_DB_HOST = os.environ.get("MATTERMOST_DB_HOST", "mattermost-db")
+MATTERMOST_DB_NAME = os.environ.get("MATTERMOST_DB_NAME", "mattermost")
+MATTERMOST_DB_USER = os.environ.get("MATTERMOST_DB_USER", "mattermost")
+MATTERMOST_DB_PASSWORD = os.environ.get("MATTERMOST_DB_PASSWORD", "")
+MATTERMOST_HUMAN_EMAIL = configured_human_email(
+    os.environ.get("MATTERMOST_HUMAN_EMAIL", ""),
+    os.environ.get("MATTERMOST_ADMIN_EMAIL", ""),
+)
 ZAMMAD_URL = os.environ.get("ZAMMAD_URL", "http://zammad-nginx:8080")
 ZAMMAD_ADMIN_TOKEN = os.environ.get("ZAMMAD_ADMIN_TOKEN", "")
 WIKIJS_URL = os.environ.get("WIKIJS_URL", "http://wikijs:3000")
@@ -392,16 +408,21 @@ async def _resolve_employee_by_wiki_tag(conn: asyncpg.Connection, tags: list[str
 async def _resolve_principal_mattermost_id(http: httpx.AsyncClient) -> Optional[str]:
     if "mattermost" in _principal_ids:
         return _principal_ids["mattermost"]
-    username = _mattermost_username_for(PRINCIPAL_EMAIL)
+    if not MATTERMOST_HUMAN_EMAIL:
+        log.warning("human-bridge: MATTERMOST_HUMAN_EMAIL/MATTERMOST_ADMIN_EMAIL is unset")
+        return None
     r = await http.get(
-        f"{MATTERMOST_URL}/api/v4/users/username/{username}",
+        f"{MATTERMOST_URL}/api/v4/users/email/{quote(MATTERMOST_HUMAN_EMAIL, safe='')}",
         headers={"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"},
     )
     if r.status_code == 200:
         uid = r.json()["id"]
         _principal_ids["mattermost"] = uid
         return uid
-    log.warning("human-bridge: could not resolve Principal Mattermost id (status=%s)", r.status_code)
+    log.warning(
+        "human-bridge: could not resolve Mattermost human account %s (status=%s)",
+        MATTERMOST_HUMAN_EMAIL, r.status_code,
+    )
     return None
 
 
@@ -447,39 +468,100 @@ async def _resolve_principal_wiki_id(http: httpx.AsyncClient) -> Optional[int]:
 
 # --- Mattermost polling ------------------------------------------------------
 
+async def _mattermost_conversation_channels(principal_id: str) -> list[dict]:
+    """Read teamless D/G memberships omitted by Mattermost's channel-list API.
+
+    Mattermost exposes no non-creating REST lookup for a user's direct channels:
+    POST /channels/direct is idempotent for existing DMs but creates every missing
+    one. A read-only query avoids filling the Principal's sidebar with empty DMs
+    and also discovers group messages. The appliance DB remains internal-only.
+    """
+    if not MATTERMOST_DB_PASSWORD:
+        log.warning("human-bridge: MATTERMOST_DB_PASSWORD is unset; DMs cannot be polled")
+        return []
+    db = await asyncpg.connect(
+        host=MATTERMOST_DB_HOST,
+        database=MATTERMOST_DB_NAME,
+        user=MATTERMOST_DB_USER,
+        password=MATTERMOST_DB_PASSWORD,
+    )
+    try:
+        rows = await db.fetch("""
+            SELECT c.id, c.type, c.name, c.displayname, c.teamid
+            FROM channels c
+            JOIN channelmembers cm ON cm.channelid = c.id
+            WHERE cm.userid = $1 AND c.type IN ('D', 'G') AND c.deleteat = 0
+        """, principal_id)
+        return [dict(row) for row in rows]
+    finally:
+        await db.close()
+
 async def _poll_mattermost_once(pool: asyncpg.Pool) -> None:
     async with httpx.AsyncClient(timeout=15.0) as http:
         principal_id = await _resolve_principal_mattermost_id(http)
         if not principal_id:
             return
         headers = {"Authorization": f"Bearer {MATTERMOST_ADMIN_TOKEN}"}
-        r = await http.get(f"{MATTERMOST_URL}/api/v4/users/{principal_id}/teams/{MATTERMOST_TEAM_ID}/channels",
-                            headers=headers)
-        if r.status_code != 200:
-            log.warning("human-bridge: mattermost channel list failed (%s)", r.status_code)
+        team_r = await http.get(f"{MATTERMOST_URL}/api/v4/users/{principal_id}/teams/{MATTERMOST_TEAM_ID}/channels",
+                                 headers=headers)
+        if team_r.status_code != 200:
+            log.warning("human-bridge: mattermost channel list failed (%s)", team_r.status_code)
             return
-        channels = r.json()
+
+        try:
+            conversation_channels = await _mattermost_conversation_channels(principal_id)
+        except Exception as exc:
+            log.warning("human-bridge: Mattermost DM/group lookup failed: %s", exc)
+            conversation_channels = []
 
         async with pool.acquire() as conn:
+            employee_rows = await conn.fetch(
+                "SELECT id, name, email, mattermost_id FROM employees WHERE status = 'active'"
+            )
+            employees_by_id = {emp["id"]: emp for emp in employee_rows}
+            employees_by_mattermost_id = {
+                str(emp["mattermost_id"]): emp["id"] for emp in employee_rows if emp["mattermost_id"]
+            }
+            employees_by_username = {
+                _mattermost_username_for(emp["email"]): emp["id"] for emp in employee_rows
+            }
+            channels = merge_channels(team_r.json(), conversation_channels)
             for ch in channels:
                 channel_id = ch["id"]
                 cursor_key = f"mattermost:{channel_id}"
                 since = await _get_cursor(conn, cursor_key)
-                params = {"page": 0, "per_page": 50}
-                if since:
-                    params["since"] = since
+                params = first_poll_params(
+                    since, now_ms=int(datetime.now(timezone.utc).timestamp() * 1000)
+                )
                 pr = await http.get(f"{MATTERMOST_URL}/api/v4/channels/{channel_id}/posts", headers=headers, params=params)
                 if pr.status_code != 200:
                     continue
+                member_ids: list[str] = []
+                if ch.get("type") == "D":
+                    members_r = await http.get(
+                        f"{MATTERMOST_URL}/api/v4/channels/{channel_id}/members",
+                        headers=headers,
+                    )
+                    if members_r.status_code != 200:
+                        continue
+                    member_ids = [str(member.get("user_id")) for member in members_r.json()]
                 posts_data = pr.json()
                 posts = posts_data.get("posts", {})
                 latest_update = int(since) if since else 0
                 for post_id, post in posts.items():
                     latest_update = max(latest_update, int(post.get("update_at", 0)))
-                    if post.get("user_id") != principal_id:
+                    if not is_principal_post(post, principal_id):
                         continue
                     message = post.get("message", "") or ""
-                    emp = await _resolve_employee_by_mattermost_mention(conn, message)
+                    employee_id = target_employee_id(
+                        channel_type=ch.get("type", ""),
+                        message=message,
+                        principal_id=principal_id,
+                        member_ids=member_ids,
+                        employees_by_mattermost_id=employees_by_mattermost_id,
+                        employees_by_username=employees_by_username,
+                    )
+                    emp = employees_by_id.get(employee_id)
                     if emp:
                         await _record_human_event(
                             conn, emp, "chat", f"mattermost:{post_id}",
