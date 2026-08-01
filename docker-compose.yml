@@ -1169,8 +1169,8 @@ services:
   # ---------------------------------------------------------------------------
   provisioning:
     build:
-      context: ./provisioning
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: provisioning/Dockerfile
     container_name: fakeco-provisioning
     # Phase 14 default (bulk/manual runs): `docker compose run --rm provisioning
     # python main.py provision --all` etc., still works unchanged — restart/command

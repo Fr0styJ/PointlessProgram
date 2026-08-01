@@ -30,6 +30,7 @@ import re
 import sys
 import traceback
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 import asyncpg
@@ -66,10 +67,110 @@ WIKIJS_URL = os.environ.get("WIKIJS_URL", "http://wikijs:3000")
 WIKIJS_ADMIN_TOKEN = os.environ.get("WIKIJS_ADMIN_TOKEN", "")
 PRINCIPAL_EMAIL = os.environ.get("PRINCIPAL_EMAIL", "principal@fakecorp.internal")
 PRINCIPAL_NAME = os.environ.get("PRINCIPAL_NAME", "Admin")
+PERSONALITY_LIBRARY_PATH = Path(
+    os.environ.get("PERSONALITY_LIBRARY_PATH", "/app/personality-library")
+)
 
 # Provisioning bootstrap: used for setup email add command against docker-mailserver
 # In Docker context, we exec into the mailserver container.
 DOCKER_HOST = os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock")
+
+
+# ---------------------------------------------------------------------------
+# Reusable employee personality library
+# ---------------------------------------------------------------------------
+_PERSONALITY_REQUIRED_FIELDS = {
+    "id", "short_label", "background", "core_personality", "communication_style",
+    "chat_style", "email_style", "motivations", "strengths", "flaws",
+    "conflict_style", "decision_style", "work_habits", "quirks",
+    "relationship_tendencies", "response_guidance", "prohibited_assumptions",
+}
+
+
+def _concise_personality(profile: dict) -> str:
+    """Keep existing meeting prompts useful without injecting the full biography."""
+    parts = [
+        profile["core_personality"],
+        f"Communication: {profile['communication_style']}",
+        f"Decision style: {profile['decision_style']}",
+        f"Response guidance: {profile['response_guidance']}",
+    ]
+    return "\n".join(str(part).strip() for part in parts if str(part).strip())
+
+
+async def sync_personality_library(conn: asyncpg.Connection) -> int:
+    """Validate/upsert the canonical JSON library and assign every unassigned employee."""
+    if not PERSONALITY_LIBRARY_PATH.exists():
+        raise RuntimeError(f"Personality library not found: {PERSONALITY_LIBRARY_PATH}")
+    files = (
+        sorted(PERSONALITY_LIBRARY_PATH.glob("*.json"))
+        if PERSONALITY_LIBRARY_PATH.is_dir()
+        else [PERSONALITY_LIBRARY_PATH]
+    )
+    profiles: list[dict] = []
+    for path in files:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        batch = payload.get("profiles") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(batch, list) or not batch:
+            raise RuntimeError(f"Invalid personality library batch: {path}")
+        profiles.extend(batch)
+    if not profiles:
+        raise RuntimeError("Personality library contains no profiles")
+
+    seen: set[str] = set()
+    for profile in profiles:
+        missing = _PERSONALITY_REQUIRED_FIELDS - set(profile) if isinstance(profile, dict) else _PERSONALITY_REQUIRED_FIELDS
+        if missing:
+            raise RuntimeError(f"Invalid personality profile; missing fields: {sorted(missing)}")
+        profile_id = str(profile["id"])
+        if profile_id in seen:
+            raise RuntimeError(f"Duplicate personality profile id: {profile_id}")
+        seen.add(profile_id)
+        await conn.execute("""
+            INSERT INTO personality_profiles (id, short_label, profile, updated_at)
+            VALUES ($1, $2, $3::jsonb, NOW())
+            ON CONFLICT (id) DO UPDATE
+            SET short_label = EXCLUDED.short_label,
+                profile = EXCLUDED.profile,
+                updated_at = NOW()
+        """, profile_id, str(profile["short_label"]), json.dumps(profile))
+
+    employee_ids = await conn.fetch(
+        "SELECT id FROM employees WHERE personality_profile_id IS NULL ORDER BY id"
+    )
+    for row in employee_ids:
+        await assign_personality_profile(conn, row["id"])
+    log.info("Personality library: synced %d profiles; assigned %d employee(s)", len(profiles), len(employee_ids))
+    return len(profiles)
+
+
+async def assign_personality_profile(conn: asyncpg.Connection, employee_id: int) -> Optional[str]:
+    """Choose randomly among least-used profiles, then keep that assignment stable."""
+    current = await conn.fetchval(
+        "SELECT personality_profile_id FROM employees WHERE id = $1", employee_id
+    )
+    if current:
+        return str(current)
+    selected = await conn.fetchrow("""
+        SELECT p.id, p.profile
+        FROM personality_profiles p
+        LEFT JOIN employees e ON e.personality_profile_id = p.id
+        GROUP BY p.id, p.profile
+        ORDER BY COUNT(e.id), RANDOM()
+        LIMIT 1
+    """)
+    if not selected:
+        raise RuntimeError("Cannot assign employee personality: profile library is empty")
+    profile = selected["profile"]
+    if isinstance(profile, str):
+        profile = json.loads(profile)
+    await conn.execute("""
+        UPDATE employees
+        SET personality_profile_id = $2,
+            personality = $3
+        WHERE id = $1 AND personality_profile_id IS NULL
+    """, employee_id, selected["id"], _concise_personality(profile))
+    return str(selected["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +738,8 @@ _svc_mail: Optional[MailserverClient] = None
 async def _lifespan(app: FastAPI):
     global _svc_pool, _svc_mm, _svc_zammad, _svc_wiki, _svc_mail
     _svc_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
+    async with _svc_pool.acquire() as conn:
+        await sync_personality_library(conn)
     _svc_mm = MattermostClient(MATTERMOST_URL, MATTERMOST_ADMIN_TOKEN, MATTERMOST_TEAM_ID)
     _svc_zammad = ZammadClient(ZAMMAD_URL, ZAMMAD_ADMIN_TOKEN)
     _svc_wiki = WikiJSClient(WIKIJS_URL, WIKIJS_ADMIN_TOKEN)
@@ -729,6 +832,9 @@ async def hire_employee_endpoint(req: HireRequest):
             RETURNING *
         """, req.name, email, req.department, req.title, req.role_tier, pay_rate)
 
+        await assign_personality_profile(conn, emp["id"])
+        emp = await conn.fetchrow("SELECT * FROM employees WHERE id = $1", emp["id"])
+
         await provision_employee(conn, emp, _svc_mm, _svc_zammad, _svc_wiki, _svc_mail)
 
     log.info("HTTP /hire: provisioned new employee %d (%s, %s / %s)", emp["id"], req.name, req.department, req.title)
@@ -774,6 +880,7 @@ async def main() -> None:
 
     try:
         async with pool.acquire() as conn:
+            await sync_personality_library(conn)
             if args.command == "provision":
                 if args.all:
                     employees = await conn.fetch(

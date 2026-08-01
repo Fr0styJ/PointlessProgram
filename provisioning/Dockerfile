@@ -13,10 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY provisioning/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY provisioning/main.py .
+COPY personality-library/ ./personality-library/
 
 # Default: provision all active employees
 # Override CMD to provision-principal or fire a specific employee

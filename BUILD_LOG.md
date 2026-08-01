@@ -34,7 +34,7 @@
 - [x] `external-world/` (Phase 21/22 — `Dockerfile`/`requirements.txt` added, wired into `docker-compose.yml`, `customers` table seeded via `005_customers_seed.sql`, prospect-generation loop runtime-verified end-to-end with real Zammad tickets)
 - [x] `kpi-engine/` (Phase 23 — built and runtime-verified, incl. live rollup against real Zammad/Wiki.js/Mattermost/Akaunting; Phase 35 added the live-switchable auto-apply vs. review-and-approve toggle, migration 011)
 - [x] `branding-manager/` (Phase 30 — built and runtime-verified against an isolated stack; 3 real appliance-API bugs/gaps found and fixed, incl. Zammad avatar-API and Wiki.js avatar-storage workarounds)
-- [x] `narrative-db/` (migrations 001–013 written and runtime-verified; 012 adds narrative deliverables and 013 adds bounded persistent deliverable retry state)
+- [x] `narrative-db/` (migrations 001–014 written and runtime-verified; 012 adds narrative deliverables, 013 adds bounded persistent deliverable retry state, and 014 adds reusable personality profiles with stable employee assignments)
 - [x] `dashboard/` (Phases 33–37 — React/Vite + FastAPI BFF, all 37's worth of tabs built and runtime-verified: Simulation/LLM Status/Narrative (33), HR/Payroll/Accounting (34), External World/KPI/Company Direction (35), Chaos/Data Management/Branding + Settings nuclear-purge (36), TV wall/Errors panel/deep links/log tail (37))
 - [x] `provisioning/` (Phase 14 CLI — runtime-verified; Phase 34 added an HTTP "serve" mode with `/hire`/`/fire` for the dashboard, reusing the same underlying functions)
 - [x] `litellm/config.yaml` (Phase 10 — written and runtime-verified)
@@ -48,6 +48,32 @@
 ## LOG (newest first)
 
 ---
+
+### 2026-08-01T05:40 — Added 50 detailed employee profiles and stable randomized assignment; confirmed direct-message replies are still an unbuilt spec gap
+
+Investigated why a direct Mattermost message to an employee received no response. The Phase 17
+detection layer works: Principal-authored Mattermost/email/Zammad/Wiki.js activity becomes a
+human-origin narrative event and a `pending_reactions` row. However, the orchestrator never
+consumes `pending_reactions`, despite the original continuity-loop specification making that its
+highest priority. This is now explicitly tracked in `bugs.md`; the personality work below does
+not misrepresent that missing reply worker as fixed.
+
+Five parallel agents each authored ten non-overlapping, reusable employee backgrounds/personas.
+The resulting `personality-library/batch-01.json` through `batch-05.json` contain 50 profiles with
+detailed background, core personality, chat/email/communication style, motivations, strengths,
+flaws, conflict and decision style, habits, quirks, relationship tendencies, response guidance,
+and prohibited assumptions. A cross-batch review caught and renamed two duplicate labels. Final
+validation confirmed IDs `persona-001` through `persona-050`, 50 unique labels, every required
+field and array, requested narrative word counts, and low textual overlap between profiles.
+
+Migration `014_personality_profiles.sql` adds the canonical JSONB profile table and a stable
+employee assignment. Provisioning now validates/upserts the bundled library and assigns every
+unassigned employee randomly from the least-used profiles, preserving variety without reshuffling
+existing staff. Both HTTP and CLI provisioning paths do this, and future dashboard hires are
+assigned before appliance provisioning. Live verification loaded all 50 profiles, assigned all
+21 current employee records to 21 distinct profiles, confirmed assignment hashes stay identical
+after a provisioning restart, and used a rolled-back future-hire row to prove new hires receive a
+profile automatically. `fakeco-provisioning` remained healthy and LiteLLM remained stopped.
 
 ### 2026-08-01T05:20 — Fixed all three narrative-deliverable review bugs without restarting LiteLLM
 
