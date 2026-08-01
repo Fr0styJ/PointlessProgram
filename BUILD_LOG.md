@@ -47,6 +47,33 @@
 
 ---
 
+### 2026-08-01T02:10 — Fixed accounting-engine: Akaunting `payment_method` now resolved dynamically, `X-Company` header added to client defaults — every real transaction post (expense approve, payroll, revenue) was silently 422ing until this landed
+
+Root cause found live while verifying Phase 34's Accounting tab Approve button: `AkauntingClient`
+sent a hardcoded `payment_method: "offline-payments.cash.1"` and never set an `X-Company` header
+on its default client headers (only individual calls were adding it ad hoc). Without `X-Company`,
+`App\Utilities\ModuleActivator` — built during Laravel's framework boot, before routing/auth —
+resolves 0 payment-method module listeners for the request's implicit company context, so
+`POST /api/transactions` 422s with "The payment method is invalid" even though the payment method
+itself is correctly seeded in Akaunting.
+
+**Fix**: `AkauntingClient.__init__` now sets `X-Company` on the client's default headers (not just
+per-call), and `post_transaction()` resolves the payment-method code live from Akaunting's own
+`GET /settings/offline-payments.methods` (cached after first lookup), with an optional
+`AKAUNTING_PAYMENT_METHOD` env var override — never a hardcoded, driftable key again.
+
+**Live verification**: submitted a fresh test expense (`$42.50`, idempotency key
+`test-fix-verify-1`), approved it via `POST /expense/approve` — previously 422'd, now returns
+`{"status":"approved","akaunting_transaction_id":"11"}`. Confirmed transaction 11 is real via a
+direct authenticated `GET /api/transactions/11` against Akaunting itself (not just accounting-
+engine's own response) — `amount: 42.5`, `type: "expense"`, matches exactly.
+
+This was found and initially fixed in a separate concurrent session/worktree (spawned as a
+flagged follow-up from Phase 34's testing), then merged into `master` here after independent
+review of the diff and a fresh live re-verification.
+
+---
+
 ### 2026-08-01T01:15 — Phase 34 built and runtime-verified: HR / Payroll / Accounting dashboard tabs
 
 Built per `PLAN_PHASES_33_38_DASHBOARD.md`'s Phase 34 feature list, adding three tabs to the
